@@ -11,6 +11,9 @@ export interface AirEnvironment {
   readonly imessageProjectSecret?: string | undefined;
   readonly imessageWebhookSecret?: string | undefined;
   readonly redisUrl?: string | undefined;
+  /** Preferred HTTPS transport for Upstash in serverless production. */
+  readonly upstashRedisRestUrl?: string | undefined;
+  readonly upstashRedisRestToken?: string | undefined;
   readonly zapAirServiceUrl?: string | undefined;
   readonly zapAirServiceToken?: string | undefined;
   readonly idHashSecret?: string | undefined;
@@ -63,6 +66,17 @@ export function loadAirEnvironment(
 
   const zapAirServiceUrl = optional(source.ZAP_AIR_SERVICE_URL);
   const zapAirServiceToken = optional(source.ZAP_AIR_SERVICE_TOKEN);
+  const upstashRedisRestUrl = optional(source.UPSTASH_REDIS_REST_URL);
+  const upstashRedisRestToken = optional(source.UPSTASH_REDIS_REST_TOKEN);
+  if (upstashRedisRestUrl || upstashRedisRestToken) {
+    if (!upstashRedisRestUrl || !upstashRedisRestToken) {
+      throw new Error("UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN must be configured together");
+    }
+    validateUpstashRedisRestUrl(upstashRedisRestUrl);
+    if (upstashRedisRestToken.length > 4_096 || /[\r\n]/.test(upstashRedisRestToken)) {
+      throw new Error("UPSTASH_REDIS_REST_TOKEN is invalid");
+    }
+  }
   if (zapAirServiceUrl) validateZapAirServiceUrl(zapAirServiceUrl);
   if (zapAirServiceToken && (zapAirServiceToken.length > 4_096 || /[\r\n]/.test(zapAirServiceToken))) {
     throw new Error("ZAP_AIR_SERVICE_TOKEN is invalid");
@@ -74,6 +88,8 @@ export function loadAirEnvironment(
     imessageProjectSecret: optional(source.IMESSAGE_PROJECT_SECRET),
     imessageWebhookSecret: optional(source.IMESSAGE_WEBHOOK_SECRET),
     redisUrl: optional(source.REDIS_URL),
+    upstashRedisRestUrl,
+    upstashRedisRestToken,
     zapAirServiceUrl,
     zapAirServiceToken,
     idHashSecret: optional(source.AIR_ID_HASH_SECRET),
@@ -103,6 +119,26 @@ function validateZapAirServiceUrl(value: string): void {
     (url.pathname !== "/" && url.pathname !== "")
   ) {
     throw new Error("ZAP_AIR_SERVICE_URL is invalid");
+  }
+}
+
+function validateUpstashRedisRestUrl(value: string): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("UPSTASH_REDIS_REST_URL is invalid");
+  }
+  if (
+    url.protocol !== "https:" ||
+    !url.hostname ||
+    url.username ||
+    url.password ||
+    (url.pathname !== "/" && url.pathname !== "") ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("UPSTASH_REDIS_REST_URL is invalid");
   }
 }
 

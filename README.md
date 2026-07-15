@@ -55,7 +55,8 @@ Set these in Vercel Production only (names, never values, are listed here):
 
 - `IMESSAGE_PROJECT_ID`, `IMESSAGE_PROJECT_SECRET`,
   `IMESSAGE_WEBHOOK_SECRET`
-- `REDIS_URL`
+- `REDIS_URL` plus `UPSTASH_REDIS_REST_URL` and
+  `UPSTASH_REDIS_REST_TOKEN` for the Vercel serverless HTTPS transport
 - `ZAP_AIR_SERVICE_URL`, `ZAP_AIR_SERVICE_TOKEN`
 - `AIR_ID_HASH_SECRET`, `AIR_QUEUE_ENCRYPTION_KEY`,
   `AIR_ALLOWED_SENDER_HASHES`

@@ -155,6 +155,19 @@ export async function handleIMessageVideoWebhook(
   } catch {
     // Deployment configuration is unavailable or unsafe. Do not parse,
     // persist, or acknowledge a signed delivery in that state.
+    // Emit only a fixed category: the error may carry secret configuration
+    // details and this route must never log webhook contents.
+    console.error("air_imessage_ingress_configuration_unavailable");
+    return emptyResponse(503);
+  }
+
+  let runtime: AirRuntime;
+  try {
+    runtime = await getAirRuntime();
+  } catch {
+    // Connection and environment errors can contain credentials. Keep the
+    // operational signal useful without disclosing the underlying error.
+    console.error("air_imessage_ingress_runtime_unavailable");
     return emptyResponse(503);
   }
 
@@ -180,7 +193,6 @@ export async function handleIMessageVideoWebhook(
     const contentType = inboxContentType(normalized.text, normalized.attachments, normalized.contentType);
     if (contentType !== "text" && contentType !== "attachment") return emptyResponse(204);
 
-    const runtime = await getAirRuntime();
     const sender = createSenderIdentity(
       runtime.environment.idHashSecret as string,
       normalized.senderId,
@@ -224,6 +236,7 @@ export async function handleIMessageVideoWebhook(
   } catch {
     // A non-2xx result makes Photon retry. The inbox key is idempotent, and
     // no raw provider response, prompt, or handle reaches the log stream.
+    console.error("air_imessage_ingress_persistence_unavailable");
     return emptyResponse(503);
   }
 }

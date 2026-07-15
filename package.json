@@ -23,6 +23,7 @@
     "@photon-ai/chat-adapter-imessage": "3.0.1",
     "@spectrum-ts/core": "^10.0.0",
     "@spectrum-ts/imessage": "^10.0.0",
+    "@upstash/redis": "1.38.0",
     "ai": "7.0.28",
     "chat": "4.34.0",
     "eve": "0.24.3",

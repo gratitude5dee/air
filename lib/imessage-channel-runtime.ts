@@ -60,7 +60,15 @@ export async function getAirRuntime(): Promise<AirRuntime> {
     pending = (async () => {
       const environment = loadAirEnvironment();
       assertQueueEnvironment(environment);
-      const connection = await connectRedisFromUrl(environment.redisUrl as string);
+      const connection = await connectRedisFromUrl(
+        environment.redisUrl as string,
+        environment.upstashRedisRestUrl && environment.upstashRedisRestToken
+          ? {
+            upstashRestUrl: environment.upstashRedisRestUrl,
+            upstashRestToken: environment.upstashRedisRestToken,
+          }
+          : undefined,
+      );
       let invalidated = false;
       const invalidate = () => {
         if (invalidated) return;
