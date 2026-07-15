@@ -6,6 +6,17 @@ import { defineNitroConfig } from "nitro/config";
  * Vercel's Build Output API applies the actual function duration.
  */
 export default defineNitroConfig({
+  // Eve registers its framework home page after Nitro has loaded this project
+  // config. Nitro preserves the first static method match, so this supported
+  // application handler keeps GET / branded as Air rather than exposing
+  // Eve's package-name-derived landing page.
+  handlers: [
+    {
+      route: "/",
+      method: "GET",
+      handler: "./lib/public-status-handler.ts",
+    },
+  ],
   vercel: {
     functions: {
       maxDuration: 60,

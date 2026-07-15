@@ -1,24 +1,24 @@
-/** Static, reviewed text used whenever no citation-validated tool result exists. */
-export const AR_AGENT_CAPABILITY_BLURB =
-  "AR Agent provides concise, transcript-grounded A&R and music-industry research. Send one self-contained question about artists, releases, strategy, or industry trends.";
+/** Reviewed iMessage copy. Never interpolate a user prompt or provider error. */
+export const AIR_VIDEO_DM_ONLY_NOTICE =
+  "Air video generation is available in direct messages only.";
 
-export const AR_AGENT_REPHRASE_GUIDANCE =
-  "Please rephrase that as one self-contained music-industry question.";
+export const AIR_VIDEO_ACCESS_NOTICE =
+  "Air video generation is currently available to an allowlisted private beta.";
 
-export const AR_AGENT_DM_ONLY_NOTICE =
-  "AR Agent currently supports direct messages only.";
+export const AIR_VIDEO_INVALID_PROMPT_NOTICE =
+  "Send a text prompt between 1 and 2,000 characters. You can include one optional image.";
 
-export const AR_AGENT_ACCESS_NOTICE =
-  "AR Agent is currently available to an allowlisted private beta.";
+export const AIR_VIDEO_IMAGE_NOTICE =
+  "Use at most one JPEG, PNG, HEIC, or HEIF image under 10 MB with a text prompt.";
 
-export const AR_AGENT_TEXT_ONLY_NOTICE =
-  "Please send a plain-text music-industry question.";
+export const AIR_VIDEO_RATE_LIMIT_NOTICE =
+  "You have reached the current video limit. Please try again later.";
 
-export const AR_AGENT_TOO_LONG_NOTICE =
-  "Please keep your question under 2,000 characters.";
+export const AIR_VIDEO_ACTIVE_NOTICE =
+  "Your previous video is still generating. Please wait for it before starting another one.";
 
-export const AR_AGENT_RATE_LIMIT_NOTICE =
-  "You have reached the current research limit. Please try again shortly.";
+export const AIR_VIDEO_GENERATING_NOTICE =
+  "Generating your 5-second video now.";
 
-export const AR_AGENT_RETRY_NOTICE =
-  "I hit a temporary issue. Please try your question again shortly.";
+export const AIR_VIDEO_TEMPORARY_FAILURE_NOTICE =
+  "I hit a temporary video-generation issue. Please try again shortly.";

@@ -14,6 +14,20 @@ export type WebhookVerification =
   | { ok: true }
   | { ok: false; status: 400 | 401; reason: "missing_headers" | "stale_timestamp" | "invalid_signature" };
 
+/**
+ * The durable reference to a Photon attachment.  Spectrum Cloud deliberately
+ * does not serialize the `read` / `stream` functions on a live attachment;
+ * Air must keep this GUID so a later worker can fetch the bytes from Photon.
+ * This is metadata only — never attachment bytes or a provider URL.
+ */
+export type NormalizedIMessageAttachment = {
+  /** Photon/Spectrum attachment GUID, passed to `imessage.getAttachment`. */
+  readonly id: string;
+  readonly name: string | null;
+  readonly mimeType: string | null;
+  readonly size: number | null;
+};
+
 export type NormalizedIMessageEnvelope = {
   readonly version: 1;
   readonly webhookId: string;
@@ -24,9 +38,15 @@ export type NormalizedIMessageEnvelope = {
   readonly senderId: string;
   readonly direction: "inbound" | "outbound";
   readonly spaceType: "dm" | "group" | "unknown";
-  /** Only textual content is copied into the encrypted envelope. */
+  /** Prompt text copied into the encrypted envelope; media remains in Photon. */
   readonly text: string | null;
   readonly contentType: string | null;
+  /**
+   * Attachment references in delivery order, including attachments nested in
+   * Spectrum `group` content. Keeping duplicates is intentional: the video
+   * workflow must be able to reject a multi-attachment request deterministically.
+   */
+  readonly attachments: readonly NormalizedIMessageAttachment[];
   readonly receivedAt: number;
 };
 
@@ -172,7 +192,8 @@ export function decodeWebhookJson(rawBody: Uint8Array): unknown {
 /**
  * Drops unneeded provider fields before encryption. The caller supplies the
  * configured project ID because current Spectrum message payloads do not
- * include it reliably.
+ * include it reliably. Attachment bytes are never in a Cloud webhook; retain
+ * only their Photon GUID and bounded metadata for a later authenticated fetch.
  */
 export function normalizeSpectrumWebhook(input: {
   readonly payload: unknown;
@@ -195,11 +216,10 @@ export function normalizeSpectrumWebhook(input: {
   }
 
   const rawContent = payload.message.content;
-  const content = rawContent && typeof rawContent === "object"
-    ? (rawContent as Record<string, unknown>)
-    : undefined;
-  const contentType = typeof content?.type === "string" ? content.type.slice(0, 80) : null;
-  const text = typeof content?.text === "string" ? content.text : null;
+  const content = asRecord(rawContent);
+  const contentType = boundedOptionalString(content?.type, 80);
+  const extracted = extractWebhookContent(rawContent);
+  const spaceType = resolveSpectrumSpaceType(payload.space.id, payload.space.type);
 
   return Object.freeze({
     version: 1,
@@ -210,14 +230,143 @@ export function normalizeSpectrumWebhook(input: {
     phone: payload.space.phone ?? payload.message.space?.phone ?? null,
     senderId: payload.message.sender?.id ?? "",
     direction: payload.message.direction ?? "inbound",
-    spaceType: payload.space.type ?? "unknown",
-    text,
+    spaceType,
+    text: extracted.text,
     contentType,
+    attachments: Object.freeze(extracted.attachments),
     receivedAt: input.receivedAt ?? Date.now(),
   });
 }
 
-/** Only inbound plain-text DMs may enter the Eve/RAG work path. */
+const MAX_ATTACHMENT_ID_LENGTH = 4_096;
+const MAX_ATTACHMENT_NAME_LENGTH = 1_024;
+const MAX_ATTACHMENT_MIME_TYPE_LENGTH = 320;
+const MAX_CONTENT_DEPTH = 12;
+const MAX_ATTACHMENT_REFERENCES = 16;
+
+interface ExtractedWebhookContent {
+  readonly text: string | null;
+  readonly attachments: NormalizedIMessageAttachment[];
+}
+
+/**
+ * Spectrum's group content contains full messages (`{ id, content }`), while
+ * a few webhook revisions have emitted the content values directly. Support
+ * both shapes without retaining any arbitrary nested provider object.
+ */
+function extractWebhookContent(rawContent: unknown): ExtractedWebhookContent {
+  const textParts: string[] = [];
+  const attachments: NormalizedIMessageAttachment[] = [];
+  const seen = new WeakSet<object>();
+
+  const visit = (candidate: unknown, depth: number): void => {
+    if (depth > MAX_CONTENT_DEPTH) {
+      throw new WebhookInputError(400, "invalid_payload");
+    }
+    const content = asRecord(candidate);
+    if (!content) return;
+
+    // Parsed JSON cannot contain a cycle, but protecting this exported parser
+    // keeps callers from accidentally causing an unbounded walk in tests/jobs.
+    if (seen.has(content)) return;
+    seen.add(content);
+
+    const type = typeof content.type === "string" ? content.type : null;
+    switch (type) {
+      case "text": {
+        if (typeof content.text === "string") textParts.push(content.text);
+        return;
+      }
+      case "attachment": {
+        if (attachments.length >= MAX_ATTACHMENT_REFERENCES) {
+          throw new WebhookInputError(400, "invalid_payload");
+        }
+        attachments.push(normalizeAttachmentReference(content));
+        return;
+      }
+      case "group": {
+        if (!Array.isArray(content.items)) {
+          throw new WebhookInputError(400, "invalid_payload");
+        }
+        for (const item of content.items) {
+          const message = asRecord(item);
+          // Group entries are normally full Message objects. For the compact
+          // content-only form, visit the entry itself.
+          visit(message?.content ?? item, depth + 1);
+        }
+        return;
+      }
+      default:
+        return;
+    }
+  };
+
+  visit(rawContent, 0);
+  return {
+    text: textParts.length > 0 ? textParts.join("\n") : null,
+    attachments,
+  };
+}
+
+function normalizeAttachmentReference(content: Record<string, unknown>): NormalizedIMessageAttachment {
+  const id = boundedRequiredString(content.id, MAX_ATTACHMENT_ID_LENGTH)
+    ?? boundedRequiredString(content.guid, MAX_ATTACHMENT_ID_LENGTH);
+  const guid = boundedRequiredString(content.guid, MAX_ATTACHMENT_ID_LENGTH);
+  if (!id || (guid && id !== guid)) {
+    throw new WebhookInputError(400, "invalid_payload");
+  }
+
+  return Object.freeze({
+    id,
+    name: boundedOptionalString(content.name, MAX_ATTACHMENT_NAME_LENGTH),
+    mimeType: boundedOptionalString(content.mimeType, MAX_ATTACHMENT_MIME_TYPE_LENGTH),
+    size: boundedNonNegativeSafeInteger(content.size),
+  });
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function boundedRequiredString(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return normalized.length > 0 && normalized.length <= maxLength ? normalized : undefined;
+}
+
+function boundedOptionalString(value: unknown, maxLength: number): string | null {
+  return typeof value === "string" && value.length <= maxLength ? value : null;
+}
+
+function boundedNonNegativeSafeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * Spectrum documents `space.type` as optional. The official iMessage adapter
+ * encodes direct-message and group chat GUIDs with distinct delimiters, so
+ * recover that information only when the provider omitted the optional field.
+ * A contradictory declared type is rejected rather than letting an attacker
+ * steer an otherwise unambiguous direct/group policy decision.
+ */
+function resolveSpectrumSpaceType(
+  chatGuid: string,
+  declared: "dm" | "group" | undefined,
+): "dm" | "group" | "unknown" {
+  const inferred = chatGuid.includes(";-;")
+    ? "dm"
+    : chatGuid.includes(";+;")
+      ? "group"
+      : "unknown";
+  if (declared && inferred !== "unknown" && declared !== inferred) {
+    throw new WebhookInputError(400, "invalid_payload");
+  }
+  return declared ?? inferred;
+}
+
+/** Legacy pure eligibility helper for inbound direct text messages. */
 export function isEligibleInboundMessage(envelope: NormalizedIMessageEnvelope): boolean {
   return (
     envelope.direction === "inbound" &&

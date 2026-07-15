@@ -1,9 +1,9 @@
 import { defineSchedule } from "eve/schedules";
-import { drainDurableInbox } from "../../lib/imessage-channel-runtime.js";
-import imessageChannel, {
+import { drainIMessageVideoJobs } from "../../lib/imessage-video-runtime.js";
+import {
   assertIMessageRuntimeConfiguration,
   imessageAdapter,
-} from "../channels/imessage.js";
+} from "../../lib/imessage-adapter.js";
 
 /**
  * Recovery only: Photon ingress remains webhook-driven. This drain gives
@@ -12,12 +12,8 @@ import imessageChannel, {
  */
 export default defineSchedule({
   cron: "* * * * *",
-  async run({ receive }) {
+  async run() {
     assertIMessageRuntimeConfiguration();
-
-    await drainDurableInbox({
-      adapter: imessageAdapter,
-      receive: (input) => receive(imessageChannel, input),
-    });
+    await drainIMessageVideoJobs({ adapter: imessageAdapter });
   },
 });

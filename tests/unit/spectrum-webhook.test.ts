@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { createiMessageAdapter } from "@photon-ai/chat-adapter-imessage";
 import { describe, expect, it } from "vitest";
 import {
   decodeWebhookJson,
@@ -38,6 +39,64 @@ function payload(): Record<string, unknown> {
 }
 
 describe("Spectrum webhook verifier", () => {
+  it("shares the official adapter's raw HMAC, thread-id, and text fixture", async () => {
+    const timestamp = Math.floor(Date.now() / 1_000);
+    const raw = JSON.stringify(payload(), null, 2);
+    const signature = signed(raw, timestamp);
+    const adapter = createiMessageAdapter({
+      projectId: "contract-project",
+      projectSecret: "contract-project-secret",
+      webhookSecret: secret,
+    });
+    const delivered: unknown[][] = [];
+    (
+      adapter as unknown as {
+        chat: { processMessage(...args: unknown[]): void };
+      }
+    ).chat = {
+      processMessage: (...args) => delivered.push(args),
+    };
+
+    expect(
+      verifySpectrumSignature({
+        rawBody: Buffer.from(raw, "utf8"),
+        secret,
+        signature,
+        timestamp: String(timestamp),
+        now: timestamp,
+      }),
+    ).toEqual({ ok: true });
+
+    const normalized = normalizeSpectrumWebhook({
+      payload: decodeWebhookJson(Buffer.from(raw, "utf8")),
+      projectId: "contract-project",
+      webhookId: "contract-delivery-001",
+      receivedAt: timestamp * 1_000,
+    });
+    if (!normalized) throw new Error("expected a normalized messages event");
+
+    const response = await adapter.handleWebhook(
+      new Request("https://air.example/webhooks/imessage", {
+        method: "POST",
+        headers: {
+          "x-spectrum-signature": signature,
+          "x-spectrum-timestamp": String(timestamp),
+        },
+        body: raw,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(delivered).toHaveLength(1);
+    const [, threadId, message] = delivered[0] ?? [];
+    expect(threadId).toBe("imessage:iMessage;-;+15555550123~+15555550124");
+    expect(adapter.encodeThreadId({
+      chatGuid: normalized.chatGuid,
+      ...(normalized.phone ? { phone: normalized.phone } : {}),
+    })).toBe(threadId);
+    expect((message as { text?: unknown }).text).toBe(normalized.text);
+  });
+
   it("uses untouched bytes with the official v0 signing shape", () => {
     const raw = JSON.stringify(payload());
     expect(
@@ -112,5 +171,154 @@ describe("Spectrum webhook verifier", () => {
       contentType: "text",
     });
     expect(envelope && isEligibleInboundMessage(envelope)).toBe(true);
+  });
+
+  it("retains a direct attachment's Photon GUID and bounded metadata, never bytes", () => {
+    const image = payload();
+    (image.message as { content: unknown }).content = {
+      type: "attachment",
+      id: "photon-attachment-guid-001",
+      name: "first-frame.heic",
+      mimeType: "image/heic",
+      size: 1_234_567,
+      // Cloud webhooks must never deliver these functions; this fixture also
+      // verifies the normalizer only retains the safe reference fields.
+      read: "not-a-function",
+      stream: "not-a-function",
+      sourceUrl: "https://provider.example/private-image",
+    };
+
+    const envelope = normalizeSpectrumWebhook({
+      payload: image,
+      projectId: "contract-project",
+      webhookId: "attachment-delivery-001",
+    });
+
+    expect(envelope).toMatchObject({
+      contentType: "attachment",
+      text: null,
+      attachments: [
+        {
+          id: "photon-attachment-guid-001",
+          name: "first-frame.heic",
+          mimeType: "image/heic",
+          size: 1_234_567,
+        },
+      ],
+    });
+    expect(envelope?.attachments[0]).not.toHaveProperty("read");
+    expect(envelope?.attachments[0]).not.toHaveProperty("stream");
+    expect(envelope?.attachments[0]).not.toHaveProperty("sourceUrl");
+  });
+
+  it("extracts prompt text and every attachment from compact and nested group payloads", () => {
+    const grouped = payload();
+    (grouped.message as { content: unknown }).content = {
+      type: "group",
+      items: [
+        {
+          id: "nested-text-message",
+          content: { type: "text", text: "Make this feel like a 1970s film." },
+        },
+        {
+          id: "nested-image-message",
+          content: {
+            type: "attachment",
+            // A few Photon payloads label the same attachment GUID `guid`.
+            guid: "photon-attachment-guid-002",
+            name: "reference.png",
+            mimeType: "image/png",
+            size: 456,
+          },
+        },
+        {
+          // Compact content-only group item, nested one level further.
+          type: "group",
+          items: [
+            {
+              type: "attachment",
+              id: "photon-attachment-guid-003",
+              name: "second-reference.jpg",
+              mimeType: "image/jpeg",
+              size: 789,
+            },
+          ],
+        },
+      ],
+    };
+
+    const envelope = normalizeSpectrumWebhook({
+      payload: grouped,
+      projectId: "contract-project",
+      webhookId: "attachment-group-delivery-001",
+    });
+
+    expect(envelope).toMatchObject({
+      contentType: "group",
+      text: "Make this feel like a 1970s film.",
+      attachments: [
+        {
+          id: "photon-attachment-guid-002",
+          name: "reference.png",
+          mimeType: "image/png",
+          size: 456,
+        },
+        {
+          id: "photon-attachment-guid-003",
+          name: "second-reference.jpg",
+          mimeType: "image/jpeg",
+          size: 789,
+        },
+      ],
+    });
+    // The workflow can now reject this as a multi-attachment request instead
+    // of silently losing the second attachment during normalization.
+    expect(envelope?.attachments).toHaveLength(2);
+  });
+
+  it("rejects attachment content with no usable Photon GUID", () => {
+    const malformed = payload();
+    (malformed.message as { content: unknown }).content = {
+      type: "attachment",
+      name: "missing-guid.png",
+      mimeType: "image/png",
+      size: 42,
+    };
+
+    expect(() => normalizeSpectrumWebhook({
+      payload: malformed,
+      projectId: "contract-project",
+      webhookId: "bad-attachment-delivery-001",
+    })).toThrow(WebhookInputError);
+  });
+
+  it("infers an omitted Spectrum space.type from the official iMessage chat GUID", () => {
+    const missingType = payload();
+    delete (missingType.space as { type?: string }).type;
+    const envelope = normalizeSpectrumWebhook({
+      payload: missingType,
+      projectId: "contract-project",
+      webhookId: "delivery-without-space-type",
+    });
+    expect(envelope?.spaceType).toBe("dm");
+    expect(envelope && isEligibleInboundMessage(envelope)).toBe(true);
+
+    const groupWithoutType = payload();
+    const groupSpace = groupWithoutType.space as { id: string; type?: string };
+    groupSpace.id = "iMessage;+;group-chat-guid";
+    delete groupSpace.type;
+    expect(normalizeSpectrumWebhook({
+      payload: groupWithoutType,
+      projectId: "contract-project",
+      webhookId: "group-delivery-without-space-type",
+    })?.spaceType).toBe("group");
+
+    const contradictoryType = payload();
+    (contradictoryType.space as { type?: string }).type = "group";
+    expect(() => normalizeSpectrumWebhook({
+      payload: contradictoryType,
+      projectId: "contract-project",
+      webhookId: "contradictory-space-type",
+    })).toThrow(WebhookInputError);
   });
 });
