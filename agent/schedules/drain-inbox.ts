@@ -4,7 +4,7 @@ import {
   assertIMessageRuntimeConfiguration,
   imessageAdapter,
 } from "../../lib/imessage-adapter.js";
-import { assertQueueEnvironment, getAirRuntime } from "../../lib/imessage-channel-runtime.js";
+import { assertQueueEnvironment } from "../../lib/imessage-channel-runtime.js";
 import { loadAirEnvironment } from "../../lib/env.js";
 
 /**
@@ -32,12 +32,13 @@ export default defineSchedule({
     }
 
     try {
-      const runtime = await getAirRuntime();
-      // This bounded read proves the same encrypted Redis runtime that ingress
-      // needs is available, without creating work or exposing queue contents.
-      await runtime.inbox.listDue(1);
-      console.info("air_imessage_recovery_runtime_ready");
-      await drainIMessageVideoJobs({ adapter: imessageAdapter, runtime });
+      await drainIMessageVideoJobs({
+        adapter: imessageAdapter,
+        // The scheduled recovery path needs a redacted failure signal; its
+        // normal empty-queue read is already the runtime probe, so do not add
+        // another request or a success log every minute.
+        onStorageUnavailable: () => console.error("air_imessage_recovery_redis_unavailable"),
+      });
     } catch {
       // Do not let Redis or provider details leak through a scheduled-function
       // log. The fixed category is enough for operators.

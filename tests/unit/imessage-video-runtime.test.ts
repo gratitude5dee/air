@@ -681,6 +681,30 @@ describe("iMessage video runtime safeguards", () => {
     });
   });
 
+  it("keeps webhook drains best-effort while recovery can observe queue-read faults", async () => {
+    const runtime = createRuntime();
+    vi.spyOn(runtime.inbox, "listDue").mockRejectedValue(new Error("fixture queue fault"));
+    const adapter = new FixtureAdapter();
+    let storageFaults = 0;
+
+    await expect(drainIMessageVideoJobs({ runtime, adapter })).resolves.toBeUndefined();
+    await expect(drainIMessageVideoJobs({
+      runtime,
+      adapter,
+      onStorageUnavailable: () => { storageFaults += 1; },
+    })).resolves.toBeUndefined();
+    expect(storageFaults).toBe(1);
+
+    const healthyRuntime = createRuntime();
+    let healthyStorageFaults = 0;
+    await drainIMessageVideoJobs({
+      runtime: healthyRuntime,
+      adapter,
+      onStorageUnavailable: () => { healthyStorageFaults += 1; },
+    });
+    expect(healthyStorageFaults).toBe(0);
+  });
+
   it("retries a malformed Zap poll response for an existing durable run", async () => {
     const runtime = createRuntime();
     const jobs = new VideoJobStore({

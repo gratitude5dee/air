@@ -87,6 +87,12 @@ export interface VideoDrainOptions {
   readonly limit?: number | undefined;
   /** Internal route reuse avoids reconnecting Redis after authorization. */
   readonly runtime?: AirRuntime | undefined;
+  /**
+   * Recovery cron uses this to emit a redacted storage signal. It receives no
+   * error details so ingress `waitUntil` drains remain privacy-safe and
+   * best-effort.
+   */
+  readonly onStorageUnavailable?: (() => void) | undefined;
 }
 
 /** Successful operator authorization deliberately exposes only a live runtime. */
@@ -248,6 +254,7 @@ export async function drainIMessageVideoJobs(options: VideoDrainOptions): Promis
     try {
       runtime = await getAirRuntime();
     } catch {
+      notifyStorageUnavailable(options);
       return;
     }
   }
@@ -260,6 +267,7 @@ export async function drainIMessageVideoJobs(options: VideoDrainOptions): Promis
   try {
     inboxRecords = await runtime.inbox.listDue(limit);
   } catch {
+    notifyStorageUnavailable(options);
     return;
   }
   for (const record of inboxRecords) {
@@ -273,10 +281,20 @@ export async function drainIMessageVideoJobs(options: VideoDrainOptions): Promis
   try {
     dueJobs = await jobs.listDue(limit);
   } catch {
+    notifyStorageUnavailable(options);
     return;
   }
   for (const record of dueJobs) {
     await processVideoJob(runtime, jobs, record, options.adapter).catch(() => undefined);
+  }
+}
+
+/** Failure telemetry is optional and must never interrupt durable recovery. */
+function notifyStorageUnavailable(options: VideoDrainOptions): void {
+  try {
+    options.onStorageUnavailable?.();
+  } catch {
+    // Observability must not make a background delivery fail.
   }
 }
 
