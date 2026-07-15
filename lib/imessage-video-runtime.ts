@@ -154,7 +154,20 @@ export async function handleIMessageVideoWebhook(
     signature: request.headers.get(SPECTRUM_SIGNATURE_HEADER),
     timestamp: request.headers.get(SPECTRUM_TIMESTAMP_HEADER),
   });
-  if (!verification.ok) return emptyResponse(verification.status);
+  if (!verification.ok) {
+    // These are a closed set of fixed categories.  They deliberately contain
+    // no request headers, payload bytes, identifiers, or signature material,
+    // but make a dashboard configuration issue distinguishable from a bad
+    // signing secret in serverless production logs.
+    console.warn(
+      verification.reason === "missing_headers"
+        ? "air_imessage_ingress_signature_headers_missing"
+        : verification.reason === "stale_timestamp"
+          ? "air_imessage_ingress_signature_timestamp_stale"
+          : "air_imessage_ingress_signature_invalid",
+    );
+    return emptyResponse(verification.status);
+  }
 
   try {
     options.assertRuntimeConfiguration();

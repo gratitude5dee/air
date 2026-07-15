@@ -201,6 +201,7 @@ describe("iMessage video runtime safeguards", () => {
       throw new Error("missing deployment configuration");
     });
     const background: Promise<unknown>[] = [];
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     const response = await handleIMessageVideoWebhook(
       new Request("https://air.example.test/webhooks/imessage", { method: "POST", body: "{}" }),
@@ -210,6 +211,8 @@ describe("iMessage video runtime safeguards", () => {
     expect(response.status).toBe(400);
     expect(assertRuntimeConfiguration).not.toHaveBeenCalled();
     expect(background).toEqual([]);
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning).toHaveBeenCalledWith("air_imessage_ingress_signature_headers_missing");
   });
 
   it("returns a retryable 503 rather than throwing when signed ingress configuration is incomplete", async () => {
