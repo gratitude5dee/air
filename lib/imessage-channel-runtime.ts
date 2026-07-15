@@ -26,6 +26,7 @@ import {
 import { OperationDeadline } from "./upstream.js";
 import {
   createSenderIdentity,
+  deriveCorrelationId,
   deriveOpaqueId,
   hashThreadIdentifier,
   isSenderAllowed,
@@ -383,6 +384,23 @@ export async function handleIMessageWebhook(
       contentType,
       isGroup: normalized.spaceType === "group",
       receivedAtMs: normalized.receivedAt,
+      ...(shouldReserveRateLimitAtReceipt({
+        runtime,
+        senderHash: sender.senderHash,
+        normalized,
+        contentType,
+      })
+        ? {
+            rateLimitReservation: runtime.limiter.reservationForIngress(
+              sender.senderHash,
+              deriveCorrelationId(
+                runtime.environment.idHashSecret as string,
+                normalized.projectId,
+                normalized.messageId,
+              ),
+            ),
+          }
+        : {}),
       envelope: {
         projectId: normalized.projectId,
         messageId: normalized.messageId,
@@ -579,7 +597,11 @@ async function processInboxRecord(
       return;
     }
 
-    const rate = await runtime.limiter.consume(current.immutable.senderHash, correlationId);
+    // New records receive this decision atomically with their first durable
+    // inbox publication. A legacy/mid-rollout record with no decision uses
+    // its immutable receipt timestamp exactly once; the correlation decision
+    // then makes every later recovery/retry idempotent.
+    const rate = await readOrReserveReceiptRateLimit(runtime, current);
     if (!rate.accepted) {
       logger.warn("imessage.rate_limited", {
         correlationId,
@@ -1608,6 +1630,50 @@ function toInboxContentType(contentType: string | null): InboxContentType {
   if (contentType === "reaction") return "reaction";
   if (contentType === "attachment") return "attachment";
   return "unknown";
+}
+
+/**
+ * Decide eligibility before queueing. This mirrors the worker's policy order
+ * exactly: only a direct, allowlisted, substantive text question consumes a
+ * research slot. Static responses and rejected traffic must never affect the
+ * rate counters merely because their signed envelope was persisted.
+ */
+function shouldReserveRateLimitAtReceipt(input: {
+  readonly runtime: AirRuntime;
+  readonly senderHash: SenderHash;
+  readonly normalized: NormalizedIMessageEnvelope;
+  readonly contentType: InboxContentType;
+}): boolean {
+  if (
+    input.normalized.direction !== "inbound" ||
+    input.normalized.spaceType !== "dm" ||
+    input.contentType !== "text" ||
+    !isSenderAllowed(input.senderHash, input.runtime.environment.allowedSenderHashes)
+  ) {
+    return false;
+  }
+  const text = input.normalized.text?.trim() ?? "";
+  return text.length > 0 && text.length <= MAX_QUESTION_CHARS && !isCapabilityOnlyMessage(text);
+}
+
+/**
+ * A decision should normally already exist because publication and
+ * reservation share one Redis EVAL. The fallback is deliberately narrow for
+ * legacy records: it uses the immutable receipt time and a correlation key,
+ * never the delayed worker clock, so retries cannot consume a second slot.
+ */
+async function readOrReserveReceiptRateLimit(runtime: AirRuntime, record: InboxRecord) {
+  const existing = await runtime.limiter.getReservation(
+    record.immutable.senderHash,
+    record.immutable.correlationId,
+  );
+  if (existing) return existing;
+  return runtime.limiter.reserveAtReceipt(
+    record.immutable.senderHash,
+    record.immutable.correlationId,
+    record.immutable.receivedAtMs,
+    Math.max(1, record.immutable.payloadExpiresAtMs - runtime.clock()),
+  );
 }
 
 function isCapabilityOnlyMessage(value: string): boolean {

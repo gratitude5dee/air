@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MemoryRedis } from "../../lib/redis.js";
-import { RateLimiter } from "../../lib/rate-limit.js";
+import { DEFAULT_RATE_LIMIT_POLICY, RateLimiter } from "../../lib/rate-limit.js";
 
 const senderHash = "a".repeat(64);
 const correlation = (value: number) => value.toString(16).padStart(64, "0");
@@ -47,5 +47,18 @@ describe("rolling sender limits", () => {
       reason: "day",
       shouldNotify: true,
     });
+  });
+
+  it("retains a legacy receipt decision through the requested payload horizon", async () => {
+    let now = 3_000_000;
+    const limiter = new RateLimiter(new MemoryRedis(() => now), { now: () => now });
+    const horizonMs = 2 * DEFAULT_RATE_LIMIT_POLICY.dayWindowMs;
+
+    await expect(limiter.reserveAtReceipt(senderHash, correlation(1), now, horizonMs))
+      .resolves.toMatchObject({ accepted: true });
+
+    now += DEFAULT_RATE_LIMIT_POLICY.dayWindowMs + 1;
+    await expect(limiter.getReservation(senderHash, correlation(1)))
+      .resolves.toMatchObject({ accepted: true });
   });
 });

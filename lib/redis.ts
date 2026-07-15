@@ -308,16 +308,23 @@ return 0
  *
  * KEYS: metadata record, encrypted payload record, global pending index,
  *       per-thread queue, per-thread sequence counter, received-at index,
- *       ready-thread-head index.
+ *       ready-thread-head index, optional rate minute/day indexes, optional
+ *       rate minute/day notice keys, optional correlation decision key, and
+ *       optional per-sender receipt watermark key.
  * ARGV: redacted metadata JSON template, metadata TTL seconds, encrypted
  *       record JSON template, payload TTL seconds, pending score, record key,
- *       sequence-counter TTL seconds, received-at score, thread hash.
+ *       sequence-counter TTL seconds, received-at score, thread hash, rate
+ *       reservation enabled (0/1), minute/day windows, minute/day limits,
+ *       and decision TTL milliseconds, then the correlation-HMAC member.
  *
  * Both JSON templates must contain exactly one `"threadSequence":-1` marker.
  * Redis replaces it with the atomically minted sequence before storing them.
  */
 export const PERSIST_INBOX_NEW_RECORD_LUA = `
 -- AIR_PERSIST_INBOX_NEW_RECORD_V1
+if #KEYS < 7 or #ARGV < 16 then
+  return redis.error_reply("invalid inbox publish script arity")
+end
 if redis.call("EXISTS", KEYS[1]) == 1 then
   return { 0, 0 }
 end
@@ -327,6 +334,125 @@ local _, metadataMarkers = string.gsub(ARGV[1], markerPattern, "")
 local _, payloadMarkers = string.gsub(ARGV[3], markerPattern, "")
 if metadataMarkers ~= 1 or payloadMarkers ~= 1 then
   return redis.error_reply("invalid inbox sequence template")
+end
+
+local function isTypeOrMissing(key, expected)
+  local actual = redis.call("TYPE", key).ok
+  return actual == "none" or actual == expected
+end
+
+local function positiveInteger(value)
+  return value and string.match(value, "^[1-9][0-9]*$") and string.len(value) <= 16
+end
+
+local function nonnegativeInteger(value)
+  return value == "0" or (value and string.match(value, "^[1-9][0-9]*$") and string.len(value) <= 16)
+end
+
+local function validSequence(value)
+  if not value or value == "0" then return true end
+  if not string.match(value, "^[1-9][0-9]*$") then return false end
+  if string.len(value) < 19 then return true end
+  if string.len(value) > 19 then return false end
+  return value < "9223372036854775807"
+end
+
+-- Redis Lua does not roll back prior writes when a later command errors.
+-- Validate every queue write and its key type before touching rate counters.
+if not positiveInteger(ARGV[2])
+  or not positiveInteger(ARGV[4])
+  or not positiveInteger(ARGV[7])
+  or not nonnegativeInteger(ARGV[5])
+  or not nonnegativeInteger(ARGV[8])
+  or not ARGV[6] or ARGV[6] == ""
+  or not ARGV[9] or ARGV[9] == ""
+  or not isTypeOrMissing(KEYS[3], "zset")
+  or not isTypeOrMissing(KEYS[4], "zset")
+  or not isTypeOrMissing(KEYS[5], "string")
+  or not isTypeOrMissing(KEYS[6], "zset")
+  or not isTypeOrMissing(KEYS[7], "zset")
+  or not validSequence(redis.call("GET", KEYS[5])) then
+  return redis.error_reply("invalid inbox publish preflight")
+end
+
+-- For an eligible substantive DM, the receipt's quota decision is made in
+-- this same atomic publication as the encrypted inbox record. The resulting
+-- correlation decision is what a recovered worker reads later; it must never
+-- consume quota after waiting behind an earlier same-thread RAG turn.
+if ARGV[10] == "1" then
+  if #KEYS ~= 13 then
+    return redis.error_reply("missing inbox rate reservation keys")
+  end
+  local now = tonumber(ARGV[8])
+  local minuteWindow = tonumber(ARGV[11])
+  local dayWindow = tonumber(ARGV[12])
+  local minuteLimit = tonumber(ARGV[13])
+  local dayLimit = tonumber(ARGV[14])
+  local decisionTtl = tonumber(ARGV[15])
+  if not nonnegativeInteger(ARGV[8])
+    or not positiveInteger(ARGV[11])
+    or not positiveInteger(ARGV[12])
+    or not positiveInteger(ARGV[13])
+    or not positiveInteger(ARGV[14])
+    or not positiveInteger(ARGV[15])
+    or decisionTtl < dayWindow
+    or not ARGV[16]
+    or not string.match(ARGV[16], "^[a-f0-9][a-f0-9]*$")
+    or string.len(ARGV[16]) ~= 64
+    or not isTypeOrMissing(KEYS[8], "zset")
+    or not isTypeOrMissing(KEYS[9], "zset")
+    or not isTypeOrMissing(KEYS[10], "string")
+    or not isTypeOrMissing(KEYS[11], "string")
+    or not isTypeOrMissing(KEYS[12], "string")
+    or not isTypeOrMissing(KEYS[13], "string") then
+    return redis.error_reply("invalid inbox rate reservation")
+  end
+
+  local existingDecision = redis.call("GET", KEYS[12])
+  if existingDecision then
+    if existingDecision ~= "a" and not string.match(existingDecision, "^[md]:[01]:%d+$") then
+      return redis.error_reply("invalid inbox rate reservation decision")
+    end
+  else
+    local watermark = redis.call("GET", KEYS[13])
+    if watermark then
+      if not nonnegativeInteger(watermark) then
+        return redis.error_reply("invalid inbox rate receipt watermark")
+      end
+      now = math.max(now, tonumber(watermark))
+    end
+    redis.call("ZREMRANGEBYSCORE", KEYS[8], "-inf", now - minuteWindow)
+    redis.call("ZREMRANGEBYSCORE", KEYS[9], "-inf", now - dayWindow)
+    if redis.call("ZSCORE", KEYS[8], ARGV[16]) or redis.call("ZSCORE", KEYS[9], ARGV[16]) then
+      -- Upgrade a legacy counter-only member to a durable decision without
+      -- charging it again; this mirrors RATE_LIMIT_LUA's recovery branch.
+      redis.call("SET", KEYS[12], "a", "PX", decisionTtl, "NX")
+    else
+      local minuteCount = redis.call("ZCARD", KEYS[8])
+      local dayCount = redis.call("ZCARD", KEYS[9])
+      local limitedByMinute = minuteCount >= minuteLimit
+      local limitedByDay = (not limitedByMinute) and dayCount >= dayLimit
+      if limitedByMinute or limitedByDay then
+        local targetKey = limitedByMinute and KEYS[8] or KEYS[9]
+        local noticeKey = limitedByMinute and KEYS[10] or KEYS[11]
+        local window = limitedByMinute and minuteWindow or dayWindow
+        local first = redis.call("ZRANGE", targetKey, 0, 0, "WITHSCORES")
+        local retryUntil = tonumber(first[2]) + window
+        local shouldNotify = redis.call("SET", noticeKey, "1", "PX", math.max(1, retryUntil - now), "NX") and 1 or 0
+        local decision = (limitedByMinute and "m:" or "d:") .. shouldNotify .. ":" .. retryUntil
+        redis.call("SET", KEYS[12], decision, "PX", decisionTtl, "NX")
+      else
+        redis.call("ZADD", KEYS[8], now, ARGV[16])
+        redis.call("ZADD", KEYS[9], now, ARGV[16])
+        redis.call("PEXPIRE", KEYS[8], minuteWindow)
+        redis.call("PEXPIRE", KEYS[9], dayWindow)
+        redis.call("SET", KEYS[12], "a", "PX", decisionTtl, "NX")
+      end
+    end
+    redis.call("SET", KEYS[13], tostring(now), "PX", dayWindow)
+  end
+elseif ARGV[10] ~= "0" or #KEYS ~= 7 then
+  return redis.error_reply("invalid inbox rate reservation mode")
 end
 
 local sequence = redis.call("INCR", KEYS[5])
@@ -818,6 +944,13 @@ export class MemoryRedis implements RedisLike {
     const sequenceTtlValue = args[6];
     const receivedAtScoreValue = args[7];
     const threadHash = args[8];
+    const rateReservationEnabled = args[9] ?? "0";
+    const minuteWindowValue = args[10] ?? "0";
+    const dayWindowValue = args[11] ?? "0";
+    const minuteLimitValue = args[12] ?? "0";
+    const dayLimitValue = args[13] ?? "0";
+    const decisionTtlValue = args[14] ?? "0";
+    const rateMember = args[15] ?? "";
     if (
       !metadataKey ||
       !payloadKey ||
@@ -859,20 +992,88 @@ export class MemoryRedis implements RedisLike {
       payloadTtlSeconds < 1 ||
       !Number.isSafeInteger(sequenceTtlSeconds) ||
       sequenceTtlSeconds < 1 ||
-      !Number.isFinite(pendingScore) ||
+      !Number.isSafeInteger(pendingScore) ||
+      pendingScore < 0 ||
       !Number.isSafeInteger(receivedAtScore) ||
       receivedAtScore < 0
     ) {
       throw new Error("invalid inbox publish script arguments");
     }
+    if (rateReservationEnabled !== "0" && rateReservationEnabled !== "1") {
+      throw new Error("invalid inbox rate reservation arguments");
+    }
+    if (
+      (rateReservationEnabled === "1" && keys.length !== 13) ||
+      (rateReservationEnabled === "0" && keys.length !== 7)
+    ) {
+      throw new Error("invalid inbox rate reservation arguments");
+    }
+    const minuteWindow = Number(minuteWindowValue);
+    const dayWindow = Number(dayWindowValue);
+    const minuteLimit = Number(minuteLimitValue);
+    const dayLimit = Number(dayLimitValue);
+    const decisionTtl = Number(decisionTtlValue);
+    if (rateReservationEnabled === "1") {
+      const minuteKey = keys[7];
+      const dayKey = keys[8];
+      const minuteNoticeKey = keys[9];
+      const dayNoticeKey = keys[10];
+      const decisionKey = keys[11];
+      const receiptWatermarkKey = keys[12];
+      if (
+        !minuteKey ||
+        !dayKey ||
+        !minuteNoticeKey ||
+        !dayNoticeKey ||
+        !decisionKey ||
+        !receiptWatermarkKey ||
+        !/^[a-f0-9]{64}$/.test(rateMember) ||
+        ![minuteWindow, dayWindow, minuteLimit, dayLimit, decisionTtl].every(
+          (value) => Number.isSafeInteger(value) && value >= 1,
+        ) ||
+        decisionTtl < dayWindow
+      ) {
+        throw new Error("invalid inbox rate reservation arguments");
+      }
+    }
 
+    // Match Lua's no-partial-write preflight. In particular, do not reserve a
+    // rate slot if a corrupt queue/index key would make publication fail.
+    this.assertZSetOrMissing(pendingKey);
+    this.assertZSetOrMissing(threadQueueKey);
+    this.assertZSetOrMissing(receivedAtIndexKey);
+    this.assertZSetOrMissing(readyThreadsIndexKey);
     const sequenceEntry = this.getEntry(sequenceKey);
-    const priorSequence = sequenceEntry?.kind === "string" ? Number(sequenceEntry.value) : 0;
+    if (sequenceEntry && sequenceEntry.kind !== "string") {
+      throw new Error("inbox thread sequence is invalid");
+    }
+    if (sequenceEntry && !/^(?:0|[1-9][0-9]*)$/.test(sequenceEntry.value)) {
+      throw new Error("inbox thread sequence is invalid");
+    }
+    const priorSequence = sequenceEntry ? Number(sequenceEntry.value) : 0;
     if (!Number.isSafeInteger(priorSequence) || priorSequence < 0) {
       throw new Error("inbox thread sequence is invalid");
     }
     const sequence = priorSequence + 1;
     if (!Number.isSafeInteger(sequence)) throw new Error("inbox thread sequence is invalid");
+
+    if (rateReservationEnabled === "1") {
+      this.reserveRateDecision({
+        minuteKey: keys[7] as string,
+        dayKey: keys[8] as string,
+        minuteNoticeKey: keys[9] as string,
+        dayNoticeKey: keys[10] as string,
+        decisionKey: keys[11] as string,
+        receiptWatermarkKey: keys[12] as string,
+        now: receivedAtScore,
+        minuteWindow,
+        dayWindow,
+        minuteLimit,
+        dayLimit,
+        member: rateMember,
+        decisionTtl,
+      });
+    }
 
     const now = this.now();
     const replacement = `"threadSequence":${String(sequence)}`;
@@ -1208,23 +1409,31 @@ export class MemoryRedis implements RedisLike {
     const dayKey = keys[1];
     const minuteNoticeKey = keys[2];
     const dayNoticeKey = keys[3];
+    const decisionKey = keys[4];
+    const receiptWatermarkKey = keys[5];
     const nowValue = args[0];
     const minuteWindowValue = args[1];
     const dayWindowValue = args[2];
     const minuteLimitValue = args[3];
     const dayLimitValue = args[4];
     const member = args[5];
+    const decisionTtlValue = args[6];
     if (
+      keys.length !== 6 ||
+      args.length !== 7 ||
       !minuteKey ||
       !dayKey ||
       !minuteNoticeKey ||
       !dayNoticeKey ||
+      !decisionKey ||
+      !receiptWatermarkKey ||
       !nowValue ||
       !minuteWindowValue ||
       !dayWindowValue ||
       !minuteLimitValue ||
       !dayLimitValue ||
-      !member
+      !member ||
+      !decisionTtlValue
     ) {
       throw new Error("invalid rate-limit script arguments");
     }
@@ -1233,47 +1442,186 @@ export class MemoryRedis implements RedisLike {
     const dayWindow = Number(dayWindowValue);
     const minuteLimit = Number(minuteLimitValue);
     const dayLimit = Number(dayLimitValue);
-    if (![now, minuteWindow, dayWindow, minuteLimit, dayLimit].every(Number.isFinite)) {
+    const decisionTtl = Number(decisionTtlValue);
+    if (
+      ![now, minuteWindow, dayWindow, minuteLimit, dayLimit, decisionTtl].every(Number.isFinite) ||
+      !Number.isSafeInteger(now) ||
+      now < 0 ||
+      !/^[a-f0-9]{64}$/.test(member) ||
+      ![minuteWindow, dayWindow, minuteLimit, dayLimit, decisionTtl].every(
+        (value) => Number.isSafeInteger(value) && value >= 1,
+      ) ||
+      decisionTtl < dayWindow
+    ) {
       throw new Error("invalid rate-limit script arguments");
     }
 
-    const minute = this.getZSet(minuteKey, true);
-    const day = this.getZSet(dayKey, true);
-    this.removeBefore(minute, now - minuteWindow);
-    this.removeBefore(day, now - dayWindow);
-    const minuteCount = minute.value.size;
-    const dayCount = day.value.size;
+    const result = this.reserveRateDecision({
+      minuteKey,
+      dayKey,
+      minuteNoticeKey,
+      dayNoticeKey,
+      decisionKey,
+      receiptWatermarkKey,
+      now,
+      minuteWindow,
+      dayWindow,
+      minuteLimit,
+      dayLimit,
+      member,
+      decisionTtl,
+    });
+    return [
+      result.accepted ? 1 : 0,
+      result.reason ?? "",
+      result.minuteCount,
+      result.dayCount,
+      result.retryAfterSeconds,
+      result.shouldNotify ? 1 : 0,
+      result.duplicate ? 1 : 0,
+    ];
+  }
 
-    if (minute.value.has(member) || day.value.has(member)) {
-      return [1, "", minuteCount, dayCount, 0, 0, 1];
+  private reserveRateDecision(input: {
+    readonly minuteKey: string;
+    readonly dayKey: string;
+    readonly minuteNoticeKey: string;
+    readonly dayNoticeKey: string;
+    readonly decisionKey: string;
+    readonly receiptWatermarkKey: string;
+    readonly now: number;
+    readonly minuteWindow: number;
+    readonly dayWindow: number;
+    readonly minuteLimit: number;
+    readonly dayLimit: number;
+    readonly member: string;
+    readonly decisionTtl: number;
+  }): {
+    readonly accepted: boolean;
+    readonly reason: "minute" | "day" | null;
+    readonly minuteCount: number;
+    readonly dayCount: number;
+    readonly retryAfterSeconds: number;
+    readonly shouldNotify: boolean;
+    readonly duplicate: boolean;
+  } {
+    // Keep direct rate calls and the combined inbox Lua path equally
+    // fail-closed: detect every wrong Redis type before touching a counter.
+    this.assertZSetOrMissing(input.minuteKey);
+    this.assertZSetOrMissing(input.dayKey);
+    this.assertStringOrMissing(input.minuteNoticeKey);
+    this.assertStringOrMissing(input.dayNoticeKey);
+    this.assertStringOrMissing(input.decisionKey);
+    this.assertStringOrMissing(input.receiptWatermarkKey);
+    const existing = this.getEntry(input.decisionKey);
+    if (existing) {
+      if (existing.kind !== "string") throw new Error("invalid rate reservation decision");
+      const parsed = parseMemoryRateDecision(existing.value, input.now);
+      return {
+        ...parsed,
+        minuteCount: this.getZSet(input.minuteKey, false)?.value.size ?? 0,
+        dayCount: this.getZSet(input.dayKey, false)?.value.size ?? 0,
+        duplicate: true,
+      };
     }
 
-    const limitedByMinute = minuteCount >= minuteLimit;
-    const limitedByDay = !limitedByMinute && dayCount >= dayLimit;
+    const watermark = this.getEntry(input.receiptWatermarkKey);
+    if (watermark && watermark.kind !== "string") throw new Error("invalid rate receipt watermark");
+    const watermarkMs = watermark ? Number(watermark.value) : 0;
+    if (watermark && (!Number.isSafeInteger(watermarkMs) || watermarkMs < 0)) {
+      throw new Error("invalid rate receipt watermark");
+    }
+    const effectiveNow = Math.max(input.now, watermarkMs);
+    const minute = this.getZSet(input.minuteKey, true);
+    const day = this.getZSet(input.dayKey, true);
+
+    this.removeBefore(minute, effectiveNow - input.minuteWindow);
+    this.removeBefore(day, effectiveNow - input.dayWindow);
+    const minuteCount = minute.value.size;
+    const dayCount = day.value.size;
+    const limitedByMinute = minuteCount >= input.minuteLimit;
+    const limitedByDay = !limitedByMinute && dayCount >= input.dayLimit;
+    const now = this.now();
+
+    const persistWatermark = () => {
+      this.values.set(input.receiptWatermarkKey, {
+        kind: "string",
+        value: String(effectiveNow),
+        expiresAt: now + input.dayWindow,
+      });
+    };
+
+    if (minute.value.has(input.member) || day.value.has(input.member)) {
+      this.values.set(input.decisionKey, {
+        kind: "string",
+        value: "a",
+        expiresAt: now + input.decisionTtl,
+      });
+      persistWatermark();
+      return {
+        accepted: true,
+        reason: null,
+        minuteCount,
+        dayCount,
+        retryAfterSeconds: 0,
+        shouldNotify: false,
+        duplicate: true,
+      };
+    }
+
     if (limitedByMinute || limitedByDay) {
       const reason = limitedByMinute ? "minute" : "day";
       const set = limitedByMinute ? minute : day;
-      const window = limitedByMinute ? minuteWindow : dayWindow;
-      const noticeKey = limitedByMinute ? minuteNoticeKey : dayNoticeKey;
+      const window = limitedByMinute ? input.minuteWindow : input.dayWindow;
+      const noticeKey = limitedByMinute ? input.minuteNoticeKey : input.dayNoticeKey;
       const oldest = Math.min(...set.value.values());
       if (!Number.isFinite(oldest)) throw new Error("rate-limit set has no entries");
-      const retryAfter = Math.max(1, Math.ceil((oldest + window - now) / 1_000));
-      const firstNotice = !this.getEntry(noticeKey);
-      if (firstNotice) {
+      const retryUntilMs = oldest + window;
+      const retryAfterSeconds = Math.max(1, Math.ceil((retryUntilMs - effectiveNow) / 1_000));
+      const shouldNotify = !this.getEntry(noticeKey);
+      if (shouldNotify) {
         this.values.set(noticeKey, {
           kind: "string",
           value: "1",
-          expiresAt: now + retryAfter * 1_000,
+          expiresAt: now + Math.max(1, retryUntilMs - effectiveNow),
         });
       }
-      return [0, reason, minuteCount, dayCount, retryAfter, firstNotice ? 1 : 0, 0];
+      this.values.set(input.decisionKey, {
+        kind: "string",
+        value: `${limitedByMinute ? "m" : "d"}:${shouldNotify ? "1" : "0"}:${retryUntilMs}`,
+        expiresAt: now + input.decisionTtl,
+      });
+      persistWatermark();
+      return {
+        accepted: false,
+        reason,
+        minuteCount,
+        dayCount,
+        retryAfterSeconds,
+        shouldNotify,
+        duplicate: false,
+      };
     }
 
-    minute.value.set(member, now);
-    day.value.set(member, now);
-    minute.expiresAt = now + minuteWindow;
-    day.expiresAt = now + dayWindow;
-    return [1, "", minuteCount + 1, dayCount + 1, 0, 0, 0];
+    minute.value.set(input.member, effectiveNow);
+    day.value.set(input.member, effectiveNow);
+    minute.expiresAt = now + input.minuteWindow;
+    day.expiresAt = now + input.dayWindow;
+    this.values.set(input.decisionKey, {
+      kind: "string",
+      value: "a",
+      expiresAt: now + input.decisionTtl,
+    });
+    persistWatermark();
+    return {
+      accepted: true,
+      reason: null,
+      minuteCount: minuteCount + 1,
+      dayCount: dayCount + 1,
+      retryAfterSeconds: 0,
+      shouldNotify: false,
+      duplicate: false,
+    };
   }
 
   private removeBefore(entry: Extract<MemoryValue, { kind: "zset" }>, cutoff: number): void {
@@ -1303,6 +1651,16 @@ export class MemoryRedis implements RedisLike {
     return entry;
   }
 
+  private assertZSetOrMissing(key: string): void {
+    const entry = this.getEntry(key);
+    if (entry && entry.kind !== "zset") throw new Error("Redis key has the wrong type");
+  }
+
+  private assertStringOrMissing(key: string): void {
+    const entry = this.getEntry(key);
+    if (entry && entry.kind !== "string") throw new Error("Redis key has the wrong type");
+  }
+
   private getZSet(
     key: string,
     create: true,
@@ -1327,4 +1685,35 @@ export class MemoryRedis implements RedisLike {
     this.values.set(key, zset);
     return zset;
   }
+}
+
+function parseMemoryRateDecision(
+  value: string,
+  now: number,
+): {
+  readonly accepted: boolean;
+  readonly reason: "minute" | "day" | null;
+  readonly retryAfterSeconds: number;
+  readonly shouldNotify: boolean;
+} {
+  if (value === "a") {
+    return {
+      accepted: true,
+      reason: null,
+      retryAfterSeconds: 0,
+      shouldNotify: false,
+    };
+  }
+  const match = /^([md]):([01]):(\d+)$/.exec(value);
+  if (!match) throw new Error("invalid rate reservation decision");
+  const retryUntilMs = Number(match[3]);
+  if (!Number.isSafeInteger(retryUntilMs) || retryUntilMs < 0) {
+    throw new Error("invalid rate reservation decision");
+  }
+  return {
+    accepted: false,
+    reason: match[1] === "m" ? "minute" : "day",
+    retryAfterSeconds: Math.max(0, Math.ceil((retryUntilMs - now) / 1_000)),
+    shouldNotify: match[2] === "1",
+  };
 }

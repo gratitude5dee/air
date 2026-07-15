@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Lock, QueueEntry, StateAdapter } from "chat";
 import {
@@ -10,6 +11,7 @@ import {
   createPrivacySafeChatState,
   IMESSAGE_ADAPTER_NAME,
   IMESSAGE_ADAPTER_INTERNAL_ROUTE,
+  imessageAdapter,
   privacySafeChatInstrumentationMetadata,
 } from "../../agent/channels/imessage.js";
 
@@ -167,6 +169,106 @@ describe("attempt-scoped iMessage Eve receiver", () => {
     expect(handlers.mentionHandlers).toEqual([]);
     expect(handlers.messagePatterns).toEqual([]);
     expect(handlers.subscribedMessageHandlers).toEqual([]);
+  });
+
+  it("accepts a correctly signed internal adapter webhook without starting an Eve session or posting", async () => {
+    const route = channel.routes.find(
+      (candidate) => candidate.method === "POST" && candidate.path === IMESSAGE_ADAPTER_INTERNAL_ROUTE,
+    );
+    if (!route || route.transport === "websocket") {
+      throw new Error("expected the internal iMessage adapter POST route");
+    }
+
+    const webhookSecret = "internal-adapter-route-test-secret";
+    const timestamp = String(Math.floor(Date.now() / 1_000));
+    const rawBody = JSON.stringify({
+      event: "messages",
+      space: {
+        id: "iMessage;-;+15555550123",
+        phone: "+15555550124",
+        type: "dm",
+      },
+      message: {
+        id: "internal-route-message-1",
+        direction: "inbound",
+        sender: { id: "+14155551234" },
+        content: { type: "text", text: "This must remain inert." },
+      },
+    });
+    const signature = `v0=${createHmac("sha256", webhookSecret)
+      .update(`v0:${timestamp}:${rawBody}`)
+      .digest("hex")}`;
+
+    const state = bot.getState() as StateAdapter;
+    const originalSetIfNotExists = state.setIfNotExists;
+    const originalAcquireLock = state.acquireLock;
+    const originalReleaseLock = state.releaseLock;
+    const originalIsSubscribed = state.isSubscribed;
+    const mutableBot = bot as unknown as { initialized: boolean };
+    const originalInitialized = mutableBot.initialized;
+    const mutableAdapter = imessageAdapter as unknown as {
+      chat: unknown;
+      webhookSecret: string | undefined;
+    };
+    const originalChat = mutableAdapter.chat;
+    const originalWebhookSecret = mutableAdapter.webhookSecret;
+    const outboundPost = vi.spyOn(imessageAdapter, "postMessage");
+    const scheduled: Promise<unknown>[] = [];
+    const sessionStarts: unknown[][] = [];
+
+    // Keep this as a black-box route test: the official adapter still hands
+    // the delivery to Chat SDK, but a tiny local state facade avoids a real
+    // Redis/Spectrum initialization while the empty handler sets are exercised.
+    state.setIfNotExists = async () => true;
+    state.acquireLock = async (threadId): Promise<Lock> => ({
+      threadId,
+      token: "internal-route-lock",
+      expiresAt: Date.now() + 30_000,
+    });
+    state.releaseLock = async () => undefined;
+    state.isSubscribed = async () => false;
+    mutableBot.initialized = true;
+    mutableAdapter.chat = bot;
+    mutableAdapter.webhookSecret = webhookSecret;
+
+    try {
+      const response = await route.handler(
+        new Request(`https://air.example${IMESSAGE_ADAPTER_INTERNAL_ROUTE}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-spectrum-signature": signature,
+            "x-spectrum-timestamp": timestamp,
+          },
+          body: rawBody,
+        }),
+        {
+          send: async (...args: unknown[]) => {
+            sessionStarts.push(args);
+            return { id: "unexpected-eve-session" } as never;
+          },
+          getSession: () => ({ id: "unused" }) as never,
+          receive: async () => ({ id: "unused" }) as never,
+          params: {},
+          waitUntil: (task: Promise<unknown>) => scheduled.push(task),
+          requestIp: null,
+        } as never,
+      );
+
+      expect(response.status).toBe(200);
+      expect(scheduled).toHaveLength(1);
+      await Promise.all(scheduled);
+      expect(sessionStarts).toEqual([]);
+      expect(outboundPost).not.toHaveBeenCalled();
+    } finally {
+      state.setIfNotExists = originalSetIfNotExists;
+      state.acquireLock = originalAcquireLock;
+      state.releaseLock = originalReleaseLock;
+      state.isSubscribed = originalIsSubscribed;
+      mutableBot.initialized = originalInitialized;
+      mutableAdapter.chat = originalChat;
+      mutableAdapter.webhookSecret = originalWebhookSecret;
+    }
   });
 
   it("keeps framework transport errors out of console output", async () => {

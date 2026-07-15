@@ -6,6 +6,7 @@ import {
   type VerifiedInboxInput,
 } from "../../lib/durable-inbox.js";
 import { DurableOutbox } from "../../lib/durable-outbox.js";
+import { RateLimiter } from "../../lib/rate-limit.js";
 import {
   acquireRedisLease,
   COMPARE_AND_SET_WITH_PX_LUA,
@@ -15,7 +16,11 @@ import {
   WRITE_INBOX_RECORD_LUA,
   WRITE_OUTBOX_RECORD_LUA,
 } from "../../lib/redis.js";
-import { hashSenderIdentifier, hashThreadIdentifier } from "../../lib/security.js";
+import {
+  deriveCorrelationId,
+  hashSenderIdentifier,
+  hashThreadIdentifier,
+} from "../../lib/security.js";
 
 const identitySecret = "test-identity-secret";
 const queueKey = Buffer.alloc(32, 9).toString("base64");
@@ -186,6 +191,126 @@ describe("durable inbox", () => {
     expect(sent?.state).toBe("sent");
     expect(sent?.encryptedEnvelope).toBeUndefined();
     expect((await inbox.getRecord(first.record.immutable.recordKey))?.encryptedEnvelope).toBeUndefined();
+  });
+
+  it("keeps the combined inbox reservation fail-closed for reverse-ordered same-thread receipts", async () => {
+    let now = 1_000_000;
+    const redis = new MemoryRedis(() => now);
+    const inbox = new DurableInbox({
+      redis,
+      cipher: createQueueCipher(queueKey),
+      identityHashSecret: identitySecret,
+      clock: () => now,
+    });
+    const limiter = new RateLimiter(redis, { now: () => now });
+    const receipts = [
+      { messageId: "reverse-t3", receivedAtMs: 60_000 },
+      { messageId: "reverse-t2", receivedAtMs: 40_000 },
+      { messageId: "reverse-t1", receivedAtMs: 20_000 },
+      { messageId: "reverse-t0", receivedAtMs: 0 },
+    ];
+    const decisions = [] as Array<Awaited<ReturnType<typeof limiter.getReservation>>>;
+
+    for (const receipt of receipts) {
+      const input = createInboxInput(receipt.messageId, "same thread question", receipt.receivedAtMs);
+      const correlationId = deriveCorrelationId(identitySecret, input.projectId, input.messageId);
+      await inbox.persistVerified({
+        ...input,
+        rateLimitReservation: limiter.reservationForIngress(input.senderHash, correlationId),
+      });
+      decisions.push(await limiter.getReservation(input.senderHash, correlationId));
+    }
+
+    // Processing order, rather than a blind timestamp-range query, remains
+    // conservative under EVAL reordering: the fourth receipt cannot reopen a
+    // slot merely because its timestamp is older than the first three.
+    expect(decisions.map((decision) => decision?.accepted)).toEqual([true, true, true, false]);
+    expect(decisions[3]).toMatchObject({
+      accepted: false,
+      reason: "minute",
+      shouldNotify: true,
+    });
+  });
+
+  it("keeps an ingress rate decision through a longer encrypted payload retention", async () => {
+    let now = 1_000;
+    const redis = new MemoryRedis(() => now);
+    const inbox = new DurableInbox({
+      redis,
+      cipher: createQueueCipher(queueKey),
+      identityHashSecret: identitySecret,
+      clock: () => now,
+      payloadRetentionMs: 2 * 86_400_000,
+      metadataRetentionMs: 3 * 86_400_000,
+    });
+    const limiter = new RateLimiter(redis, { now: () => now });
+    let rejectedInput: VerifiedInboxInput | undefined;
+    let rejectedCorrelationId: string | undefined;
+
+    for (let index = 1; index <= 4; index += 1) {
+      const input = createInboxInput(`retention-${String(index)}`, "durable question", now);
+      const correlationId = deriveCorrelationId(identitySecret, input.projectId, input.messageId);
+      await inbox.persistVerified({
+        ...input,
+        rateLimitReservation: limiter.reservationForIngress(input.senderHash, correlationId),
+      });
+      if (index === 4) {
+        rejectedInput = input;
+        rejectedCorrelationId = correlationId;
+      }
+    }
+
+    now += 86_400_001;
+    if (!rejectedInput || !rejectedCorrelationId) throw new Error("expected a rejected receipt");
+    expect(await inbox.getRecord(inboxRecordKey(rejectedInput.projectId, rejectedInput.messageId)))
+      .not.toBeNull();
+    expect(await limiter.getReservation(rejectedInput.senderHash, rejectedCorrelationId)).toMatchObject({
+      accepted: false,
+      reason: "minute",
+    });
+  });
+
+  it("rejects a forged ingress reservation namespace before publishing or reserving", async () => {
+    const now = 1_000;
+    const redis = new MemoryRedis(() => now);
+    const inbox = new DurableInbox({
+      redis,
+      cipher: createQueueCipher(queueKey),
+      identityHashSecret: identitySecret,
+      clock: () => now,
+    });
+    const limiter = new RateLimiter(redis, { now: () => now });
+    const input = createInboxInput("forged-rate-key", "private question", now);
+    const correlationId = deriveCorrelationId(identitySecret, input.projectId, input.messageId);
+    const reservation = limiter.reservationForIngress(input.senderHash, correlationId);
+
+    await expect(inbox.persistVerified({
+      ...input,
+      rateLimitReservation: { ...reservation, minuteKey: "air:unrelated:minute" },
+    })).rejects.toThrow(/rate namespace/);
+    expect(await redis.get("air:unrelated:minute")).toBeNull();
+    expect(await limiter.getReservation(input.senderHash, correlationId)).toBeNull();
+  });
+
+  it("does not charge an ingress reservation when queue preflight rejects publication", async () => {
+    const now = 1_000;
+    const redis = new MemoryRedis(() => now);
+    const inbox = new DurableInbox({
+      redis,
+      cipher: createQueueCipher(queueKey),
+      identityHashSecret: identitySecret,
+      clock: () => now,
+    });
+    const limiter = new RateLimiter(redis, { now: () => now });
+    const input = createInboxInput("wrong-type-before-rate", "private question", now);
+    const correlationId = deriveCorrelationId(identitySecret, input.projectId, input.messageId);
+    await redis.zAdd(`air:inbox:v1:thread:${input.threadHash}:sequence`, [{ score: 1, value: "wrong" }]);
+
+    await expect(inbox.persistVerified({
+      ...input,
+      rateLimitReservation: limiter.reservationForIngress(input.senderHash, correlationId),
+    })).rejects.toThrow(/thread sequence/);
+    expect(await limiter.getReservation(input.senderHash, correlationId)).toBeNull();
   });
 
   it("does not turn a committed sent transition into a false dead letter and promotes its successor", async () => {

@@ -12,6 +12,10 @@ import {
   type RedisLike,
 } from "./redis.js";
 import {
+  DEFAULT_RATE_LIMIT_PREFIX,
+  type RateLimitIngressReservation,
+} from "./rate-limit.js";
+import {
   deriveCorrelationId,
   deriveOpaqueId,
   type CorrelationId,
@@ -64,6 +68,12 @@ export interface VerifiedInboxInput {
   readonly contentType: InboxContentType;
   readonly isGroup: boolean;
   readonly receivedAtMs?: number | undefined;
+  /**
+   * Present only for an allowed, substantive direct-message receipt. The
+   * first-publication Redis script reserves this correlation atomically with
+   * the durable inbox record, so later queue recovery cannot re-consume it.
+   */
+  readonly rateLimitReservation?: RateLimitIngressReservation | undefined;
   readonly envelope: InboxEnvelope;
 }
 
@@ -185,6 +195,8 @@ export interface DurableInboxOptions {
   readonly threadLeaseTtlMs?: number | undefined;
   /** Upper bound on durable processing attempts before a redacted dead letter. */
   readonly maxProcessingAttempts?: number | undefined;
+  /** Must match the RateLimiter namespace used to mint ingress reservations. */
+  readonly rateLimitPrefix?: string | undefined;
 }
 
 const TERMINAL_STATES = new Set<InboxState>(["sent", "send_unknown", "dead_letter"]);
@@ -245,6 +257,7 @@ export class DurableInbox {
   private readonly metadataRetentionMs: number;
   private readonly threadLeaseTtlMs: number;
   private readonly maxProcessingAttempts: number;
+  private readonly rateLimitPrefix: string;
 
   public constructor(options: DurableInboxOptions) {
     if (!options.identityHashSecret?.trim()) {
@@ -259,6 +272,7 @@ export class DurableInbox {
     this.metadataRetentionMs = options.metadataRetentionMs ?? 604_800_000;
     this.threadLeaseTtlMs = options.threadLeaseTtlMs ?? 75_000;
     this.maxProcessingAttempts = options.maxProcessingAttempts ?? DEFAULT_MAX_PROCESSING_ATTEMPTS;
+    this.rateLimitPrefix = options.rateLimitPrefix ?? DEFAULT_RATE_LIMIT_PREFIX;
     for (const value of [this.payloadRetentionMs, this.metadataRetentionMs, this.threadLeaseTtlMs]) {
       if (!Number.isInteger(value) || value < 1_000) throw new Error("invalid inbox retention or lease setting");
     }
@@ -267,6 +281,9 @@ export class DurableInbox {
     }
     if (!Number.isInteger(this.maxProcessingAttempts) || this.maxProcessingAttempts < 1) {
       throw new Error("max processing attempts must be a positive integer");
+    }
+    if (!/^[A-Za-z0-9:_-]{1,128}$/.test(this.rateLimitPrefix)) {
+      throw new Error("rate-limit prefix is invalid");
     }
   }
 
@@ -292,6 +309,13 @@ export class DurableInbox {
       receivedAtMs: now,
     });
     const recordKey = inboxRecordKey(input.projectId, input.messageId, this.prefix);
+    const correlationId = deriveCorrelationId(this.identityHashSecret, input.projectId, input.messageId);
+    const rateLimitReservation = validateRateLimitReservation(
+      input.rateLimitReservation,
+      correlationId,
+      input.senderHash,
+      this.rateLimitPrefix,
+    );
     const threadHash = input.threadHash as ThreadHash;
     const webhookIdHash = input.webhookId
       ? deriveOpaqueId(this.identityHashSecret, "spectrum-webhook", input.webhookId)
@@ -333,7 +357,7 @@ export class DurableInbox {
           recordKey,
           projectId: input.projectId,
           messageId: input.messageId,
-          correlationId: deriveCorrelationId(this.identityHashSecret, input.projectId, input.messageId),
+          correlationId,
           senderHash: verifiedIdentity.senderHash,
           threadHash,
           contentType: input.contentType,
@@ -354,7 +378,7 @@ export class DurableInbox {
         status: { attempts: 0, updatedAtMs: now, nextAttemptAtMs: now },
         encryptedEnvelope: this.cipher.encrypt(normalizedEnvelope, recordKey),
       });
-      const publication = await this.publishNewRecord(unpublishedRecord, now);
+      const publication = await this.publishNewRecord(unpublishedRecord, now, rateLimitReservation);
       if (publication.created) {
         const record = withThreadSequence(unpublishedRecord, publication.threadSequence);
         return Object.freeze({ created: true, record });
@@ -889,7 +913,11 @@ export class DurableInbox {
    * A worker that dies after the script commits can therefore be retried
    * without making a later same-thread record look like the queue head.
    */
-  private async publishNewRecord(record: InboxRecord, now: number): Promise<InboxPublication> {
+  private async publishNewRecord(
+    record: InboxRecord,
+    now: number,
+    rateLimitReservation?: RateLimitIngressReservation,
+  ): Promise<InboxPublication> {
     if (record.immutable.threadSequence !== -1) {
       throw new Error("new inbox record must use the unpublished sequence marker");
     }
@@ -902,6 +930,16 @@ export class DurableInbox {
         this.threadSequenceKey(record.immutable.threadHash),
         this.receivedAtIndexKey(),
         this.readyThreadsIndexKey(),
+        ...(rateLimitReservation
+          ? [
+              rateLimitReservation.minuteKey,
+              rateLimitReservation.dayKey,
+              rateLimitReservation.minuteNoticeKey,
+              rateLimitReservation.dayNoticeKey,
+              rateLimitReservation.decisionKey,
+              rateLimitReservation.receiptWatermarkKey,
+            ]
+          : []),
       ],
       arguments: [
         JSON.stringify(redactInboxRecord(record)),
@@ -913,6 +951,20 @@ export class DurableInbox {
         String(ttlSeconds(record.immutable.metadataExpiresAtMs, now)),
         String(record.immutable.receivedAtMs),
         record.immutable.threadHash,
+        ...(rateLimitReservation
+          ? [
+              "1",
+              String(rateLimitReservation.minuteWindowMs),
+              String(rateLimitReservation.dayWindowMs),
+              String(rateLimitReservation.perMinute),
+              String(rateLimitReservation.perRollingDay),
+              // A decision is needed until this encrypted payload can no
+              // longer be processed. A custom inbox retention must never
+              // let a queued rejected receipt become newly eligible later.
+              String(Math.max(rateLimitReservation.decisionTtlMs, this.payloadRetentionMs)),
+              rateLimitReservation.correlationId,
+            ]
+          : ["0", "0", "0", "0", "0", "0", ""]),
       ],
     });
     if (!Array.isArray(result) || result.length < 2) {
@@ -1297,6 +1349,54 @@ function validateVerifiedEnvelope(input: VerifiedInboxInput): void {
   if (envelope.isGroup !== input.isGroup || envelope.content.type !== input.contentType) {
     throw new Error("verified envelope metadata does not match inbox metadata");
   }
+}
+
+/**
+ * The ingress runtime builds these fields solely from HMACs and fixed policy
+ * constants. Validate them at the durable boundary so an accidental caller
+ * cannot turn a generic inbox publication into a write against arbitrary
+ * Redis keys or reserve a different correlation.
+ */
+function validateRateLimitReservation(
+  value: RateLimitIngressReservation | undefined,
+  correlationId: CorrelationId,
+  senderHash: SenderHash | string,
+  rateLimitPrefix: string,
+): RateLimitIngressReservation | undefined {
+  if (!value) return undefined;
+  assertPseudonymousHash(value.correlationId, "rate reservation correlation id");
+  if (value.correlationId !== correlationId) {
+    throw new Error("rate reservation correlation does not match inbox record");
+  }
+  const base = `${rateLimitPrefix}:${senderHash}`;
+  const expectedKeys = {
+    minuteKey: `${base}:minute`,
+    dayKey: `${base}:day`,
+    minuteNoticeKey: `${base}:notice:minute`,
+    dayNoticeKey: `${base}:notice:day`,
+    decisionKey: `${base}:reservation:${correlationId}`,
+    receiptWatermarkKey: `${base}:receipt-watermark`,
+  } as const;
+  for (const [field, expected] of Object.entries(expectedKeys)) {
+    if (value[field as keyof typeof expectedKeys] !== expected) {
+      throw new Error("rate reservation keys do not match the inbox rate namespace");
+    }
+  }
+  for (const number of [
+    value.minuteWindowMs,
+    value.dayWindowMs,
+    value.perMinute,
+    value.perRollingDay,
+    value.decisionTtlMs,
+  ]) {
+    if (!Number.isSafeInteger(number) || number < 1) {
+      throw new Error("rate reservation policy is invalid");
+    }
+  }
+  if (value.decisionTtlMs < value.minuteWindowMs || value.decisionTtlMs < value.dayWindowMs) {
+    throw new Error("rate reservation retention is invalid");
+  }
+  return Object.freeze({ ...value });
 }
 
 function assertProviderIdentifier(value: string, label: string): void {
