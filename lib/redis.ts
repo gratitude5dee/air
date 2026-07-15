@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { Redis } from "@upstash/redis";
 
 /**
  * The small Redis surface Air needs.  Application code depends on this shape,
@@ -77,6 +78,43 @@ export interface NodeRedisCompatibleClient {
 }
 
 /**
+ * The narrow `@upstash/redis` REST surface Air uses in Vercel.  Keeping it
+ * separate from the node-redis shape lets the durable queue use HTTPS without
+ * leaking a transport dependency into workflow code.
+ */
+export interface UpstashRedisCompatibleClient {
+  get<T = string>(key: string): Promise<T | null>;
+  set<T = string>(
+    key: string,
+    value: T,
+    options?: { nx?: true; xx?: true; ex?: number; px?: number },
+  ): Promise<"OK" | T | null>;
+  del(...keys: string[]): Promise<number>;
+  incr(key: string): Promise<number>;
+  expire(key: string, seconds: number): Promise<number>;
+  pttl(key: string): Promise<number>;
+  zadd<T = string>(
+    key: string,
+    entry: { score: number; member: T },
+    ...entries: readonly { score: number; member: T }[]
+  ): Promise<number | null>;
+  zrange<T extends unknown[] = string[]>(
+    key: string,
+    min: number | "-inf" | "+inf",
+    max: number | "-inf" | "+inf",
+    options: { byScore: true; offset?: number; count?: number },
+  ): Promise<T>;
+  zcard(key: string): Promise<number>;
+  zrem<T = string>(key: string, ...members: T[]): Promise<number>;
+  zremrangebyscore(
+    key: string,
+    min: number | "-inf" | "+inf",
+    max: number | "-inf" | "+inf",
+  ): Promise<number>;
+  eval<T = unknown>(script: string, keys: string[], arguments_: string[]): Promise<T>;
+}
+
+/**
  * Wrap a connected `redis` (node-redis v5) client. This keeps application code
  * vendor-neutral while still using server-side Lua for the security-sensitive
  * lease and rate-limit operations.
@@ -122,6 +160,63 @@ export function createNodeRedisAdapter(client: NodeRedisCompatibleClient): Redis
   return Object.freeze(adapter);
 }
 
+/**
+ * REST adapter for Upstash. Automatic deserialization stays disabled because
+ * Air deliberately stores opaque encrypted JSON strings and Redis Lua payloads
+ * as exact bytes, not application objects.
+ */
+export function createUpstashRedisAdapter(client: UpstashRedisCompatibleClient): RedisLike {
+  const adapter: RedisLike = {
+    async get(key) {
+      const value = await client.get<string>(key);
+      if (value === null || typeof value === "string") return value;
+      throw new Error("Upstash Redis returned a non-string queue value");
+    },
+    async set(key, value, options = {}) {
+      const upstashOptions: { nx?: true; xx?: true; ex?: number; px?: number } = {};
+      if (options.nx) upstashOptions.nx = true;
+      if (options.xx) upstashOptions.xx = true;
+      if (options.ex !== undefined) upstashOptions.ex = options.ex;
+      if (options.px !== undefined) upstashOptions.px = options.px;
+      const result = await client.set(
+        key,
+        value,
+        Object.keys(upstashOptions).length > 0 ? upstashOptions : undefined,
+      );
+      return result === "OK" ? "OK" : null;
+    },
+    del: (...keys) => keys.length === 0 ? Promise.resolve(0) : client.del(...keys),
+    incr: (key) => client.incr(key),
+    async expire(key, seconds) {
+      return (await client.expire(key, seconds)) === 1;
+    },
+    pttl: (key) => client.pttl(key),
+    async zAdd(key, entries) {
+      const mapped = entries.map((entry) => ({ score: entry.score, member: entry.value }));
+      const first = mapped[0];
+      if (!first) return 0;
+      return (await client.zadd(key, first, ...mapped.slice(1))) ?? 0;
+    },
+    zRangeByScore: async (key, min, max, options) => {
+      const rangeOptions = options?.limit === undefined
+        ? { byScore: true as const }
+        : { byScore: true as const, offset: options.offset ?? 0, count: options.limit };
+      return client.zrange<string[]>(
+        key,
+        upstashScoreBound(min),
+        upstashScoreBound(max),
+        rangeOptions,
+      );
+    },
+    zCard: (key) => client.zcard(key),
+    zRem: (key, ...members) => members.length === 0 ? Promise.resolve(0) : client.zrem(key, ...members),
+    zRemRangeByScore: (key, min, max) =>
+      client.zremrangebyscore(key, upstashScoreBound(min), upstashScoreBound(max)),
+    eval: (script, options) => client.eval(script, [...options.keys], [...options.arguments]),
+  };
+  return Object.freeze(adapter);
+}
+
 export interface ConnectedRedis {
   readonly redis: RedisLike;
   /** Fires after a connected client's transport fails, without exposing the error. */
@@ -153,6 +248,23 @@ export interface RedisConnectionOptions {
       readonly reconnectStrategy: false;
     };
   }) => NodeRedisConnectionClient) | undefined;
+  /**
+   * Preferred serverless connection for Upstash. These values are supplied
+   * separately from the legacy TCP REDIS_URL and never appear in logs.
+   */
+  readonly upstashRestUrl?: string | undefined;
+  readonly upstashRestToken?: string | undefined;
+  /** Test-only factory for the serverless Upstash REST client. */
+  readonly upstashClientFactory?: ((options: UpstashRedisRestOptions) => UpstashRedisCompatibleClient) | undefined;
+}
+
+export interface UpstashRedisRestOptions {
+  readonly url: string;
+  readonly token: string;
+  /** Explicit zero retries: v1.38's `false` still issues a second request. */
+  readonly retry: { readonly retries: 0 };
+  readonly automaticDeserialization: false;
+  readonly signal: () => AbortSignal;
 }
 
 /**
@@ -164,6 +276,15 @@ export async function connectRedisFromUrl(
   redisUrl: string,
   options: RedisConnectionOptions = {},
 ): Promise<ConnectedRedis> {
+  const hasUpstashRestUrl = options.upstashRestUrl !== undefined;
+  const hasUpstashRestToken = options.upstashRestToken !== undefined;
+  if (hasUpstashRestUrl || hasUpstashRestToken) {
+    if (!options.upstashRestUrl?.trim() || !options.upstashRestToken?.trim()) {
+      throw new Error("Upstash Redis REST configuration is incomplete");
+    }
+    return connectUpstashRedis(options);
+  }
+
   let url: URL;
   try {
     url = new URL(redisUrl);
@@ -224,6 +345,61 @@ export async function connectRedisFromUrl(
   });
 }
 
+/** Prefer Upstash HTTPS in Vercel: it needs no persistent TCP socket. */
+function connectUpstashRedis(options: RedisConnectionOptions): ConnectedRedis {
+  const restUrl = options.upstashRestUrl as string;
+  const restToken = options.upstashRestToken as string;
+  let url: URL;
+  try {
+    url = new URL(restUrl);
+  } catch {
+    throw new Error("Upstash Redis REST URL is invalid");
+  }
+  if (
+    url.protocol !== "https:" ||
+    !url.hostname ||
+    url.username ||
+    url.password ||
+    url.pathname !== "/" ||
+    url.search ||
+    url.hash ||
+    restToken.length > 4_096 ||
+    /[\r\n]/.test(restToken)
+  ) {
+    throw new Error("Upstash Redis REST configuration is invalid");
+  }
+  const requestTimeoutMs = REDIS_INITIAL_CONNECT_TIMEOUT_MS;
+  const restOptions: UpstashRedisRestOptions = Object.freeze({
+    url: restUrl,
+    token: restToken,
+    retry: Object.freeze({ retries: 0 as const }),
+    automaticDeserialization: false,
+    signal: () => AbortSignal.timeout(requestTimeoutMs),
+  });
+  let client: UpstashRedisCompatibleClient;
+  try {
+    client = options.upstashClientFactory
+      ? options.upstashClientFactory(restOptions)
+      : new Redis(restOptions) as unknown as UpstashRedisCompatibleClient;
+  } catch {
+    throw new Error("Upstash Redis REST configuration is invalid");
+  }
+  return Object.freeze({
+    redis: createUpstashRedisAdapter(client),
+    // REST failures are request-scoped; the next command receives a fresh
+    // HTTPS request, so there is no socket event stream to subscribe to.
+    onOperationalError(): () => void {
+      return () => undefined;
+    },
+    destroy(): void {
+      // The Upstash client owns no persistent connection to close.
+    },
+    async close(): Promise<void> {
+      // The Upstash client owns no persistent connection to close.
+    },
+  });
+}
+
 /** Attach handlers to the connection promise so a timed-out attempt is never unhandled later. */
 function settleWithin<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -248,6 +424,13 @@ function settleWithin<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
       },
     );
   });
+}
+
+function upstashScoreBound(value: number): number | "-inf" | "+inf" {
+  if (value === Number.NEGATIVE_INFINITY) return "-inf";
+  if (value === Number.POSITIVE_INFINITY) return "+inf";
+  if (!Number.isFinite(value)) throw new Error("sorted-set score must be finite or infinite");
+  return value;
 }
 
 /**

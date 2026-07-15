@@ -5,7 +5,6 @@
 /zap-main/
 
 # Local task material and machine-specific files.
-/goal.md
 .DS_Store
 .vercel/
 

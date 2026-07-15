@@ -70,6 +70,23 @@ describe("sender privacy and Air video environment", () => {
     }), { mode: "production" })).toThrow(/ZAP_AIR_SERVICE_TOKEN is invalid/);
   });
 
+  it("requires the Upstash REST endpoint and token together", () => {
+    expect(() => loadAirEnvironment(productionEnvironment({
+      UPSTASH_REDIS_REST_URL: "https://example.upstash.io",
+    }), { mode: "production" })).toThrow(/must be configured together/);
+    expect(() => loadAirEnvironment(productionEnvironment({
+      UPSTASH_REDIS_REST_URL: "http://example.upstash.io",
+      UPSTASH_REDIS_REST_TOKEN: "rest-token",
+    }), { mode: "production" })).toThrow(/UPSTASH_REDIS_REST_URL is invalid/);
+
+    const loaded = loadAirEnvironment(productionEnvironment({
+      UPSTASH_REDIS_REST_URL: "https://example.upstash.io",
+      UPSTASH_REDIS_REST_TOKEN: "rest-token",
+    }), { mode: "production" });
+    expect(loaded.upstashRedisRestUrl).toBe("https://example.upstash.io");
+    expect(loaded.upstashRedisRestToken).toBe("rest-token");
+  });
+
   it("treats Vercel production as production even without a normal NODE_ENV", () => {
     expect(() => loadAirEnvironment({
       VERCEL_ENV: "production",

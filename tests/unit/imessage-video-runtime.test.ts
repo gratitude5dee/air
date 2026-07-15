@@ -201,6 +201,7 @@ describe("iMessage video runtime safeguards", () => {
       throw new Error("missing deployment configuration");
     });
     const background: Promise<unknown>[] = [];
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     const response = await handleIMessageVideoWebhook(
       new Request("https://air.example.test/webhooks/imessage", { method: "POST", body: "{}" }),
@@ -210,6 +211,8 @@ describe("iMessage video runtime safeguards", () => {
     expect(response.status).toBe(400);
     expect(assertRuntimeConfiguration).not.toHaveBeenCalled();
     expect(background).toEqual([]);
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning).toHaveBeenCalledWith("air_imessage_ingress_signature_headers_missing");
   });
 
   it("returns a retryable 503 rather than throwing when signed ingress configuration is incomplete", async () => {
@@ -679,6 +682,30 @@ describe("iMessage video runtime safeguards", () => {
       state: "submission_unknown",
       status: { failureCategory: "zap_submission_unknown" },
     });
+  });
+
+  it("keeps webhook drains best-effort while recovery can observe queue-read faults", async () => {
+    const runtime = createRuntime();
+    vi.spyOn(runtime.inbox, "listDue").mockRejectedValue(new Error("fixture queue fault"));
+    const adapter = new FixtureAdapter();
+    let storageFaults = 0;
+
+    await expect(drainIMessageVideoJobs({ runtime, adapter })).resolves.toBeUndefined();
+    await expect(drainIMessageVideoJobs({
+      runtime,
+      adapter,
+      onStorageUnavailable: () => { storageFaults += 1; },
+    })).resolves.toBeUndefined();
+    expect(storageFaults).toBe(1);
+
+    const healthyRuntime = createRuntime();
+    let healthyStorageFaults = 0;
+    await drainIMessageVideoJobs({
+      runtime: healthyRuntime,
+      adapter,
+      onStorageUnavailable: () => { healthyStorageFaults += 1; },
+    });
+    expect(healthyStorageFaults).toBe(0);
   });
 
   it("retries a malformed Zap poll response for an existing durable run", async () => {

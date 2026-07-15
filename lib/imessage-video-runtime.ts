@@ -87,6 +87,12 @@ export interface VideoDrainOptions {
   readonly limit?: number | undefined;
   /** Internal route reuse avoids reconnecting Redis after authorization. */
   readonly runtime?: AirRuntime | undefined;
+  /**
+   * Recovery cron uses this to emit a redacted storage signal. It receives no
+   * error details so ingress `waitUntil` drains remain privacy-safe and
+   * best-effort.
+   */
+  readonly onStorageUnavailable?: (() => void) | undefined;
 }
 
 /** Successful operator authorization deliberately exposes only a live runtime. */
@@ -148,13 +154,39 @@ export async function handleIMessageVideoWebhook(
     signature: request.headers.get(SPECTRUM_SIGNATURE_HEADER),
     timestamp: request.headers.get(SPECTRUM_TIMESTAMP_HEADER),
   });
-  if (!verification.ok) return emptyResponse(verification.status);
+  if (!verification.ok) {
+    // These are a closed set of fixed categories.  They deliberately contain
+    // no request headers, payload bytes, identifiers, or signature material,
+    // but make a dashboard configuration issue distinguishable from a bad
+    // signing secret in serverless production logs.
+    console.warn(
+      verification.reason === "missing_headers"
+        ? "air_imessage_ingress_signature_headers_missing"
+        : verification.reason === "stale_timestamp"
+          ? "air_imessage_ingress_signature_timestamp_stale"
+          : "air_imessage_ingress_signature_invalid",
+    );
+    return emptyResponse(verification.status);
+  }
 
   try {
     options.assertRuntimeConfiguration();
   } catch {
     // Deployment configuration is unavailable or unsafe. Do not parse,
     // persist, or acknowledge a signed delivery in that state.
+    // Emit only a fixed category: the error may carry secret configuration
+    // details and this route must never log webhook contents.
+    console.error("air_imessage_ingress_configuration_unavailable");
+    return emptyResponse(503);
+  }
+
+  let runtime: AirRuntime;
+  try {
+    runtime = await getAirRuntime();
+  } catch {
+    // Connection and environment errors can contain credentials. Keep the
+    // operational signal useful without disclosing the underlying error.
+    console.error("air_imessage_ingress_runtime_unavailable");
     return emptyResponse(503);
   }
 
@@ -180,7 +212,6 @@ export async function handleIMessageVideoWebhook(
     const contentType = inboxContentType(normalized.text, normalized.attachments, normalized.contentType);
     if (contentType !== "text" && contentType !== "attachment") return emptyResponse(204);
 
-    const runtime = await getAirRuntime();
     const sender = createSenderIdentity(
       runtime.environment.idHashSecret as string,
       normalized.senderId,
@@ -224,6 +255,7 @@ export async function handleIMessageVideoWebhook(
   } catch {
     // A non-2xx result makes Photon retry. The inbox key is idempotent, and
     // no raw provider response, prompt, or handle reaches the log stream.
+    console.error("air_imessage_ingress_persistence_unavailable");
     return emptyResponse(503);
   }
 }
@@ -235,6 +267,7 @@ export async function drainIMessageVideoJobs(options: VideoDrainOptions): Promis
     try {
       runtime = await getAirRuntime();
     } catch {
+      notifyStorageUnavailable(options);
       return;
     }
   }
@@ -247,6 +280,7 @@ export async function drainIMessageVideoJobs(options: VideoDrainOptions): Promis
   try {
     inboxRecords = await runtime.inbox.listDue(limit);
   } catch {
+    notifyStorageUnavailable(options);
     return;
   }
   for (const record of inboxRecords) {
@@ -260,10 +294,20 @@ export async function drainIMessageVideoJobs(options: VideoDrainOptions): Promis
   try {
     dueJobs = await jobs.listDue(limit);
   } catch {
+    notifyStorageUnavailable(options);
     return;
   }
   for (const record of dueJobs) {
     await processVideoJob(runtime, jobs, record, options.adapter).catch(() => undefined);
+  }
+}
+
+/** Failure telemetry is optional and must never interrupt durable recovery. */
+function notifyStorageUnavailable(options: VideoDrainOptions): void {
+  try {
+    options.onStorageUnavailable?.();
+  } catch {
+    // Observability must not make a background delivery fail.
   }
 }
 
