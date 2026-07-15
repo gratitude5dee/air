@@ -66,8 +66,8 @@ describe("durable video job store", () => {
       firstFrameIdentity,
     });
 
-    expect(first).toMatchObject({ created: true, record: { state: "submission_pending" } });
-    expect(second).toMatchObject({ created: false, record: { state: "submission_pending" } });
+    expect(first).toMatchObject({ created: true, record: { state: "validated" } });
+    expect(second).toMatchObject({ created: false, record: { state: "validated" } });
     expect(await store.getPayload(first.record.immutable.recordKey)).toMatchObject({
       prompt: "A tiny orange robot watering desert flowers",
       firstFrameUrl: "https://storage.googleapis.com/air/frame.png",
@@ -94,6 +94,67 @@ describe("durable video job store", () => {
       prompt: "A valid prompt",
       firstFrameUrl: "https://storage.googleapis.com/air/frame.png",
     })).rejects.toMatchObject({ code: "invalid_input" });
+  });
+
+  it("persists encrypted image recovery checkpoints before a Zap submission", async () => {
+    const { redis, store } = setup();
+    const firstFrameIdentity = deriveCorrelationId(identitySecret, "video-frame", "recovery-attachment");
+    const source = {
+      messageId: "photon-message-recovery",
+      attachment: {
+        id: "photon-guid-recovery",
+        name: "first-frame.jpg",
+        mimeType: "image/jpeg",
+        size: 123,
+      },
+    } as const;
+    const created = await store.createOrGet({
+      correlationId: correlation("image-recovery"),
+      senderHash: sender("image-recovery"),
+      delivery: deliveryTarget,
+      prompt: "A bright kite over a canyon",
+      firstFrameInput: source,
+      firstFrameIdentity,
+    });
+    const recordKey = created.record.immutable.recordKey;
+
+    expect(created.record.state).toBe("validated");
+    const metadata = await redis.get(`${recordKey}:metadata`);
+    const ciphertext = await redis.get(`${recordKey}:payload`);
+    expect(metadata).not.toContain(source.messageId);
+    expect(metadata).not.toContain(source.attachment.id);
+    expect(ciphertext).not.toContain(source.messageId);
+    expect(ciphertext).not.toContain(source.attachment.id);
+
+    const interruptedUpload = await store.beginWork(recordKey);
+    if (!interruptedUpload) throw new Error("expected image-upload work");
+    expect(interruptedUpload.operation).toBe("upload");
+    expect(interruptedUpload.record.state).toBe("image_uploading");
+    await interruptedUpload.release();
+
+    // Simulate a cold-start recovery after the worker acquired its upload
+    // intent but before it could contact Zap/GMI.
+    const recoveredUpload = await store.beginWork(recordKey);
+    if (!recoveredUpload) throw new Error("expected recovered image-upload work");
+    expect(recoveredUpload.operation).toBe("upload");
+    await recoveredUpload.transition({
+      expectedStates: ["image_uploading"],
+      state: "zap_submitting",
+      firstFrameUrl: "https://storage.googleapis.com/air/frame.jpg",
+      clearFirstFrameInput: true,
+    });
+    const uploadedPayload = await store.getPayload(recordKey);
+    expect(uploadedPayload).toMatchObject({ firstFrameUrl: "https://storage.googleapis.com/air/frame.jpg" });
+    expect(uploadedPayload).not.toHaveProperty("firstFrameInput");
+    await recoveredUpload.release();
+
+    // A crash after image upload but before provider handoff resumes from the
+    // named `zap_submitting` checkpoint and writes `submission_unknown` first.
+    const submission = await store.beginWork(recordKey);
+    if (!submission) throw new Error("expected recovered submission work");
+    expect(submission.operation).toBe("submit");
+    expect(submission.record.state).toBe("submission_unknown");
+    await submission.release();
   });
 
   it("persists an unknown submission intent before Zap and reconciles it without automatic resubmission", async () => {

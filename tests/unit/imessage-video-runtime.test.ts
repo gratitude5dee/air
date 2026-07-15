@@ -5,9 +5,13 @@ const spectrumMock = vi.hoisted(() => ({
   getAttachment: vi.fn(),
 }));
 
+const heicMock = vi.hoisted(() => vi.fn());
+
 vi.mock("@spectrum-ts/imessage", () => ({
   imessage: () => ({ getAttachment: spectrumMock.getAttachment }),
 }));
+
+vi.mock("heic-convert", () => ({ default: heicMock }));
 
 import {
   __setAirRuntimeForTests,
@@ -57,7 +61,7 @@ function createRuntime() {
   });
 }
 
-function signedRequest(payload: Record<string, unknown>): Request {
+function signedRequest(payload: Record<string, unknown>, options: { readonly webhookId?: string } = {}): Request {
   const timestamp = String(Math.floor(Date.now() / 1_000));
   const raw = JSON.stringify(payload);
   const signature = `v0=${createHmac("sha256", webhookSecret)
@@ -69,7 +73,7 @@ function signedRequest(payload: Record<string, unknown>): Request {
       "content-type": "application/json",
       "x-spectrum-signature": signature,
       "x-spectrum-timestamp": timestamp,
-      "x-spectrum-webhook-id": "video-runtime-delivery",
+      "x-spectrum-webhook-id": options.webhookId ?? "video-runtime-delivery",
     },
     body: raw,
   });
@@ -186,6 +190,7 @@ function webhookOptions(
 afterEach(() => {
   __setAirRuntimeForTests(undefined);
   spectrumMock.getAttachment.mockReset();
+  heicMock.mockReset();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
 });
@@ -380,6 +385,104 @@ describe("iMessage video runtime safeguards", () => {
       "https://zap.example.test/api/services/air/v1/runs",
     ]);
     expect(adapter.posted).toEqual(["Generating your 5-second video now."]);
+  });
+
+  it("converts a validated HEIC first frame to JPEG before the direct upload", async () => {
+    const runtime = createRuntime();
+    __setAirRuntimeForTests(runtime);
+    vi.stubEnv("IMESSAGE_PROJECT_ID", projectId);
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+    const heic = Buffer.from([0, 0, 0, 0, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]);
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0]);
+    heicMock.mockResolvedValue(jpeg);
+    spectrumMock.getAttachment.mockResolvedValue({
+      size: heic.byteLength,
+      stream: async () => new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(heic);
+          controller.close();
+        },
+      }),
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/api/services/air/v1/uploads")) {
+        return new Response(JSON.stringify({
+          uploadUrl: "https://storage.googleapis.com/gmi/converted-frame.jpg?signature=fixture",
+          publicUrl: "https://storage.googleapis.com/gmi/converted-frame.jpg",
+          headers: { "content-type": "image/jpeg" },
+          method: "PUT",
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        }), { status: 201, headers: { "content-type": "application/json" } });
+      }
+      if (url.startsWith("https://storage.googleapis.com/")) return new Response(null, { status: 200 });
+      if (url.endsWith("/api/services/air/v1/runs")) {
+        return new Response(JSON.stringify({ runId: "run_heic_fixture", status: "queued" }), {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error("unexpected network destination");
+    });
+    const payload = attachmentPayload();
+    const content = (payload.message as { content: { items: Array<{ content: Record<string, unknown> }> } }).content;
+    const attachment = content.items[1]?.content;
+    if (!attachment) throw new Error("expected attachment fixture");
+    attachment.name = "frame.heic";
+    attachment.mimeType = "image/heic";
+    attachment.size = heic.byteLength;
+    const adapter = new FixtureAdapter();
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(payload),
+      webhookOptions(adapter, background),
+    );
+    await Promise.all(background);
+
+    expect(response.status).toBe(200);
+    expect(heicMock).toHaveBeenCalledWith(expect.objectContaining({ buffer: heic, format: "JPEG" }));
+    expect(adapter.posted).toEqual([AIR_VIDEO_GENERATING_NOTICE]);
+  });
+
+  it("coalesces concurrent duplicate signed deliveries into one Zap submission", async () => {
+    const runtime = createRuntime();
+    __setAirRuntimeForTests(runtime);
+    vi.stubEnv("IMESSAGE_PROJECT_ID", projectId);
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+    let runPosts = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.endsWith("/api/services/air/v1/runs")) {
+        throw new Error("unexpected network destination");
+      }
+      runPosts += 1;
+      return new Response(JSON.stringify({ runId: "run_concurrent_duplicate", status: "queued" }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const adapter = new FixtureAdapter();
+    const firstBackground: Promise<unknown>[] = [];
+    const secondBackground: Promise<unknown>[] = [];
+    const payload = textPayload({ messageId: "concurrent-duplicate" });
+
+    const [first, second] = await Promise.all([
+      handleIMessageVideoWebhook(
+        signedRequest(payload, { webhookId: "delivery-concurrent-a" }),
+        webhookOptions(adapter, firstBackground),
+      ),
+      handleIMessageVideoWebhook(
+        signedRequest(payload, { webhookId: "delivery-concurrent-b" }),
+        webhookOptions(adapter, secondBackground),
+      ),
+    ]);
+    await Promise.all([...firstBackground, ...secondBackground]);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(runPosts).toBe(1);
+    expect(adapter.posted).toEqual([AIR_VIDEO_GENERATING_NOTICE]);
   });
 
   it("waits for durable Zap acceptance before sending the generating acknowledgement", async () => {
@@ -610,6 +713,87 @@ describe("iMessage video runtime safeguards", () => {
       state: "retryable",
       status: { failureCategory: "zap_poll_retryable" },
     });
+  });
+
+  it("delivers a validated MP4 as an attachment-only iMessage", async () => {
+    const runtime = createRuntime();
+    const jobs = new VideoJobStore({
+      redis: runtime.redis,
+      cipher: runtime.cipher,
+      identityHashSecret: identitySecret,
+    });
+    const created = await jobs.createOrGet({
+      correlationId: deriveCorrelationId(identitySecret, projectId, "attachment-delivery"),
+      senderHash: hashSenderIdentifier(identitySecret, sender),
+      prompt: "A whale made of clouds",
+      delivery: { chatGuid: "iMessage;-;+14155550000", phone: "+14155550001" },
+    });
+    const submission = await jobs.beginWork(created.record.immutable.recordKey);
+    if (!submission) throw new Error("expected submission intent");
+    await submission.transition({
+      expectedStates: ["submission_unknown"],
+      state: "video_ready",
+      zapRunId: "run_attachment_delivery",
+      video: { url: "https://blob.vercel-storage.com/air/attachment.mp4", mimeType: "video/mp4" },
+    });
+    await submission.release();
+
+    const mp4 = Buffer.from([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(mp4, {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": String(mp4.byteLength) },
+    }));
+    const adapter = new FixtureAdapter();
+
+    await drainIMessageVideoJobs({ runtime, adapter });
+
+    expect(adapter.posted).toHaveLength(1);
+    expect(adapter.posted[0]).toMatchObject({
+      raw: "",
+      files: [{ filename: "air-video.mp4", mimeType: "video/mp4" }],
+    });
+    const sent = adapter.posted[0] as { files: Array<{ data: Buffer }> };
+    expect(sent.files[0]?.data.equals(mp4)).toBe(true);
+    expect(await jobs.get(created.record.immutable.recordKey)).toMatchObject({ state: "delivered" });
+    expect(await jobs.getPayload(created.record.immutable.recordKey)).toBeNull();
+  });
+
+  it("uses the approved Blob URL only after deterministic output validation fails", async () => {
+    const runtime = createRuntime();
+    const jobs = new VideoJobStore({
+      redis: runtime.redis,
+      cipher: runtime.cipher,
+      identityHashSecret: identitySecret,
+    });
+    const videoUrl = "https://blob.vercel-storage.com/air/oversized.mp4";
+    const created = await jobs.createOrGet({
+      correlationId: deriveCorrelationId(identitySecret, projectId, "approved-fallback"),
+      senderHash: hashSenderIdentifier(identitySecret, sender),
+      prompt: "A sunset over an alien sea",
+      delivery: { chatGuid: "iMessage;-;+14155550000", phone: "+14155550001" },
+    });
+    const submission = await jobs.beginWork(created.record.immutable.recordKey);
+    if (!submission) throw new Error("expected submission intent");
+    await submission.transition({
+      expectedStates: ["submission_unknown"],
+      state: "video_ready",
+      zapRunId: "run_approved_fallback",
+      video: { url: videoUrl, mimeType: "video/mp4" },
+    });
+    await submission.release();
+
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": String(25 * 1024 * 1024 + 1) },
+    }));
+    const adapter = new FixtureAdapter();
+
+    await drainIMessageVideoJobs({ runtime, adapter });
+
+    expect(adapter.posted).toEqual([
+      `Your video is ready, but it could not be attached. Temporary link: ${videoUrl}`,
+    ]);
+    expect(await jobs.get(created.record.immutable.recordKey)).toMatchObject({ state: "delivered" });
   });
 
   it("does not send a fallback link for an unapproved output URL", async () => {

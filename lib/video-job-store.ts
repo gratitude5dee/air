@@ -13,6 +13,13 @@ import { deriveOpaqueId, type CorrelationId } from "./security.js";
  * AES-GCM encrypted payload key.
  */
 export const VIDEO_JOB_STATES = Object.freeze([
+  /** Local prompt/input checks and quota admission have completed. */
+  "validated",
+  /** A first-frame source is durably recorded before its upload is attempted. */
+  "image_uploading",
+  /** An image (if any) is ready; persist this before making the paid Zap call. */
+  "zap_submitting",
+  /** Retained only so pre-rollout records can still recover safely. */
   "submission_pending",
   "submission_unknown",
   "queued",
@@ -69,6 +76,11 @@ export interface VideoJobRecord {
 export interface VideoJobPayload {
   readonly schemaVersion: 1;
   readonly prompt: string;
+  /**
+   * Encrypted-only source needed to resume an interrupted first-frame upload.
+   * It is deleted as soon as the GMI-readable frame URL is durably recorded.
+   */
+  readonly firstFrameInput?: VideoJobFirstFrameInput | undefined;
   readonly firstFrameUrl?: string | undefined;
   readonly zapRunId?: string | undefined;
   readonly video?: VideoJobVideo | undefined;
@@ -79,6 +91,20 @@ export interface VideoJobPayload {
 export interface VideoJobDeliveryTarget {
   readonly chatGuid: string;
   readonly phone?: string | undefined;
+}
+
+/** Photon attachment metadata is encrypted with the prompt; it never reaches Redis metadata or keys. */
+export interface VideoJobAttachmentReference {
+  readonly id: string;
+  readonly name: string | null;
+  readonly mimeType: string | null;
+  readonly size: number | null;
+}
+
+/** Stable source reference used only until the first-frame image has uploaded. */
+export interface VideoJobFirstFrameInput {
+  readonly messageId: string;
+  readonly attachment: VideoJobAttachmentReference;
 }
 
 export interface VideoJobVideo {
@@ -93,6 +119,11 @@ export interface CreateVideoJobInput {
   /** Opaque HMAC sender identity. A sender can have only one active generation. */
   readonly senderHash: string;
   readonly prompt: string;
+  /**
+   * The encrypted Photon source for a first frame. It is mutually exclusive
+   * with an already-uploaded firstFrameUrl.
+   */
+  readonly firstFrameInput?: VideoJobFirstFrameInput | undefined;
   readonly firstFrameUrl?: string | undefined;
   /** Stable HMAC attachment identity; never the ephemeral signed/public URL. */
   readonly firstFrameIdentity?: string | undefined;
@@ -113,6 +144,10 @@ export interface VideoJobTransitionInput {
   readonly progress?: number | undefined;
   /** Raw value remains encrypted; metadata receives an HMAC only. */
   readonly zapRunId?: string | undefined;
+  /** Raw GMI-readable frame URL stays encrypted; no source URL enters metadata. */
+  readonly firstFrameUrl?: string | undefined;
+  /** Delete the raw Photon GUID/message reference after a successful upload. */
+  readonly clearFirstFrameInput?: boolean | undefined;
   /** Raw value remains encrypted; metadata receives an HMAC only. */
   readonly video?: VideoJobVideo | undefined;
   /** Acknowledgements are never retried after a transport ambiguity. */
@@ -123,7 +158,7 @@ export interface VideoJobAttempt {
   readonly record: VideoJobRecord;
   readonly payload: VideoJobPayload | null;
   /** A submission intent is durably marked unknown before the paid Zap call. */
-  readonly operation: "submit" | "poll" | "send";
+  readonly operation: "upload" | "submit" | "poll" | "send";
   /** Always reuse this opaque inbound-event HMAC for Zap's idempotency header. */
   readonly idempotencyKey: string;
   heartbeat(): Promise<boolean>;
@@ -171,6 +206,9 @@ const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/;
 const FAILURE_CATEGORY_PATTERN = /^[a-z0-9][a-z0-9_:-]{0,119}$/;
 const AUTOMATIC_STATES = new Set<VideoJobState>([
+  "validated",
+  "image_uploading",
+  "zap_submitting",
   "submission_pending",
   "queued",
   "running",
@@ -180,6 +218,9 @@ const AUTOMATIC_STATES = new Set<VideoJobState>([
 
 /** Generation occupies a sender slot; delivery does not. */
 const GENERATION_ACTIVE_STATES = new Set<VideoJobState>([
+  "validated",
+  "image_uploading",
+  "zap_submitting",
   "submission_pending",
   "submission_unknown",
   "queued",
@@ -188,7 +229,11 @@ const GENERATION_ACTIVE_STATES = new Set<VideoJobState>([
 ]);
 
 const TRANSITIONS: Readonly<Record<VideoJobState, readonly VideoJobState[]>> = Object.freeze({
-  submission_pending: ["queued", "running", "retryable", "submission_unknown", "dead_letter"],
+  validated: ["image_uploading", "zap_submitting", "retryable", "dead_letter"],
+  image_uploading: ["image_uploading", "zap_submitting", "retryable", "dead_letter"],
+  zap_submitting: ["submission_unknown", "queued", "running", "video_ready", "retryable", "dead_letter"],
+  // Migration path for records created before the explicit pre-submit states.
+  submission_pending: ["zap_submitting", "queued", "running", "retryable", "submission_unknown", "dead_letter"],
   // Never picked up automatically. An operator or an idempotent Zap replay can
   // reconcile the durable intent once the provider-side result is known.
   submission_unknown: ["queued", "running", "video_ready", "retryable", "dead_letter"],
@@ -199,7 +244,7 @@ const TRANSITIONS: Readonly<Record<VideoJobState, readonly VideoJobState[]>> = O
   video_ready: ["sending", "dead_letter"],
   sending: ["video_ready", "send_unknown", "delivered", "dead_letter"],
   send_unknown: ["delivered", "dead_letter"],
-  retryable: ["submission_pending", "queued", "running", "video_ready", "retryable", "submission_unknown", "dead_letter"],
+  retryable: ["validated", "image_uploading", "zap_submitting", "submission_pending", "queued", "running", "video_ready", "retryable", "submission_unknown", "dead_letter"],
   dead_letter: [],
   delivered: [],
 });
@@ -428,7 +473,9 @@ export class VideoJobStore {
           payloadExpiresAtMs: now + this.payloadRetentionMs,
           metadataExpiresAtMs: now + this.metadataRetentionMs,
         },
-        state: "submission_pending",
+        // The source payload is now durable before any GMI upload or Seedance
+        // submission. A recovery worker can resume from this exact checkpoint.
+        state: "validated",
         stateVersion: 1,
         status: { attempts: 0, updatedAtMs: now, nextAttemptAtMs: now },
       });
@@ -547,12 +594,56 @@ export class VideoJobStore {
       }
 
       let operation: VideoJobAttempt["operation"];
-      const needsSubmissionIntent =
+      const needsImageUpload =
+        ((record.state === "validated" || record.state === "image_uploading") &&
+          payload.firstFrameInput !== undefined &&
+          payload.firstFrameUrl === undefined) ||
+        (record.state === "retryable" &&
+          payload.firstFrameInput !== undefined &&
+          payload.firstFrameUrl === undefined &&
+          payload.zapRunId === undefined);
+      if (needsImageUpload) {
+        if (record.state !== "image_uploading") {
+          const uploading = await this.transitionUnderLease(lease, record, payload, {
+            expectedStates: [record.state],
+            state: "image_uploading",
+          });
+          if (!uploading) return null;
+          record = uploading;
+        }
+        operation = "upload";
+      } else if (record.state === "image_uploading") {
+        // An image-uploading record without a recoverable source is never safe
+        // to submit; fail closed rather than turn an ambiguous image step into
+        // a paid text-only request.
+        await this.transitionUnderLease(lease, record, payload, {
+          expectedStates: ["image_uploading"],
+          state: "dead_letter",
+          failureCategory: "first_frame_source_missing",
+        });
+        return null;
+      } else if (
+        record.state === "validated" ||
+        record.state === "zap_submitting" ||
         record.state === "submission_pending" ||
-        (record.state === "retryable" && payload.zapRunId === undefined);
-      if (needsSubmissionIntent) {
+        (record.state === "retryable" && payload.zapRunId === undefined)
+      ) {
+        // Persist the named pre-submit checkpoint first. If the process dies
+        // before the next write, recovery starts here and still has not made a
+        // provider call.
+        if (record.state !== "zap_submitting") {
+          const submitting = await this.transitionUnderLease(lease, record, payload, {
+            expectedStates: [record.state],
+            state: "zap_submitting",
+          });
+          if (!submitting) return null;
+          record = submitting;
+        }
+        // A second durable intent is deliberately written before the paid
+        // handoff. A crash after this point is manual/idempotent reconciliation,
+        // never an automatic duplicate Seedance submission.
         const intent = await this.transitionUnderLease(lease, record, payload, {
-          expectedStates: [record.state],
+          expectedStates: ["zap_submitting"],
           state: "submission_unknown",
           failureCategory: "submission_intent",
         });
@@ -662,11 +753,22 @@ export class VideoJobStore {
       if (!nextPayload || current.immutable.payloadExpiresAtMs <= now) {
         throw new VideoJobStoreError("corrupt_record");
       }
-      nextPayload = freezePayload({
-        ...nextPayload,
-        ...(input.zapRunId === undefined ? {} : { zapRunId: validateRunId(input.zapRunId) }),
-        ...(input.video === undefined ? {} : { video: validateVideo(input.video) }),
-      });
+      if (input.clearFirstFrameInput) {
+        const { firstFrameInput: _discardedFirstFrameInput, ...withoutFirstFrameInput } = nextPayload;
+        nextPayload = freezePayload({
+          ...withoutFirstFrameInput,
+          ...(input.firstFrameUrl === undefined ? {} : { firstFrameUrl: normalizeHttpsUrl(input.firstFrameUrl) }),
+          ...(input.zapRunId === undefined ? {} : { zapRunId: validateRunId(input.zapRunId) }),
+          ...(input.video === undefined ? {} : { video: validateVideo(input.video) }),
+        });
+      } else {
+        nextPayload = freezePayload({
+          ...nextPayload,
+          ...(input.firstFrameUrl === undefined ? {} : { firstFrameUrl: normalizeHttpsUrl(input.firstFrameUrl) }),
+          ...(input.zapRunId === undefined ? {} : { zapRunId: validateRunId(input.zapRunId) }),
+          ...(input.video === undefined ? {} : { video: validateVideo(input.video) }),
+        });
+      }
       if (requiresZapRunId(input.state) && !nextPayload.zapRunId) {
         throw new VideoJobStoreError("invalid_transition");
       }
@@ -727,7 +829,11 @@ export class VideoJobStore {
     const existingPayload = await this.readPayload(record.immutable.recordKey);
     if (existingPayload) return record;
     const safeToRepair =
-      (record.state === "submission_pending" || record.state === "retryable") &&
+      (record.state === "validated" ||
+        record.state === "image_uploading" ||
+        record.state === "zap_submitting" ||
+        record.state === "submission_pending" ||
+        record.state === "retryable") &&
       record.status.zapRunIdHash === undefined &&
       record.immutable.payloadExpiresAtMs > this.clock();
     if (!safeToRepair) {
@@ -755,9 +861,15 @@ export class VideoJobStore {
     assertPseudonymousHash(input.correlationId, "video correlation id");
     assertPseudonymousHash(input.senderHash, "video sender hash");
     const prompt = normalizePrompt(input.prompt);
+    const firstFrameInput = input.firstFrameInput === undefined
+      ? undefined
+      : validateFirstFrameInput(input.firstFrameInput);
     const firstFrameUrl = input.firstFrameUrl === undefined ? undefined : normalizeHttpsUrl(input.firstFrameUrl);
     const firstFrameIdentity = input.firstFrameIdentity === undefined ? undefined : input.firstFrameIdentity;
-    if (firstFrameUrl !== undefined) {
+    if (firstFrameInput !== undefined && firstFrameUrl !== undefined) {
+      throw new VideoJobStoreError("invalid_input");
+    }
+    if (firstFrameInput !== undefined || firstFrameUrl !== undefined) {
       if (firstFrameIdentity === undefined) throw new VideoJobStoreError("invalid_input");
       assertPseudonymousHash(firstFrameIdentity, "video first-frame identity");
     } else if (firstFrameIdentity !== undefined) {
@@ -784,6 +896,7 @@ export class VideoJobStore {
       payload: freezePayload({
         schemaVersion: 1,
         prompt,
+        ...(firstFrameInput === undefined ? {} : { firstFrameInput }),
         ...(firstFrameUrl === undefined ? {} : { firstFrameUrl }),
         delivery,
       }),
@@ -909,6 +1022,13 @@ function validateTransitionInput(input: VideoJobTransitionInput): void {
     throw new VideoJobStoreError("invalid_transition");
   }
   if (input.zapRunId !== undefined) validateRunId(input.zapRunId);
+  if (input.firstFrameUrl !== undefined) normalizeHttpsUrl(input.firstFrameUrl);
+  if (input.clearFirstFrameInput !== undefined && input.clearFirstFrameInput !== true) {
+    throw new VideoJobStoreError("invalid_transition");
+  }
+  if (input.clearFirstFrameInput && input.firstFrameUrl === undefined) {
+    throw new VideoJobStoreError("invalid_transition");
+  }
   if (input.video !== undefined) validateVideo(input.video);
   if (input.acknowledgementAttempted !== undefined && input.acknowledgementAttempted !== true) {
     throw new VideoJobStoreError("invalid_transition");
@@ -924,7 +1044,10 @@ function validateTransitionInput(input: VideoJobTransitionInput): void {
   }
   if (
     (input.state === "dead_letter" || input.state === "delivered") &&
-    (input.zapRunId !== undefined || input.video !== undefined)
+    (input.zapRunId !== undefined ||
+      input.firstFrameUrl !== undefined ||
+      input.clearFirstFrameInput !== undefined ||
+      input.video !== undefined)
   ) {
     throw new VideoJobStoreError("invalid_transition");
   }
@@ -1034,7 +1157,11 @@ function validateRecordStateConsistency(state: VideoJobState, status: Record<str
     AUTOMATIC_STATES.has(state) !== hasNextAttempt ||
     (requiresZapRunId(state) && !hasRunId) ||
     (requiresVideoPayload(state) && !hasVideo) ||
-    (state === "submission_pending" && (hasRunId || hasVideo)) ||
+    ((state === "validated" ||
+      state === "image_uploading" ||
+      state === "zap_submitting" ||
+      state === "submission_pending") &&
+      (hasRunId || hasVideo)) ||
     ((state === "submission_unknown" || state === "queued" || state === "running" || state === "retryable") && hasVideo) ||
     ((state === "dead_letter" || state === "delivered") && (hasRunId || hasVideo)) ||
     (requiresFailure && status.failureCategory === undefined)
@@ -1048,13 +1175,20 @@ function parsePayload(value: unknown): VideoJobPayload {
   const payload = value as Record<string, unknown>;
   if (payload.schemaVersion !== 1 || typeof payload.prompt !== "string") throw new VideoJobStoreError("corrupt_record");
   let prompt: string;
+  let firstFrameInput: VideoJobFirstFrameInput | undefined;
   let firstFrameUrl: string | undefined;
   let zapRunId: string | undefined;
   let video: VideoJobVideo | undefined;
   let delivery: VideoJobDeliveryTarget;
   try {
     prompt = normalizePrompt(payload.prompt);
+    firstFrameInput = payload.firstFrameInput === undefined
+      ? undefined
+      : validateFirstFrameInput(payload.firstFrameInput);
     firstFrameUrl = payload.firstFrameUrl === undefined ? undefined : normalizeHttpsUrl(payload.firstFrameUrl as string);
+    if (firstFrameInput !== undefined && firstFrameUrl !== undefined) {
+      throw new VideoJobStoreError("invalid_input");
+    }
     zapRunId = payload.zapRunId === undefined ? undefined : validateRunId(payload.zapRunId);
     video = payload.video === undefined ? undefined : validateVideo(payload.video as VideoJobVideo);
     delivery = validateDeliveryTarget(payload.delivery);
@@ -1064,6 +1198,7 @@ function parsePayload(value: unknown): VideoJobPayload {
   return freezePayload({
     schemaVersion: 1,
     prompt,
+    ...(firstFrameInput === undefined ? {} : { firstFrameInput }),
     ...(firstFrameUrl === undefined ? {} : { firstFrameUrl }),
     ...(zapRunId === undefined ? {} : { zapRunId }),
     ...(video === undefined ? {} : { video }),
@@ -1082,8 +1217,58 @@ function freezeRecord(record: VideoJobRecord): VideoJobRecord {
 function freezePayload(payload: VideoJobPayload): VideoJobPayload {
   return Object.freeze({
     ...payload,
+    ...(payload.firstFrameInput === undefined
+      ? {}
+      : {
+          firstFrameInput: Object.freeze({
+            ...payload.firstFrameInput,
+            attachment: Object.freeze({ ...payload.firstFrameInput.attachment }),
+          }),
+        }),
     ...(payload.video === undefined ? {} : { video: Object.freeze({ ...payload.video }) }),
     delivery: Object.freeze({ ...payload.delivery }),
+  });
+}
+
+function validateFirstFrameInput(value: unknown): VideoJobFirstFrameInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new VideoJobStoreError("invalid_input");
+  }
+  const input = value as Record<string, unknown>;
+  const messageId = input.messageId;
+  if (
+    typeof messageId !== "string" ||
+    !messageId.trim() ||
+    messageId.length > 4_096 ||
+    /[\u0000\r\n]/.test(messageId)
+  ) {
+    throw new VideoJobStoreError("invalid_input");
+  }
+  const attachment = input.attachment;
+  if (!attachment || typeof attachment !== "object" || Array.isArray(attachment)) {
+    throw new VideoJobStoreError("invalid_input");
+  }
+  const raw = attachment as Record<string, unknown>;
+  if (
+    typeof raw.id !== "string" ||
+    !raw.id.trim() ||
+    raw.id.length > 4_096 ||
+    /[\u0000\r\n]/.test(raw.id) ||
+    (raw.name !== null && (typeof raw.name !== "string" || raw.name.length > 1_024 || /[\u0000\r\n]/.test(raw.name))) ||
+    (raw.mimeType !== null &&
+      (typeof raw.mimeType !== "string" || raw.mimeType.length > 320 || /[\u0000\r\n]/.test(raw.mimeType))) ||
+    (raw.size !== null && (!Number.isSafeInteger(raw.size) || (raw.size as number) < 0))
+  ) {
+    throw new VideoJobStoreError("invalid_input");
+  }
+  return Object.freeze({
+    messageId: messageId.trim(),
+    attachment: Object.freeze({
+      id: raw.id.trim(),
+      name: raw.name as string | null,
+      mimeType: raw.mimeType as string | null,
+      size: raw.size as number | null,
+    }),
   });
 }
 

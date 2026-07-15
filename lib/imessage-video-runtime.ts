@@ -36,6 +36,8 @@ import {
   videoJobRecordKey,
   type VideoJobAttempt,
   type VideoJobDeliveryTarget,
+  type VideoJobFirstFrameInput,
+  type PersistedVideoJob,
   type VideoJobRecord,
 } from "./video-job-store.js";
 import { acquireRedisLease } from "./redis.js";
@@ -103,6 +105,12 @@ interface SpectrumAttachmentReader {
 interface PreparedImage {
   readonly bytes: Buffer;
   readonly mimeType: "image/jpeg" | "image/png";
+}
+
+/** Ephemeral bytes let the first post-ack worker avoid a second Photon read. */
+interface PreparedFirstFrameHandoff {
+  readonly record: VideoJobRecord;
+  readonly image: PreparedImage;
 }
 
 class VideoWorkflowError extends Error {
@@ -242,7 +250,10 @@ export async function drainIMessageVideoJobs(options: VideoDrainOptions): Promis
     return;
   }
   for (const record of inboxRecords) {
-    await processInboxRecord(runtime, jobs, record, options.adapter).catch(() => undefined);
+    const prepared = await processInboxRecord(runtime, jobs, record, options.adapter).catch(() => undefined);
+    if (prepared) {
+      await processVideoJob(runtime, jobs, prepared.record, options.adapter, prepared.image).catch(() => undefined);
+    }
   }
 
   let dueJobs: readonly VideoJobRecord[];
@@ -302,7 +313,7 @@ async function processInboxRecord(
   jobs: VideoJobStore,
   record: InboxRecord,
   adapter: AirVideoIMessageAdapter,
-): Promise<void> {
+): Promise<PreparedFirstFrameHandoff | undefined> {
   const lease = await runtime.inbox.beginProcessing(record.immutable.recordKey);
   if (!lease) return;
   try {
@@ -409,42 +420,29 @@ async function processInboxRecord(
         return;
       }
 
-      let firstFrameUrl: string | undefined;
-      let firstFrameIdentity: string | undefined;
-      if (firstFrame) {
-        try {
-          firstFrameUrl = await uploadPreparedFirstFrame({
-            image: firstFrame,
-            correlationId,
-            service: zapClient(runtime),
-          });
-          firstFrameIdentity = deriveOpaqueId(
-            runtime.environment.idHashSecret as string,
-            "video-first-frame",
-            (attachments[0] as NormalizedIMessageAttachment).id,
-          );
-        } catch (error) {
-          const workflow = workflowError(error, "image_transfer");
-          if (workflow.retryable) {
-            await transitionInboxRetryable(lease, workflow.category, runtime.clock());
-          } else {
-            await sendStaticAndFinish(lease, adapter, threadId, AIR_VIDEO_IMAGE_NOTICE);
-          }
-          return;
-        }
-      }
-
       if (!(await admission.refresh(VIDEO_ADMISSION_LEASE_TTL_MS))) {
         await transitionInboxRetryable(lease, "video_admission_lost", runtime.clock());
         return;
       }
 
+      const firstFrameInput = attachments.length === 1
+        ? toFirstFrameInput(envelope.messageId, attachments[0] as NormalizedIMessageAttachment)
+        : undefined;
+      const firstFrameIdentity = firstFrameInput === undefined
+        ? undefined
+        : deriveOpaqueId(
+            runtime.environment.idHashSecret as string,
+            "video-first-frame",
+            firstFrameInput.attachment.id,
+          );
+
+      let persistedJob: PersistedVideoJob;
       try {
-        await jobs.createOrGet({
+        persistedJob = await jobs.createOrGet({
           correlationId,
           senderHash: record.immutable.senderHash,
           prompt,
-          ...(firstFrameUrl === undefined ? {} : { firstFrameUrl, firstFrameIdentity }),
+          ...(firstFrameInput === undefined ? {} : { firstFrameInput, firstFrameIdentity }),
           delivery: {
             chatGuid: envelope.chatGuid,
             phone: envelope.sendingLine,
@@ -460,10 +458,13 @@ async function processInboxRecord(
         return;
       }
 
-      // A durable local submission intent exists before this handoff, but the
-      // user-facing generation acknowledgement waits for Zap to durably accept
-      // the run. The job owns that acknowledgement and all later recovery.
-      await lease.transition("handed_off");
+      // A durable validated input exists before this handoff. The job records
+      // image-upload and Zap-submission intents before each external handoff;
+      // the acknowledgement still waits for durable Zap acceptance.
+      const handedOff = await lease.transition("handed_off");
+      if (handedOff && firstFrame && persistedJob.created && persistedJob.record.state === "validated") {
+        return Object.freeze({ record: persistedJob.record, image: firstFrame });
+      }
     } finally {
       await admission.release().catch(() => undefined);
     }
@@ -479,11 +480,15 @@ async function processVideoJob(
   jobs: VideoJobStore,
   record: VideoJobRecord,
   adapter: AirVideoIMessageAdapter,
+  preloadedImage?: PreparedImage | undefined,
 ): Promise<void> {
   const attempt = await jobs.beginWork(record.immutable.recordKey);
   if (!attempt || !attempt.payload) return;
   try {
     switch (attempt.operation) {
+      case "upload":
+        await uploadVideoFirstFrame(runtime, attempt, adapter, preloadedImage);
+        return;
       case "submit":
         await submitVideoJob(runtime, attempt, adapter);
         return;
@@ -496,6 +501,85 @@ async function processVideoJob(
     }
   } finally {
     await attempt.release();
+  }
+}
+
+/**
+ * The raw Photon reference is encrypted in the job until a GMI-readable frame
+ * URL has been durably recorded. An interruption in this state may repeat an
+ * upload ticket/PUT, but can never reach a paid Seedance submission twice.
+ */
+async function uploadVideoFirstFrame(
+  runtime: AirRuntime,
+  attempt: VideoJobAttempt,
+  adapter: AirVideoIMessageAdapter,
+  preloadedImage?: PreparedImage | undefined,
+): Promise<void> {
+  const payload = attempt.payload;
+  const firstFrameInput = payload?.firstFrameInput;
+  if (!payload || !firstFrameInput || payload.firstFrameUrl !== undefined) {
+    await attempt.transition({
+      expectedStates: ["image_uploading"],
+      state: "dead_letter",
+      failureCategory: "first_frame_source_missing",
+    });
+    return;
+  }
+
+  try {
+    let image = preloadedImage;
+    if (!image) {
+      const threadId = adapter.encodeThreadId({
+        chatGuid: payload.delivery.chatGuid,
+        ...(payload.delivery.phone === undefined ? {} : { phone: payload.delivery.phone }),
+      });
+      image = await prepareFirstFrame({
+        adapter,
+        attachment: firstFrameInput.attachment,
+        messageId: firstFrameInput.messageId,
+        phone: payload.delivery.phone,
+        threadId,
+      });
+    }
+
+    const firstFrameUrl = await uploadPreparedFirstFrame({
+      image,
+      correlationId: attempt.idempotencyKey,
+      service: zapClient(runtime),
+    });
+    const submitting = await attempt.transition({
+      expectedStates: ["image_uploading"],
+      state: "zap_submitting",
+      firstFrameUrl,
+      clearFirstFrameInput: true,
+    });
+    if (!submitting) return;
+
+    // The named checkpoint above is visible to recovery. Persist the stronger
+    // no-retry intent before calling Zap in this same fast-path invocation.
+    const intent = await attempt.transition({
+      expectedStates: ["zap_submitting"],
+      state: "submission_unknown",
+      failureCategory: "submission_intent",
+    });
+    if (!intent) return;
+    await submitVideoJob(runtime, attempt, adapter);
+  } catch (error) {
+    const workflow = workflowError(error, "image_transfer");
+    if (workflow.retryable) {
+      await attempt.transition({
+        expectedStates: ["image_uploading"],
+        state: "image_uploading",
+        failureCategory: workflow.category,
+        nextAttemptAtMs: runtime.clock() + VIDEO_RETRY_DELAY_MS,
+      });
+    } else {
+      await attempt.transition({
+        expectedStates: ["image_uploading"],
+        state: "dead_letter",
+        failureCategory: workflow.category,
+      });
+    }
   }
 }
 
@@ -1012,6 +1096,22 @@ function expectedImageKind(attachment: NormalizedIMessageAttachment): "jpeg" | "
 function isPotentialImage(attachment: NormalizedIMessageAttachment | undefined): boolean {
   return attachment !== undefined && expectedImageKind(attachment) !== undefined &&
     (attachment.size === null || attachment.size <= MAX_INPUT_IMAGE_BYTES);
+}
+
+/** Keep the Photon lookup reference only in the encrypted video-job payload. */
+function toFirstFrameInput(
+  messageId: string,
+  attachment: NormalizedIMessageAttachment,
+): VideoJobFirstFrameInput {
+  return Object.freeze({
+    messageId,
+    attachment: Object.freeze({
+      id: attachment.id,
+      name: attachment.name,
+      mimeType: attachment.mimeType,
+      size: attachment.size,
+    }),
+  });
 }
 
 function detectImageKind(bytes: Buffer): "jpeg" | "png" | "heic" | undefined {
