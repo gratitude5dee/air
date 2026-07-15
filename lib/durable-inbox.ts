@@ -117,6 +117,27 @@ export interface PersistedInbox {
   readonly record: InboxRecord;
 }
 
+/**
+ * Privacy-safe queue observability. These values derive only from private
+ * Redis indexes and immutable receipt timestamps; no envelope data is read
+ * into the returned metric.
+ */
+export interface InboxQueueMetrics {
+  /** Number of nonterminal records currently in the durable inbox. */
+  readonly depth: number;
+  /**
+   * Age of the oldest queued receipt. Undefined only while a bounded
+   * migration fallback cannot establish an exact value.
+   */
+  readonly oldestInboxAgeMs?: number | undefined;
+}
+
+interface ThreadQueueHeadLookup {
+  readonly recordKey: string | null;
+  /** A bounded stale-record repair pass has more members left to clean. */
+  readonly repairIncomplete: boolean;
+}
+
 type InboxPublication =
   | { readonly created: true; readonly threadSequence: number }
   | { readonly created: false };
@@ -181,6 +202,23 @@ const TRANSITIONS: Readonly<Record<InboxState, readonly InboxState[]>> = Object.
 
 const MAX_RECORDED_DELIVERIES = 16;
 const DEFAULT_MAX_PROCESSING_ATTEMPTS = 3;
+/** Legacy records created before the received-at index are scanned only in a bounded maintenance window. */
+const QUEUE_METRICS_FALLBACK_SCAN_LIMIT = 500;
+const QUEUE_METRICS_STALE_INDEX_REPAIRS = 16;
+/** Normal scheduling reads one ready/recovery head per thread, never every tail. */
+const READY_THREAD_SCAN_LIMIT = 500;
+const THREAD_HEAD_STALE_REPAIR_LIMIT = 500;
+const THREAD_HEAD_STALE_REPAIR_PAGE_SIZE = 32;
+const READY_THREADS_BACKFILL_REQUIRED_ERROR = "inbox ready-thread index backfill required";
+/**
+ * A duplicate Photon delivery can arrive while the first request is still
+ * committing its idempotency record.  Wait only a small, fixed fraction of
+ * the webhook's one-second acknowledgement budget before asking Photon to
+ * retry; a second valid concurrent delivery should normally be recorded as
+ * duplicate metadata rather than be surfaced as a spurious 503.
+ */
+const INGRESS_RECORD_LEASE_WAIT_MS = 250;
+const RECORD_LEASE_RETRY_INTERVAL_MS = 5;
 
 export function inboxRecordKey(projectId: string, messageId: string, prefix = "air:inbox:v1"): string {
   assertProviderIdentifier(projectId, "project id");
@@ -270,7 +308,7 @@ export class DurableInbox {
     // queue publication themselves happen in one Redis script below, so a
     // lease expiry or process crash cannot expose a durable record without its
     // earlier per-thread queue entry.
-    const recordLease = await this.acquireRecordLease(recordKey);
+    const recordLease = await this.acquireRecordLease(recordKey, INGRESS_RECORD_LEASE_WAIT_MS);
     if (!recordLease) throw new Error("inbox record is busy");
     try {
       // Avoid extending sequence retention for a redelivery. The original
@@ -367,27 +405,34 @@ export class DurableInbox {
     }
     const now = this.clock();
     const due: InboxRecord[] = [];
-    const threadHeads = new Map<ThreadHash, string | null>();
-    const maxScanned = Math.min(5_000, Math.max(500, limit * 20));
+    await this.assertReadyThreadIndexPresent();
+    const threadHashes = await this.redis.zRangeByScore(
+      this.readyThreadsIndexKey(),
+      Number.NEGATIVE_INFINITY,
+      now,
+      { limit: Math.min(READY_THREAD_SCAN_LIMIT, Math.max(limit * 4, limit)) },
+    );
 
-    // Every queued record has a global pending entry for crash recovery, but
-    // only a thread head is actionable. Take one bounded snapshot rather than
-    // offset-paginating a set we mutate while clearing stale members; removal
-    // shifts offsets and can otherwise skip a live record behind that page.
-    const keys = await this.redis.zRangeByScore(this.pendingIndexKey(), Number.NEGATIVE_INFINITY, now, {
-      limit: maxScanned,
-    });
-    for (const recordKey of keys) {
-      if (due.length >= limit) break;
-      let record = await this.getRecord(recordKey);
-      if (!record) {
-        await this.redis.zRem(this.pendingIndexKey(), recordKey);
+    // The ready index has exactly one member per thread: its current head.
+    // Publication, state writes, heartbeats, and terminal promotion update it
+    // in the same Redis scripts as the durable queue. That makes scheduling
+    // independent of how many later records a busy thread has accumulated.
+    for (const threadHashValue of threadHashes) {
+      if (!isPseudonymousHash(threadHashValue)) {
+        await this.redis.zRem(this.readyThreadsIndexKey(), threadHashValue);
         continue;
       }
-      if (TERMINAL_STATES.has(record.state)) {
-        // New writes remove both indexes atomically. Keep only a best-effort
-        // repair for records created by an older schema.
-        await this.removeFromIndexes(record).catch(() => undefined);
+      const threadHash = threadHashValue as ThreadHash;
+      const head = await this.readThreadQueueHead(threadHash);
+      if (head.repairIncomplete) continue;
+      if (!head.recordKey) {
+        await this.redis.zRem(this.readyThreadsIndexKey(), threadHash);
+        continue;
+      }
+
+      let record = await this.getRecord(head.recordKey);
+      if (!record || TERMINAL_STATES.has(record.state)) {
+        await this.reconcileReadyThread(threadHash);
         continue;
       }
       if (
@@ -399,18 +444,66 @@ export class DurableInbox {
         // Re-check the expiration while holding the record mutex. A heartbeat
         // can refresh the processing lease between the scan above and a state
         // write; treating that live worker as stale would create two owners.
-        record = (await this.recoverExpiredProcessingLease(recordKey)) ?? record;
+        record = (await this.recoverExpiredProcessingLease(head.recordKey)) ?? record;
       }
-      if (!isDispatchable(record, now)) continue;
+      if (!isDispatchable(record, now)) {
+        // A legacy/stale index member must not make a live worker look due.
+        // Re-score it to the active lease expiry (or retry time) for later.
+        await this.reconcileReadyThread(threadHash);
+        continue;
+      }
 
-      let head = threadHeads.get(record.immutable.threadHash);
-      if (head === undefined) {
-        head = await this.nextThreadQueueHead(record.immutable.threadHash);
-        threadHeads.set(record.immutable.threadHash, head);
+      // The head can change only through an atomic queue write, but re-check
+      // it before handing work to a caller after an asynchronous record read.
+      const latestHead = await this.readThreadQueueHead(threadHash);
+      if (latestHead.repairIncomplete || latestHead.recordKey !== head.recordKey) {
+        await this.reconcileReadyThread(threadHash);
+        continue;
       }
-      if (head === recordKey) due.push(record);
+      due.push(record);
     }
-    return Object.freeze(due);
+    // Redis uses the ready-thread hash only as a membership key. Restore the
+    // durable head's due-time/record-key order before applying the worker
+    // limit, so equal-millisecond arrivals remain deterministic across chats.
+    due.sort(compareDueInboxRecords);
+    return Object.freeze(due.slice(0, limit));
+  }
+
+  /**
+   * Returns queue depth plus an exact oldest-receipt age without exposing a
+   * Redis key, provider identifier, sender, thread, or encrypted envelope.
+   *
+   * The scheduling index is deliberately re-scored when a retry is deferred,
+   * so it cannot identify the oldest receipt. A second, lockstep received-at
+   * index preserves that ordering. Deployments with pre-index records fall
+   * back to a bounded complete scan; if the queue is larger than that bounded
+   * window, the age is withheld rather than reported inaccurately.
+   */
+  async getQueueMetrics(): Promise<InboxQueueMetrics> {
+    const [depth, receivedAtIndexDepth] = await Promise.all([
+      this.redis.zCard(this.pendingIndexKey()),
+      this.redis.zCard(this.receivedAtIndexKey()),
+    ]);
+    if (depth === 0) return Object.freeze({ depth: 0, oldestInboxAgeMs: 0 });
+
+    if (depth === receivedAtIndexDepth) {
+      const oldest = await this.readOldestReceivedAtRecord();
+      if (oldest) {
+        const [reconciledDepth, reconciledReceivedAtIndexDepth] = await Promise.all([
+          this.redis.zCard(this.pendingIndexKey()),
+          this.redis.zCard(this.receivedAtIndexKey()),
+        ]);
+        if (reconciledDepth === depth && reconciledReceivedAtIndexDepth === depth) {
+          return Object.freeze({
+            depth,
+            oldestInboxAgeMs: Math.max(0, this.clock() - oldest.immutable.receivedAtMs),
+          });
+        }
+        return this.getLegacyQueueMetrics(reconciledDepth);
+      }
+    }
+
+    return this.getLegacyQueueMetrics(depth);
   }
 
   /**
@@ -770,6 +863,8 @@ export class DurableInbox {
         record.immutable.recordKey,
         this.pendingIndexKey(),
         this.threadQueueKey(record.immutable.threadHash),
+        this.receivedAtIndexKey(),
+        this.readyThreadsIndexKey(),
       ],
       arguments: [
         JSON.stringify(redactInboxRecord(record)),
@@ -781,6 +876,8 @@ export class DurableInbox {
         String(index.pendingScore),
         record.immutable.recordKey,
         String(record.immutable.threadSequence),
+        String(record.immutable.receivedAtMs),
+        record.immutable.threadHash,
       ],
     });
     if (Number(result) !== 1) throw new Error("inbox record could not be updated");
@@ -803,6 +900,8 @@ export class DurableInbox {
         this.pendingIndexKey(),
         this.threadQueueKey(record.immutable.threadHash),
         this.threadSequenceKey(record.immutable.threadHash),
+        this.receivedAtIndexKey(),
+        this.readyThreadsIndexKey(),
       ],
       arguments: [
         JSON.stringify(redactInboxRecord(record)),
@@ -812,6 +911,8 @@ export class DurableInbox {
         String(record.immutable.receivedAtMs),
         record.immutable.recordKey,
         String(ttlSeconds(record.immutable.metadataExpiresAtMs, now)),
+        String(record.immutable.receivedAtMs),
+        record.immutable.threadHash,
       ],
     });
     if (!Array.isArray(result) || result.length < 2) {
@@ -826,38 +927,193 @@ export class DurableInbox {
     return Object.freeze({ created: true, threadSequence });
   }
 
-  private async acquireRecordLease(recordKey: string): Promise<RedisLease | null> {
-    return acquireRedisLease(this.redis, this.recordLeaseKey(recordKey), {
-      ttlMs: 15_000,
-      now: this.clock,
-    });
+  private async acquireRecordLease(
+    recordKey: string,
+    waitForContentionMs = 0,
+  ): Promise<RedisLease | null> {
+    const deadline = Date.now() + waitForContentionMs;
+    for (;;) {
+      const lease = await acquireRedisLease(this.redis, this.recordLeaseKey(recordKey), {
+        ttlMs: 15_000,
+        now: this.clock,
+      });
+      if (lease || Date.now() >= deadline) return lease;
+      await new Promise<void>((resolve) => setTimeout(resolve, RECORD_LEASE_RETRY_INTERVAL_MS));
+    }
   }
 
   private async removeFromIndexes(record: InboxRecord): Promise<void> {
     await Promise.all([
       this.redis.zRem(this.pendingIndexKey(), record.immutable.recordKey),
+      this.redis.zRem(this.receivedAtIndexKey(), record.immutable.recordKey),
       this.redis.zRem(this.threadQueueKey(record.immutable.threadHash), record.immutable.recordKey),
+    ]);
+    await this.reconcileReadyThread(record.immutable.threadHash);
+  }
+
+  private async removeUnknownRecordFromIndexes(recordKey: string): Promise<void> {
+    await Promise.all([
+      this.redis.zRem(this.pendingIndexKey(), recordKey),
+      this.redis.zRem(this.receivedAtIndexKey(), recordKey),
     ]);
   }
 
-  private async nextThreadQueueHead(threadHash: ThreadHash): Promise<string | null> {
-    const queueKey = this.threadQueueKey(threadHash);
-    const candidates = await this.redis.zRangeByScore(queueKey, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY, {
-      limit: 32,
-    });
-    for (const key of candidates) {
-      const record = await this.getRecord(key);
-      if (!record || TERMINAL_STATES.has(record.state)) {
-        await this.redis.zRem(queueKey, key);
-        continue;
+  private async readOldestReceivedAtRecord(): Promise<InboxRecord | null> {
+    for (let repair = 0; repair < QUEUE_METRICS_STALE_INDEX_REPAIRS; repair += 1) {
+      const [recordKey] = await this.redis.zRangeByScore(
+        this.receivedAtIndexKey(),
+        Number.NEGATIVE_INFINITY,
+        Number.POSITIVE_INFINITY,
+        { limit: 1 },
+      );
+      if (!recordKey) return null;
+
+      const record = await this.getRecord(recordKey);
+      if (record && !TERMINAL_STATES.has(record.state)) return record;
+      if (record) {
+        await this.removeFromIndexes(record);
+      } else {
+        await this.removeUnknownRecordFromIndexes(recordKey);
       }
-      return key;
     }
     return null;
   }
 
+  private async getLegacyQueueMetrics(depth: number): Promise<InboxQueueMetrics> {
+    if (depth === 0) return Object.freeze({ depth: 0, oldestInboxAgeMs: 0 });
+    const scanLimit = Math.min(depth, QUEUE_METRICS_FALLBACK_SCAN_LIMIT);
+    const recordKeys = await this.redis.zRangeByScore(
+      this.pendingIndexKey(),
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      { limit: scanLimit },
+    );
+    let oldestReceivedAtMs: number | undefined;
+    for (const recordKey of recordKeys) {
+      const record = await this.getRecord(recordKey);
+      if (record && !TERMINAL_STATES.has(record.state)) {
+        oldestReceivedAtMs = oldestReceivedAtMs === undefined
+          ? record.immutable.receivedAtMs
+          : Math.min(oldestReceivedAtMs, record.immutable.receivedAtMs);
+      } else if (record) {
+        await this.removeFromIndexes(record);
+      } else {
+        await this.removeUnknownRecordFromIndexes(recordKey);
+      }
+    }
+
+    const reconciledDepth = await this.redis.zCard(this.pendingIndexKey());
+    if (reconciledDepth === 0) return Object.freeze({ depth: 0, oldestInboxAgeMs: 0 });
+    if (
+      reconciledDepth > scanLimit ||
+      recordKeys.length < reconciledDepth ||
+      oldestReceivedAtMs === undefined
+    ) {
+      return Object.freeze({ depth: reconciledDepth });
+    }
+    return Object.freeze({
+      depth: reconciledDepth,
+      oldestInboxAgeMs: Math.max(0, this.clock() - oldestReceivedAtMs),
+    });
+  }
+
+  private async nextThreadQueueHead(threadHash: ThreadHash): Promise<string | null> {
+    return (await this.readThreadQueueHead(threadHash)).recordKey;
+  }
+
+  /**
+   * Cleans stale queue members from the prefix without scanning a busy live
+   * thread's tail. If a legacy/corrupt queue needs more repair, callers leave
+   * its ready-thread member in place for the next bounded scheduler pass.
+   */
+  private async readThreadQueueHead(threadHash: ThreadHash): Promise<ThreadQueueHeadLookup> {
+    const queueKey = this.threadQueueKey(threadHash);
+    let repaired = 0;
+    while (repaired < THREAD_HEAD_STALE_REPAIR_LIMIT) {
+      const candidates = await this.redis.zRangeByScore(
+        queueKey,
+        Number.NEGATIVE_INFINITY,
+        Number.POSITIVE_INFINITY,
+        { limit: Math.min(THREAD_HEAD_STALE_REPAIR_PAGE_SIZE, THREAD_HEAD_STALE_REPAIR_LIMIT - repaired) },
+      );
+      if (candidates.length === 0) {
+        return Object.freeze({ recordKey: null, repairIncomplete: false });
+      }
+      for (const key of candidates) {
+        const record = await this.getRecord(key);
+        if (!record || TERMINAL_STATES.has(record.state)) {
+          await this.redis.zRem(queueKey, key);
+          repaired += 1;
+          continue;
+        }
+        return Object.freeze({ recordKey: key, repairIncomplete: false });
+      }
+      // Every member in this prefix was stale and has been removed. Fetch the
+      // next prefix at offset zero so removal cannot skip the live head.
+    }
+    const [remaining] = await this.redis.zRangeByScore(
+      queueKey,
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      { limit: 1 },
+    );
+    return Object.freeze({ recordKey: null, repairIncomplete: remaining !== undefined });
+  }
+
+  /**
+   * Best-effort repair for legacy or manually-corrupted indexes. Normal queue
+   * publication and state transitions do this atomically in Redis Lua.
+   */
+  private async reconcileReadyThread(threadHash: ThreadHash): Promise<void> {
+    for (let remaining = 0; remaining < 32; remaining += 1) {
+      const head = await this.readThreadQueueHead(threadHash);
+      if (head.repairIncomplete) return;
+      if (!head.recordKey) {
+        await this.redis.zRem(this.readyThreadsIndexKey(), threadHash);
+        return;
+      }
+      const record = await this.getRecord(head.recordKey);
+      if (!record || TERMINAL_STATES.has(record.state)) continue;
+      const score = inboxReadyThreadScore(record);
+      if (score === undefined) {
+        await this.redis.zRem(this.readyThreadsIndexKey(), threadHash);
+      } else {
+        await this.redis.zAdd(this.readyThreadsIndexKey(), [{ score, value: threadHash }]);
+      }
+      return;
+    }
+    await this.redis.zRem(this.readyThreadsIndexKey(), threadHash);
+  }
+
+  /**
+   * This release intentionally has no automatic global-pending fallback: an
+   * offset scan can again let one thread's tail hide another thread forever.
+   * Existing queues must be drained or backfilled while quiescent before this
+   * ready-head index is enabled. The double read avoids falsely flagging an
+   * atomic ingress publication that races this scheduler invocation.
+   */
+  private async assertReadyThreadIndexPresent(): Promise<void> {
+    if (await this.redis.zCard(this.pendingIndexKey()) === 0) return;
+    if (await this.redis.zCard(this.readyThreadsIndexKey()) > 0) return;
+    const [pendingDepth, readyThreadDepth] = await Promise.all([
+      this.redis.zCard(this.pendingIndexKey()),
+      this.redis.zCard(this.readyThreadsIndexKey()),
+    ]);
+    if (pendingDepth > 0 && readyThreadDepth === 0) {
+      throw new Error(READY_THREADS_BACKFILL_REQUIRED_ERROR);
+    }
+  }
+
   private pendingIndexKey(): string {
     return `${this.prefix}:pending`;
+  }
+
+  private readyThreadsIndexKey(): string {
+    return `${this.prefix}:ready-threads`;
+  }
+
+  private receivedAtIndexKey(): string {
+    return `${this.prefix}:pending:received-at`;
   }
 
   private metadataRecordKey(recordKey: string): string {
@@ -987,6 +1243,30 @@ function inboxIndexIntent(record: InboxRecord): {
       ? (record.status.nextAttemptAtMs ?? record.status.updatedAtMs)
       : record.immutable.receivedAtMs,
   });
+}
+
+/**
+ * The ready-thread index carries one current head per thread. Active heads
+ * stay scheduled at their durable lease expiry so a crashed worker is still
+ * recoverable without scanning every later record in that thread.
+ */
+function inboxReadyThreadScore(record: InboxRecord): number | undefined {
+  if (record.state === "received" || record.state === "failed_retryable") {
+    return inboxIndexIntent(record).pendingScore;
+  }
+  const leaseExpiry = record.status.processingLeaseExpiresAtMs;
+  return typeof leaseExpiry === "number" && Number.isSafeInteger(leaseExpiry) && leaseExpiry >= 0
+    ? leaseExpiry
+    : undefined;
+}
+
+function compareDueInboxRecords(first: InboxRecord, second: InboxRecord): number {
+  const firstScore = inboxReadyThreadScore(first) ?? Number.POSITIVE_INFINITY;
+  const secondScore = inboxReadyThreadScore(second) ?? Number.POSITIVE_INFINITY;
+  if (firstScore !== secondScore) return firstScore - secondScore;
+  if (first.immutable.recordKey < second.immutable.recordKey) return -1;
+  if (first.immutable.recordKey > second.immutable.recordKey) return 1;
+  return 0;
 }
 
 function createAttemptToken(): string {

@@ -200,6 +200,7 @@ export function normalizeSpectrumWebhook(input: {
     : undefined;
   const contentType = typeof content?.type === "string" ? content.type.slice(0, 80) : null;
   const text = typeof content?.text === "string" ? content.text : null;
+  const spaceType = resolveSpectrumSpaceType(payload.space.id, payload.space.type);
 
   return Object.freeze({
     version: 1,
@@ -210,11 +211,33 @@ export function normalizeSpectrumWebhook(input: {
     phone: payload.space.phone ?? payload.message.space?.phone ?? null,
     senderId: payload.message.sender?.id ?? "",
     direction: payload.message.direction ?? "inbound",
-    spaceType: payload.space.type ?? "unknown",
+    spaceType,
     text,
     contentType,
     receivedAt: input.receivedAt ?? Date.now(),
   });
+}
+
+/**
+ * Spectrum documents `space.type` as optional. The official iMessage adapter
+ * encodes direct-message and group chat GUIDs with distinct delimiters, so
+ * recover that information only when the provider omitted the optional field.
+ * A contradictory declared type is rejected rather than letting an attacker
+ * steer an otherwise unambiguous direct/group policy decision.
+ */
+function resolveSpectrumSpaceType(
+  chatGuid: string,
+  declared: "dm" | "group" | undefined,
+): "dm" | "group" | "unknown" {
+  const inferred = chatGuid.includes(";-;")
+    ? "dm"
+    : chatGuid.includes(";+;")
+      ? "group"
+      : "unknown";
+  if (declared && inferred !== "unknown" && declared !== inferred) {
+    throw new WebhookInputError(400, "invalid_payload");
+  }
+  return declared ?? inferred;
 }
 
 /** Only inbound plain-text DMs may enter the Eve/RAG work path. */

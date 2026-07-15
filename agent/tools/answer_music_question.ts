@@ -36,6 +36,72 @@ const outputSchema = z.discriminatedUnion("kind", [
 
 export type AnswerMusicQuestionToolOutput = z.infer<typeof outputSchema>;
 
+export type AirToolFailureCategory = "upstream_timeout" | "rag_execution";
+
+/**
+ * This is the only error shape permitted to leave the application tool
+ * boundary. Eve logs tool errors verbatim, while provider errors can contain
+ * request bodies, transcript excerpts, headers, and credentials.
+ */
+export class AirToolExecutionError extends Error {
+  public readonly category: AirToolFailureCategory;
+  /** Eve recognizes this safe marker when deciding whether to retry a task. */
+  public readonly isRetryable: boolean;
+
+  public constructor(category: AirToolFailureCategory) {
+    super(
+      category === "upstream_timeout"
+        ? "AR Agent research is temporarily unavailable."
+        : "AR Agent research could not be completed.",
+    );
+    this.name = "AirToolExecutionError";
+    this.category = category;
+    this.isRetryable = category === "upstream_timeout";
+  }
+}
+
+/** Exported separately so the tool-error boundary can be tested without Eve. */
+export async function executeAnswerMusicQuestion(
+  question: string,
+  executeGroundedAnswer: typeof answerMusicQuestion = answerMusicQuestion,
+): Promise<AnswerMusicQuestionToolOutput> {
+  const startedAtMs = Date.now();
+  try {
+    const grounded = await executeGroundedAnswer(question);
+    const output = {
+      kind: "air.grounded-answer.v1" as const,
+      rendered: grounded.answer,
+      intent: grounded.intent,
+      sourceCount: grounded.sources.length,
+      citationRetries: grounded.citationRetries,
+    };
+    operationalLogger.info("rag.answer_completed", {
+      latencyMs: Date.now() - startedAtMs,
+      intent: output.intent,
+      sourceCount: output.sourceCount,
+      citationRetries: output.citationRetries,
+    });
+    return output;
+  } catch (error) {
+    if (error instanceof GroundingValidationError) {
+      operationalLogger.warn("rag.answer_validation_fallback", {
+        latencyMs: Date.now() - startedAtMs,
+        category: error.reason,
+      });
+      return { kind: "air.capability-fallback.v1", reason: "citation_validation" };
+    }
+    const category: AirToolFailureCategory = isRetryableUpstreamError(error)
+      ? "upstream_timeout"
+      : "rag_execution";
+    operationalLogger.error("rag.answer_failed", {
+      latencyMs: Date.now() - startedAtMs,
+      category,
+    });
+    // Deliberately do not set `cause` or copy properties from `error`.
+    throw new AirToolExecutionError(category);
+  }
+}
+
 /**
  * Air's sole callable capability. Retrieval, generation, citation checking,
  * and source rendering all happen before this tool result reaches the channel.
@@ -49,37 +115,7 @@ export const answerMusicQuestionTool = defineTool({
   inputSchema,
   outputSchema,
   async execute({ question }): Promise<AnswerMusicQuestionToolOutput> {
-    const startedAtMs = Date.now();
-    try {
-      const grounded = await answerMusicQuestion(question);
-      const output = {
-        kind: "air.grounded-answer.v1" as const,
-        rendered: grounded.answer,
-        intent: grounded.intent,
-        sourceCount: grounded.sources.length,
-        citationRetries: grounded.citationRetries,
-      };
-      operationalLogger.info("rag.answer_completed", {
-        latencyMs: Date.now() - startedAtMs,
-        intent: output.intent,
-        sourceCount: output.sourceCount,
-        citationRetries: output.citationRetries,
-      });
-      return output;
-    } catch (error) {
-      if (error instanceof GroundingValidationError) {
-        operationalLogger.warn("rag.answer_validation_fallback", {
-          latencyMs: Date.now() - startedAtMs,
-          category: error.reason,
-        });
-        return { kind: "air.capability-fallback.v1", reason: "citation_validation" };
-      }
-      operationalLogger.error("rag.answer_failed", {
-        latencyMs: Date.now() - startedAtMs,
-        category: isRetryableUpstreamError(error) ? "upstream_timeout" : "rag_execution",
-      });
-      throw error;
-    }
+    return executeAnswerMusicQuestion(question);
   },
 });
 

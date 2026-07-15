@@ -25,6 +25,7 @@ afterEach(() => {
   delete process.env.VOYAGE_API_KEY;
   delete process.env.VOYAGE_API_BASE_URL;
   delete process.env.EMBED_MODEL;
+  delete process.env.EMBED_FALLBACK_MODEL;
   delete process.env.RERANK_MODEL;
 });
 
@@ -78,4 +79,22 @@ test("valid Voyage embeddings retain the required 1024 dimensions", async () => 
   );
 
   await expect(embedQuery("artist strategy")).resolves.toEqual(embedding);
+});
+
+test("pins Voyage requests despite unsupported endpoint and fallback-model environment variables", async () => {
+  process.env.VOYAGE_API_KEY = "test-key";
+  process.env.EMBED_MODEL = "voyage-4-large";
+  process.env.VOYAGE_API_BASE_URL = "https://untrusted.example/v1";
+  process.env.EMBED_FALLBACK_MODEL = "untrusted-model";
+  const embedding = Array.from({ length: VOYAGE_DIMENSIONS }, (_value, index) => index);
+  const fetchMock = vi.fn().mockResolvedValue(
+    new Response(JSON.stringify({ data: [{ embedding }] }), { status: 200 }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+
+  await expect(embedQuery("artist strategy")).resolves.toEqual(embedding);
+
+  expect(fetchMock.mock.calls[0]?.[0]).toBe("https://ai.mongodb.com/v1/embeddings");
+  const body = JSON.parse(String((fetchMock.mock.calls[0]?.[1] as RequestInit | undefined)?.body));
+  expect(body).toMatchObject({ model: "voyage-4-large" });
 });

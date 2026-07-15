@@ -8,7 +8,12 @@ import {
   type InboxRecord,
   type InboxState,
 } from "./durable-inbox.js";
-import { DurableOutbox, outboxRecordKey, type OutboxState } from "./durable-outbox.js";
+import {
+  DurableOutbox,
+  outboxRecordKey,
+  type OutboxSendAttempt,
+  type OutboxState,
+} from "./durable-outbox.js";
 import { loadAirEnvironment, type AirEnvironment } from "./env.js";
 import { createRedactedLogger } from "./logging.js";
 import { RateLimiter } from "./rate-limit.js";
@@ -61,6 +66,17 @@ const MAX_QUESTION_CHARS = 2_000;
 /** Signed ingress has to acknowledge or fail closed before Photon retries. */
 export const WEBHOOK_DURABILITY_BUDGET_MS = 900;
 
+/**
+ * Intentional, silent product-policy outcomes. They use the terminal queue
+ * state to erase transient payloads, but do not warrant a dead-letter page.
+ */
+const POLICY_DROP_CATEGORIES = new Set([
+  "unsupported_inbound_event",
+  "group_notice_suppressed",
+  "access_notice_suppressed",
+  "rate_notice_suppressed",
+]);
+
 const logger = createRedactedLogger((event) => {
   // The logger sanitizes fields before they reach the Vercel log stream.
   console.log(JSON.stringify(event));
@@ -80,7 +96,11 @@ export interface AirIMessageTurnInput {
   readonly message: string;
   readonly target: {
     readonly adapterName: typeof IMESSAGE_ADAPTER_NAME;
-    readonly threadId: string;
+    /**
+     * A correlation HMAC used as the workflow's opaque delivery handle. The
+     * matching physical thread stays only in the encrypted Redis target.
+     */
+    readonly deliveryTargetId: CorrelationId;
     /** HMAC-derived and attempt-scoped; never the raw queue capability. */
     readonly continuationKey: string;
   };
@@ -99,12 +119,23 @@ export interface AirIMessageSession {
 }
 
 export interface AirChatThread {
+  /**
+   * Opaque event-thread handle. Production channel contexts set this to the
+   * delivery-target correlation id; unit fixtures may use a physical id only
+   * at the isolated in-process boundary.
+   */
   readonly id: string;
   post(message: string): Promise<unknown>;
 }
 
 export interface AirChatEventChannel {
   readonly thread: AirChatThread | null;
+  /**
+   * The custom Eve channel persists only this correlation HMAC. It is resolved
+   * through the encrypted delivery-target record at lifecycle time instead of
+   * retaining a Photon thread in Vercel workflow state.
+   */
+  readonly state?: { readonly deliveryTargetId?: string | null };
   /** Eve channel operation used to retire a parked HITL continuation. */
   setContinuationToken?(token: string): void;
 }
@@ -248,6 +279,21 @@ async function getRuntime(): Promise<AirRuntime> {
     });
   }
   return runtimePromise;
+}
+
+/**
+ * Resolves a workflow-safe delivery-target HMAC only at the moment the
+ * Photon-backed Chat SDK thread needs to post. The physical thread id remains
+ * inside the encrypted Redis target and is never returned to Eve state,
+ * metadata, continuation tokens, or workflow attributes.
+ */
+export async function resolveIMessageDeliveryThreadId(
+  deliveryTargetId: string,
+): Promise<string | null> {
+  if (!isOpaqueCorrelationId(deliveryTargetId)) return null;
+  const runtime = await getRuntime();
+  const target = await loadDeliveryTarget(runtime, deliveryTargetId as CorrelationId);
+  return target?.threadId ?? null;
 }
 
 function assertQueueEnvironment(environment: AirEnvironment): void {
@@ -398,12 +444,20 @@ export async function drainDurableInbox(options: DurableDrainOptions): Promise<v
     logger.error("imessage.inbox_scan_failed", { category: "inbox_scan" });
     return;
   }
+  const queueMetrics = await runtime.inbox.getQueueMetrics().catch(() => {
+    // Observability must never prevent a durable worker from draining a
+    // successfully scanned queue. The next invocation will retry this read.
+    logger.error("imessage.inbox_metrics_failed", { category: "inbox_metrics" });
+    return undefined;
+  });
   logger.info("imessage.inbox_scan", {
     dueCount: due.length,
-    oldestInboxAgeMs: due.reduce(
-      (oldest, record) => Math.max(oldest, runtime.clock() - record.immutable.receivedAtMs),
-      0,
-    ),
+    ...(queueMetrics ? {
+      queueDepth: queueMetrics.depth,
+      ...(queueMetrics.oldestInboxAgeMs === undefined
+        ? {}
+        : { oldestInboxAgeMs: queueMetrics.oldestInboxAgeMs }),
+    } : {}),
   });
 
   for (const record of due) {
@@ -563,13 +617,23 @@ async function processInboxRecord(
     });
     const started = await lease.transition("session_started", { expectedStates: ["processing"] });
     if (!started || started.state !== "session_started") {
-      await clearActiveTurn(runtime, threadId, current.immutable.recordKey, lease.attemptToken);
-      await transitionRetryable(runtime, lease, "session_start_state_conflict");
+      await endHandoffAttempt(
+        runtime,
+        lease,
+        threadId,
+        current.immutable.recordKey,
+        "session_start_state_conflict",
+      );
       return;
     }
     if (!(await lease.heartbeat())) {
-      await clearActiveTurn(runtime, threadId, current.immutable.recordKey, lease.attemptToken);
-      await transitionRetryable(runtime, lease, "session_lease_heartbeat_failed");
+      await endHandoffAttempt(
+        runtime,
+        lease,
+        threadId,
+        current.immutable.recordKey,
+        "session_lease_heartbeat_failed",
+      );
       return;
     }
 
@@ -578,7 +642,7 @@ async function processInboxRecord(
         message: text,
         target: {
           adapterName: IMESSAGE_ADAPTER_NAME,
-          threadId,
+          deliveryTargetId: correlationId,
           continuationKey: attemptScopedContinuationKey(runtime, active),
         },
         auth: {
@@ -593,8 +657,13 @@ async function processInboxRecord(
       });
       const sessionId = sessionIdFromReceive(session);
       if (!sessionId || !(await bindActiveTurnSession(runtime, threadId, active, sessionId))) {
-        await clearActiveTurn(runtime, threadId, current.immutable.recordKey, lease.attemptToken);
-        await transitionRetryable(runtime, lease, "eve_session_bind_failed");
+        await endHandoffAttempt(
+          runtime,
+          lease,
+          threadId,
+          current.immutable.recordKey,
+          "eve_session_bind_failed",
+        );
         return;
       }
       // The task is now owned by durable active-turn metadata rather than this
@@ -603,8 +672,13 @@ async function processInboxRecord(
       handoffOwnsLease = true;
       logger.info("imessage.session_handed_off", { correlationId });
     } catch {
-      await clearActiveTurn(runtime, threadId, current.immutable.recordKey, lease.attemptToken);
-      await transitionRetryable(runtime, lease, "eve_receive_failed");
+      await endHandoffAttempt(
+        runtime,
+        lease,
+        threadId,
+        current.immutable.recordKey,
+        "eve_receive_failed",
+      );
     }
   } finally {
     if (!handoffOwnsLease) await lease.release();
@@ -635,14 +709,21 @@ async function continueExistingOutbox(
     // The provider send completed before a crash, but the inbox did not reach
     // its terminal state. Reconcile through the legal state graph without a
     // second provider call.
-    const ready = await ensureResponseReady(runtime, record.immutable.recordKey, attemptToken);
+    const ready = await ensureResponseReady(
+      runtime,
+      record.immutable.recordKey,
+      attemptToken,
+      record.status.failureCategory,
+    );
     if (!ready) return;
+    const diagnosticCategory = ready.status.failureCategory;
     const sending = await transitionInbox(
       runtime,
       record.immutable.recordKey,
       "sending",
       ["response_ready"],
       attemptToken,
+      diagnosticCategory,
     );
     if (!sending || sending.state !== "sending") return;
     const sent = await transitionInbox(
@@ -651,6 +732,7 @@ async function continueExistingOutbox(
       "sent",
       ["sending"],
       attemptToken,
+      sending.status.failureCategory ?? diagnosticCategory,
     );
     if (sent?.state === "sent") {
       await cleanupDeliveredTurn(runtime, correlationId, threadId, record.immutable.recordKey, attemptToken);
@@ -768,8 +850,10 @@ export async function handleIMessageActionResult(input: {
   let runtime: AirRuntime;
   try {
     runtime = await getRuntime();
-    const active = await loadActiveTurn(runtime, thread.id, input.sessionId, turnId);
-    if (!active || !(await renewActiveAttempt(runtime, thread.id, active))) return;
+    const target = await resolveLifecycleEventTarget(runtime, input.eventChannel);
+    if (!target) return;
+    const active = await loadActiveTurn(runtime, target.threadId, input.sessionId, turnId);
+    if (!active || !matchesLifecycleTarget(active, target) || !(await renewActiveAttempt(runtime, target.threadId, active))) return;
     const result = validatedAnswerFromActionEvent(input.event);
     if (!result) return;
     const stored = await storeValidatedResult(runtime, active.correlationId, {
@@ -801,10 +885,12 @@ export async function handleIMessageTurnStarted(input: {
   if (!thread || !turnId) return;
   try {
     const runtime = await getRuntime();
-    const active = await loadActiveTurnForStart(runtime, thread.id, input.sessionId);
-    if (!active || (active.turnId && active.turnId !== turnId)) return;
-    if (!(await renewActiveAttempt(runtime, thread.id, active))) return;
-    const replaced = await replaceActiveTurn(runtime, thread.id, active, {
+    const target = await resolveLifecycleEventTarget(runtime, input.eventChannel);
+    if (!target) return;
+    const active = await loadActiveTurnForStart(runtime, target.threadId, input.sessionId);
+    if (!active || !matchesLifecycleTarget(active, target) || (active.turnId && active.turnId !== turnId)) return;
+    if (!(await renewActiveAttempt(runtime, target.threadId, active))) return;
+    const replaced = await replaceActiveTurn(runtime, target.threadId, active, {
       ...active,
       sessionId: input.sessionId,
       turnId,
@@ -831,11 +917,13 @@ export async function handleIMessageMessageCompleted(input: {
   if (!thread || !turnId) return;
   try {
     const runtime = await getRuntime();
-    const active = await loadActiveTurn(runtime, thread.id, input.sessionId, turnId);
-    if (!active || !(await renewActiveAttempt(runtime, thread.id, active))) return;
+    const target = await resolveLifecycleEventTarget(runtime, input.eventChannel);
+    if (!target) return;
+    const active = await loadActiveTurn(runtime, target.threadId, input.sessionId, turnId);
+    if (!active || !matchesLifecycleTarget(active, target) || !(await renewActiveAttempt(runtime, target.threadId, active))) return;
     const validated = await loadValidatedResult(runtime, active.correlationId, active.attemptToken);
     const response = validated?.renderedResponse ?? AR_AGENT_CAPABILITY_BLURB;
-    await queueEventResponse(runtime, active, thread, response);
+    await queueEventResponse(runtime, active, thread, target.threadId, response);
   } catch {
     logger.error("imessage.completion_failed", { category: "message_completion" });
   }
@@ -851,10 +939,11 @@ export async function handleIMessageTurnFailed(input: {
   if (!thread || !turnId) return;
   try {
     const runtime = await getRuntime();
-    const active = await loadActiveTurn(runtime, thread.id, input.sessionId, turnId);
-    if (!active || !(await renewActiveAttempt(runtime, thread.id, active))) return;
-    const validated = await loadValidatedResult(runtime, active.correlationId, active.attemptToken);
-    await queueEventResponse(runtime, active, thread, validated?.renderedResponse ?? AR_AGENT_RETRY_NOTICE);
+    const target = await resolveLifecycleEventTarget(runtime, input.eventChannel);
+    if (!target) return;
+    const active = await loadActiveTurn(runtime, target.threadId, input.sessionId, turnId);
+    if (!active || !matchesLifecycleTarget(active, target) || !(await renewActiveAttempt(runtime, target.threadId, active))) return;
+    await queueEventResponse(runtime, active, thread, target.threadId, AR_AGENT_RETRY_NOTICE, "eve_turn_failed");
   } catch {
     logger.error("imessage.turn_failure_handler_failed", { category: "turn_failure" });
   }
@@ -870,14 +959,16 @@ export async function handleIMessageInputRequested(input: {
   if (!thread || !turnId) return;
   try {
     const runtime = await getRuntime();
-    const active = await loadActiveTurn(runtime, thread.id, input.sessionId, turnId);
-    if (!active || !(await renewActiveAttempt(runtime, thread.id, active))) return;
+    const target = await resolveLifecycleEventTarget(runtime, input.eventChannel);
+    if (!target) return;
+    const active = await loadActiveTurn(runtime, target.threadId, input.sessionId, turnId);
+    if (!active || !matchesLifecycleTarget(active, target) || !(await renewActiveAttempt(runtime, target.threadId, active))) return;
     // Task-mode sessions have no requestInput capability. If a future
     // framework/tool path nevertheless reports this event, deliver the fixed
     // rephrase guidance and return normally; Eve's task workflow owns the
     // terminal session.failed boundary. Adapter handler exceptions are
     // intentionally swallowed by Eve and cannot be used as cancellation.
-    await queueEventResponse(runtime, active, thread, AR_AGENT_REPHRASE_GUIDANCE);
+    await queueEventResponse(runtime, active, thread, target.threadId, AR_AGENT_REPHRASE_GUIDANCE);
   } catch {
     logger.error("imessage.input_request_handler_failed", { category: "input_request" });
   }
@@ -893,13 +984,14 @@ export async function handleIMessageSessionFailed(input: {
   if (!thread || !sessionId) return;
   try {
     const runtime = await getRuntime();
-    const active = await loadActiveTurn(runtime, thread.id, sessionId);
+    const target = await resolveLifecycleEventTarget(runtime, input.eventChannel);
+    if (!target) return;
+    const active = await loadActiveTurn(runtime, target.threadId, sessionId);
     // A prior session can finish while a recovered attempt is still in the
     // receive/start race. Do not let a session-only event send a fallback
     // until the exact turn id has bound this durable attempt.
-    if (!active || !active.turnId || !(await renewActiveAttempt(runtime, thread.id, active))) return;
-    const validated = await loadValidatedResult(runtime, active.correlationId, active.attemptToken);
-    await queueEventResponse(runtime, active, thread, validated?.renderedResponse ?? AR_AGENT_RETRY_NOTICE);
+    if (!active || !matchesLifecycleTarget(active, target) || !active.turnId || !(await renewActiveAttempt(runtime, target.threadId, active))) return;
+    await queueEventResponse(runtime, active, thread, target.threadId, AR_AGENT_RETRY_NOTICE, "eve_session_failed");
   } catch {
     logger.error("imessage.session_failure_handler_failed", { category: "session_failure" });
   }
@@ -918,10 +1010,12 @@ export async function handleIMessageSessionCompleted(input: {
   if (!thread) return;
   try {
     const runtime = await getRuntime();
-    const active = await loadActiveTurn(runtime, thread.id, input.sessionId);
-    if (!active || !active.turnId || !(await renewActiveAttempt(runtime, thread.id, active))) return;
+    const target = await resolveLifecycleEventTarget(runtime, input.eventChannel);
+    if (!target) return;
+    const active = await loadActiveTurn(runtime, target.threadId, input.sessionId);
+    if (!active || !matchesLifecycleTarget(active, target) || !active.turnId || !(await renewActiveAttempt(runtime, target.threadId, active))) return;
     const validated = await loadValidatedResult(runtime, active.correlationId, active.attemptToken);
-    await queueEventResponse(runtime, active, thread, validated?.renderedResponse ?? AR_AGENT_CAPABILITY_BLURB);
+    await queueEventResponse(runtime, active, thread, target.threadId, validated?.renderedResponse ?? AR_AGENT_CAPABILITY_BLURB);
   } catch {
     logger.error("imessage.session_completion_handler_failed", { category: "session_completion" });
   }
@@ -942,28 +1036,73 @@ export async function handleIMessageProgressEvent(input: {
   if (!thread || !turnId) return;
   try {
     const runtime = await getRuntime();
-    const active = await loadActiveTurn(runtime, thread.id, input.sessionId, turnId);
-    if (!active) return;
-    await renewActiveAttempt(runtime, thread.id, active);
+    const target = await resolveLifecycleEventTarget(runtime, input.eventChannel);
+    if (!target) return;
+    const active = await loadActiveTurn(runtime, target.threadId, input.sessionId, turnId);
+    if (!active || !matchesLifecycleTarget(active, target)) return;
+    await renewActiveAttempt(runtime, target.threadId, active);
   } catch {
     logger.error("imessage.progress_heartbeat_failed", { category: "progress_heartbeat" });
   }
+}
+
+type LifecycleEventTarget = {
+  readonly threadId: string;
+  /** Present for the production opaque-channel path, absent only in unit fixtures. */
+  readonly deliveryTargetId?: CorrelationId | undefined;
+};
+
+/**
+ * Eve workflow state contains only `deliveryTargetId`, a correlation HMAC.
+ * Resolve its physical Photon thread only while handling the lifecycle event,
+ * from the encrypted target record that the durable worker wrote before it
+ * started the workflow. The fallback exists solely for small in-process unit
+ * fixtures that exercise runtime state transitions without constructing Eve.
+ */
+async function resolveLifecycleEventTarget(
+  runtime: AirRuntime,
+  eventChannel: AirChatEventChannel,
+): Promise<LifecycleEventTarget | null> {
+  const thread = eventChannel.thread;
+  if (!thread) return null;
+  const deliveryTargetId = eventChannel.state?.deliveryTargetId;
+  if (deliveryTargetId === undefined || deliveryTargetId === null) {
+    return thread.id ? { threadId: thread.id } : null;
+  }
+  if (!isOpaqueCorrelationId(deliveryTargetId)) return null;
+  const target = await loadDeliveryTarget(runtime, deliveryTargetId as CorrelationId);
+  return target
+    ? { threadId: target.threadId, deliveryTargetId: deliveryTargetId as CorrelationId }
+    : null;
+}
+
+function matchesLifecycleTarget(active: ActiveTurn, target: LifecycleEventTarget): boolean {
+  return target.deliveryTargetId === undefined || active.correlationId === target.deliveryTargetId;
 }
 
 async function queueEventResponse(
   runtime: AirRuntime,
   active: ActiveTurn,
   thread: AirChatThread,
+  physicalThreadId: string,
   response: string,
+  failureCategory?: string,
 ): Promise<void> {
-  const ready = await ensureResponseReady(runtime, active.recordKey, active.attemptToken);
+  // A framework failure is represented only by this fixed, redacted category.
+  // Persist it before the response enters the outbox, never from raw event data.
+  const ready = await ensureResponseReady(
+    runtime,
+    active.recordKey,
+    active.attemptToken,
+    failureCategory,
+  );
   if (!ready) return;
   const target = await loadDeliveryTarget(runtime, active.correlationId);
   if (
     !target ||
     target.recordKey !== active.recordKey ||
     target.attemptToken !== active.attemptToken ||
-    target.threadId !== thread.id
+    target.threadId !== physicalThreadId
   ) {
     await transitionRetryableRecord(runtime, active.recordKey, active.attemptToken, "delivery_target_missing");
     return;
@@ -988,7 +1127,13 @@ async function queueEventResponse(
     sessionDurationMs: Math.max(0, runtime.clock() - active.startedAtMs),
   });
   try {
-    await deliverOutbox(runtime, active.correlationId, { kind: "chat_thread", thread });
+    // Chat SDK types promise `post`, but a malformed/partially initialized
+    // lifecycle event is still possible at runtime. Do not let that local
+    // preflight failure masquerade as an ambiguous Photon send.
+    const transport: SendTransport = typeof (thread as unknown as { post?: unknown }).post === "function"
+      ? { kind: "chat_thread", thread }
+      : { kind: "unavailable" };
+    await deliverOutbox(runtime, active.correlationId, transport, failureCategory);
   } catch {
     await transitionRetryableRecord(runtime, active.recordKey, active.attemptToken, "terminal_response_delivery_failed");
   }
@@ -998,11 +1143,18 @@ async function deliverOutbox(
   runtime: AirRuntime,
   correlationId: CorrelationId,
   transport: SendTransport,
+  failureCategory?: string,
 ): Promise<void> {
   const target = await loadDeliveryTarget(runtime, correlationId);
   if (!target) return;
-  const ready = await ensureResponseReady(runtime, target.recordKey, target.attemptToken);
+  const ready = await ensureResponseReady(
+    runtime,
+    target.recordKey,
+    target.attemptToken,
+    failureCategory,
+  );
   if (!ready) return;
+  const diagnosticCategory = failureCategory ?? ready.status.failureCategory;
 
   const attempt = await runtime.outbox.beginSend(outboxRecordKey(correlationId));
   if (!attempt) return;
@@ -1014,69 +1166,266 @@ async function deliverOutbox(
       "sending",
       ["response_ready"],
       target.attemptToken,
+      diagnosticCategory,
     );
     if (!sending || sending.state !== "sending") {
-      await attempt.markPreSendFailure(
+      await recordKnownPreSendFailure(
+        runtime,
+        attempt,
+        target,
+        correlationId,
         "inbox_send_state_conflict",
-        nextBackoffMs(attempt.record.status.attempts, runtime.clock()),
+        sendStartedAtMs,
       );
-      await transitionRetryableRecord(runtime, target.recordKey, target.attemptToken, "inbox_send_state_conflict");
       return;
     }
 
-    if (transport.kind === "unavailable") {
-      await attempt.markPreSendFailure(
+    if (
+      transport.kind === "unavailable" ||
+      (transport.kind === "chat_thread" &&
+        typeof (transport.thread as unknown as { post?: unknown }).post !== "function")
+    ) {
+      await recordKnownPreSendFailure(
+        runtime,
+        attempt,
+        target,
+        correlationId,
         "chat_thread_unavailable",
-        nextBackoffMs(attempt.record.status.attempts, runtime.clock()),
+        sendStartedAtMs,
       );
-      await transitionRetryableRecord(runtime, target.recordKey, target.attemptToken, "chat_thread_unavailable");
       return;
     }
 
-    // A Chat SDK event always uses the rebuilt thread so the normal success
-    // path remains `channel.thread.post`. Direct adapter sends are recovery or
-    // pre-Eve static notices only and still use the official Photon adapter.
-    if (transport.kind === "chat_thread") {
-      await transport.thread.post(attempt.renderedResponse);
-    } else {
-      await transport.adapter.postMessage(target.threadId, attempt.renderedResponse);
+    // A Chat SDK lifecycle event uses Air's opaque `channel.thread` wrapper,
+    // which resolves the encrypted provider target only inside `post()`. The
+    // normal path therefore remains `channel.thread.post`; direct adapter
+    // sends are recovery or pre-Eve static notices only.
+    // Any provider throw is ambiguous: Photon does not offer an outbound
+    // idempotency key, so it must never become an automatic retry.
+    let providerSucceeded = false;
+    try {
+      if (transport.kind === "chat_thread") {
+        await transport.thread.post(attempt.renderedResponse);
+      } else {
+        await transport.adapter.postMessage(target.threadId, attempt.renderedResponse);
+      }
+      providerSucceeded = true;
+    } catch {
+      // The outcome is reconciled below from the fenced durable outbox state.
     }
-    await attempt.markSent();
-    const sent = await transitionInbox(runtime, target.recordKey, "sent", ["sending"], target.attemptToken);
-    if (sent?.state !== "sent") return;
-    await cleanupDeliveredTurn(runtime, correlationId, target.threadId, target.recordKey, target.attemptToken);
+
+    const outcome = await reconcileProviderDeliveryOutcome(
+      runtime,
+      attempt,
+      correlationId,
+      providerSucceeded,
+    );
+    if (outcome !== "sent") {
+      await recordAmbiguousProviderOutcome(
+        runtime,
+        target,
+        correlationId,
+        sendStartedAtMs,
+      );
+      return;
+    }
+
+    const sent = await transitionInbox(
+      runtime,
+      target.recordKey,
+      "sent",
+      ["sending"],
+      target.attemptToken,
+      sending.status.failureCategory ?? diagnosticCategory,
+    );
+    // `markSent()` may have committed while its Redis response was lost, and
+    // the same is true of the inbox transition. Only a positively observed
+    // durable `sent` record permits cleanup; a known outbox send is never
+    // reclassified as unknown merely because cleanup or its acknowledgement
+    // has a transient fault.
+    const inboxSent = sent?.state === "sent"
+      || (await runtime.inbox.getRecord(target.recordKey).catch(() => null))?.state === "sent";
+    if (!inboxSent) {
+      logger.warn("imessage.response_sent_inbox_reconcile_failed", {
+        correlationId,
+        attempt: attempt.record.status.attempts,
+        photonLatencyMs: Math.max(0, runtime.clock() - sendStartedAtMs),
+      });
+      return;
+    }
+    await cleanupDeliveredTurn(runtime, correlationId, target.threadId, target.recordKey, target.attemptToken)
+      .catch(() => {
+        logger.warn("imessage.response_sent_cleanup_failed", {
+          correlationId,
+          attempt: attempt.record.status.attempts,
+        });
+      });
     logger.info("imessage.response_sent", {
       correlationId,
       attempt: attempt.record.status.attempts,
       photonLatencyMs: Math.max(0, runtime.clock() - sendStartedAtMs),
     });
+  } finally {
+    await attempt.release().catch(() => {
+      logger.warn("imessage.outbox_attempt_release_failed", { correlationId });
+    });
+  }
+}
+
+/**
+ * Resolve the provider outcome through the fenced outbox state. A provider
+ * success only becomes an inbox `sent` once this invocation has either
+ * received, or re-read after a lost response, the durable `sent` record. A
+ * stale sending lease instead wins conservatively as `send_unknown`.
+ */
+async function reconcileProviderDeliveryOutcome(
+  runtime: AirRuntime,
+  attempt: OutboxSendAttempt,
+  correlationId: CorrelationId,
+  providerSucceeded: boolean,
+): Promise<"sent" | "unknown"> {
+  let state: OutboxState | undefined;
+  try {
+    const transitioned = providerSucceeded
+      ? await attempt.markSent()
+      : await attempt.markSendUnknown("photon_send_unknown");
+    state = transitioned?.state;
   } catch {
-    // Any throw after an adapter/thread post is ambiguous: Photon has no
-    // outbound idempotency key, so never turn this into an automatic retry.
-    await attempt.markSendUnknown("photon_send_unknown").catch(() => undefined);
-    await transitionInbox(
-      runtime,
-      target.recordKey,
-      "send_unknown",
-      ["sending"],
-      target.attemptToken,
-      "photon_send_unknown",
-    ).catch(() => undefined);
-    await clearActiveTurn(runtime, target.threadId, target.recordKey, target.attemptToken);
-    logger.error("imessage.response_send_unknown", {
+    // The durable write may have committed before Redis lost its response.
+  }
+
+  if (state === undefined) {
+    state = await runtime.outbox.getRecord(outboxRecordKey(correlationId))
+      .then((record) => record?.state)
+      .catch(() => undefined);
+  }
+  if (state === "sent") return "sent";
+
+  // `markSent()` can legitimately lose to an expired sending lease. Once a
+  // provider call has happened, anything short of a proven sent write must be
+  // fenced as unknown rather than re-entering the retryable path.
+  if (state !== "send_unknown") {
+    try {
+      const unknown = await attempt.markSendUnknown("photon_send_unknown");
+      state = unknown?.state ?? state;
+    } catch {
+      // Re-read below distinguishes a committed unknown write from a lost
+      // acknowledgement. If Redis is unavailable, stay conservative.
+    }
+    const observed = await runtime.outbox.getRecord(outboxRecordKey(correlationId))
+      .then((record) => record?.state)
+      .catch(() => undefined);
+    if (observed !== undefined) state = observed;
+  }
+  return state === "sent" ? "sent" : "unknown";
+}
+
+/**
+ * The provider was called but its durable success could not be proven. Keep
+ * the inbox out of automatic recovery, and clear the active turn only after
+ * the terminal inbox write is positively observed.
+ */
+async function recordAmbiguousProviderOutcome(
+  runtime: AirRuntime,
+  target: StoredDeliveryTarget,
+  correlationId: CorrelationId,
+  sendStartedAtMs: number,
+): Promise<void> {
+  const unknown = await transitionInbox(
+    runtime,
+    target.recordKey,
+    "send_unknown",
+    ["sending"],
+    target.attemptToken,
+    "photon_send_unknown",
+  ).catch(() => undefined);
+  if (unknown?.state === "send_unknown") {
+    await clearActiveTurn(runtime, target.threadId, target.recordKey, target.attemptToken)
+      .catch(() => undefined);
+  }
+  logger.error("imessage.response_send_unknown", {
+    correlationId,
+    category: "photon_send_unknown",
+    photonLatencyMs: Math.max(0, runtime.clock() - sendStartedAtMs),
+  });
+}
+
+/**
+ * Reconcile a failure that occurred before the first Photon call. A lost
+ * Redis response is re-read before deciding whether the attempt safely became
+ * retryable; otherwise we keep the durable `sending` lease conservative and
+ * let its expiration take the ambiguous path rather than forcing one here.
+ */
+async function recordKnownPreSendFailure(
+  runtime: AirRuntime,
+  attempt: OutboxSendAttempt,
+  target: StoredDeliveryTarget,
+  correlationId: CorrelationId,
+  category: string,
+  sendStartedAtMs: number,
+): Promise<void> {
+  let outboxState: OutboxState | undefined;
+  try {
+    const transitioned = await attempt.markPreSendFailure(
+      category,
+      nextBackoffMs(attempt.record.status.attempts, runtime.clock()),
+    );
+    outboxState = transitioned?.state;
+  } catch {
+    // The write may have committed before the Redis response was lost.
+    outboxState = await runtime.outbox.getRecord(outboxRecordKey(correlationId))
+      .then((record) => record?.state)
+      .catch(() => undefined);
+  }
+  if (outboxState === undefined) {
+    outboxState = await runtime.outbox.getRecord(outboxRecordKey(correlationId))
+      .then((record) => record?.state)
+      .catch(() => undefined);
+  }
+
+  if (outboxState !== "failed_retryable" && outboxState !== "dead_letter") {
+    logger.warn("imessage.response_presend_reconcile_failed", {
       correlationId,
-      category: "photon_send_unknown",
+      category,
+      attempt: attempt.record.status.attempts,
       photonLatencyMs: Math.max(0, runtime.clock() - sendStartedAtMs),
     });
-  } finally {
-    await attempt.release();
+    return;
   }
+
+  const inbox = outboxState === "dead_letter"
+    ? await transitionInbox(
+      runtime,
+      target.recordKey,
+      "dead_letter",
+      ["processing", "session_started", "response_ready", "sending"],
+      target.attemptToken,
+      "pre_send_retries_exhausted",
+    )
+    : await transitionRetryableRecord(runtime, target.recordKey, target.attemptToken, category);
+  if (inbox?.state !== "failed_retryable" && inbox?.state !== "dead_letter") {
+    logger.warn("imessage.response_presend_reconcile_failed", {
+      correlationId,
+      category,
+      attempt: attempt.record.status.attempts,
+      photonLatencyMs: Math.max(0, runtime.clock() - sendStartedAtMs),
+    });
+    return;
+  }
+  await clearActiveTurn(runtime, target.threadId, target.recordKey, target.attemptToken);
+  logger.warn("imessage.response_presend_failed", {
+    correlationId,
+    category,
+    attempt: attempt.record.status.attempts,
+    photonLatencyMs: Math.max(0, runtime.clock() - sendStartedAtMs),
+  });
 }
 
 async function ensureResponseReady(
   runtime: AirRuntime,
   recordKey: string,
   attemptToken: string,
+  failureCategory?: string,
 ): Promise<InboxRecord | null> {
   const current = await runtime.inbox.getRecord(recordKey);
   if (!current) return null;
@@ -1088,6 +1437,7 @@ async function ensureResponseReady(
     "response_ready",
     ["processing", "session_started"],
     attemptToken,
+    failureCategory,
   );
 }
 
@@ -1106,12 +1456,7 @@ async function transitionInbox(
       ...(failureCategory ? { failureCategory } : {}),
     });
     if (target === "dead_letter" && transitioned?.state === "dead_letter") {
-      logger.error("imessage.dead_letter", {
-        correlationId: transitioned.immutable.correlationId,
-        category: failureCategory ?? "unknown_failure",
-        attempt: transitioned.status.attempts,
-        inboxAgeMs: Math.max(0, runtime.clock() - transitioned.immutable.receivedAtMs),
-      });
+      logTerminalInboxRecord(runtime, transitioned, failureCategory ?? "unknown_failure");
     }
     return transitioned;
   } catch {
@@ -1123,32 +1468,27 @@ async function transitionTerminal(
   runtime: AirRuntime,
   lease: InboxProcessingLease | null,
   category: string,
-): Promise<void> {
-  if (!lease) return;
+): Promise<InboxRecord | null> {
+  if (!lease) return null;
   const transitioned = await lease.transition("dead_letter", {
     expectedStates: ["processing", "session_started", "response_ready", "sending"],
     failureCategory: category,
   }).catch(() => undefined);
   if (transitioned?.state === "dead_letter") {
-    logger.error("imessage.dead_letter", {
-      correlationId: transitioned.immutable.correlationId,
-      category,
-      attempt: transitioned.status.attempts,
-      inboxAgeMs: Math.max(0, runtime.clock() - transitioned.immutable.receivedAtMs),
-    });
+    logTerminalInboxRecord(runtime, transitioned, category);
   }
+  return transitioned ?? null;
 }
 
 async function transitionRetryable(
   runtime: AirRuntime,
   lease: InboxProcessingLease | null,
   category: string,
-): Promise<void> {
-  if (!lease) return;
+): Promise<InboxRecord | null> {
+  if (!lease) return null;
   const attempts = Math.max(1, lease.record.status.attempts);
   if (attempts >= 3) {
-    await transitionTerminal(runtime, lease, `${category}_retries_exhausted`);
-    return;
+    return transitionTerminal(runtime, lease, `${category}_retries_exhausted`);
   }
   const transitioned = await lease.transition("failed_retryable", {
     expectedStates: ["processing", "session_started", "response_ready", "sending"],
@@ -1162,6 +1502,25 @@ async function transitionRetryable(
       attempt: transitioned.status.attempts,
     });
   }
+  return transitioned ?? null;
+}
+
+/**
+ * The durable transition commits and releases the processing capability first.
+ * Only then may this attempt delete its encrypted active map; otherwise a
+ * concurrent drain could observe no active map while the old attempt is still
+ * the durable owner of the thread.
+ */
+async function endHandoffAttempt(
+  runtime: AirRuntime,
+  lease: InboxProcessingLease,
+  threadId: string,
+  recordKey: string,
+  category: string,
+): Promise<void> {
+  const ended = await transitionRetryable(runtime, lease, category);
+  if (ended?.state !== "failed_retryable" && ended?.state !== "dead_letter") return;
+  await clearActiveTurn(runtime, threadId, recordKey, lease.attemptToken);
 }
 
 async function transitionRetryableRecord(
@@ -1169,9 +1528,10 @@ async function transitionRetryableRecord(
   recordKey: string,
   attemptToken: string,
   category: string,
-): Promise<void> {
+): Promise<InboxRecord | null> {
   const current = await runtime.inbox.getRecord(recordKey);
-  if (!current || current.state === "failed_retryable") return;
+  if (!current) return null;
+  if (current.state === "failed_retryable") return current;
   if (current.status.attempts >= 3) {
     const transitioned = await runtime.inbox.transition(recordKey, "dead_letter", {
       expectedStates: ["processing", "session_started", "response_ready", "sending"],
@@ -1179,14 +1539,9 @@ async function transitionRetryableRecord(
       failureCategory: `${category}_retries_exhausted`,
     }).catch(() => undefined);
     if (transitioned?.state === "dead_letter") {
-      logger.error("imessage.dead_letter", {
-        correlationId: transitioned.immutable.correlationId,
-        category: `${category}_retries_exhausted`,
-        attempt: transitioned.status.attempts,
-        inboxAgeMs: Math.max(0, runtime.clock() - transitioned.immutable.receivedAtMs),
-      });
+      logTerminalInboxRecord(runtime, transitioned, `${category}_retries_exhausted`);
     }
-    return;
+    return transitioned ?? null;
   }
   const transitioned = await runtime.inbox.transition(recordKey, "failed_retryable", {
     expectedStates: ["processing", "session_started", "response_ready", "sending"],
@@ -1201,6 +1556,26 @@ async function transitionRetryableRecord(
       attempt: transitioned.status.attempts,
     });
   }
+  return transitioned ?? null;
+}
+
+/** Emit only privacy-safe terminal telemetry; normal policy drops are non-alerting. */
+function logTerminalInboxRecord(
+  runtime: AirRuntime,
+  record: InboxRecord,
+  category: string,
+): void {
+  const fields = {
+    correlationId: record.immutable.correlationId,
+    category,
+    attempt: record.status.attempts,
+    inboxAgeMs: Math.max(0, runtime.clock() - record.immutable.receivedAtMs),
+  };
+  if (POLICY_DROP_CATEGORIES.has(category)) {
+    logger.info("imessage.policy_drop", fields);
+    return;
+  }
+  logger.error("imessage.dead_letter", fields);
 }
 
 async function cleanupDeliveredTurn(
@@ -1608,6 +1983,10 @@ function isValidDeliveryTarget(value: StoredDeliveryTarget | null): value is Sto
 
 function isAttemptToken(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{32,128}$/.test(value);
+}
+
+function isOpaqueCorrelationId(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 }
 
 function isValidSessionId(value: unknown): value is string {

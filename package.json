@@ -8,13 +8,15 @@
     "npm": ">=10"
   },
   "scripts": {
-    "build": "eve build && npm run verify:build",
+    "postinstall": "node scripts/patch-eve-logging.mjs",
+    "build": "node scripts/patch-eve-logging.mjs && eve build && npm run verify:build",
     "dev": "eve dev --no-ui",
     "start": "eve start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm test",
+    "eval:golden": "RUN_LIVE_GOLDEN_EVAL=1 vitest run tests/live/golden-eval.test.ts",
     "ops:send-unknown": "node scripts/report-send-unknown.mjs",
     "verify:build": "node scripts/verify-build.mjs"
   },

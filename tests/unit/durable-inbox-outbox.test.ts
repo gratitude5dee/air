@@ -188,7 +188,7 @@ describe("durable inbox", () => {
     expect((await inbox.getRecord(first.record.immutable.recordKey))?.encryptedEnvelope).toBeUndefined();
   });
 
-  it("does not turn a committed sent transition into a false dead letter after a lost response", async () => {
+  it("does not turn a committed sent transition into a false dead letter and promotes its successor", async () => {
     let now = 1_000;
     const redis = new FailAfterInboxStateCommitRedis(() => now);
     const inbox = new DurableInbox({
@@ -198,6 +198,7 @@ describe("durable inbox", () => {
       clock: () => now,
     });
     const persisted = await inbox.persistVerified(createInboxInput("sent-atomic", "private question", now));
+    const successor = await inbox.persistVerified(createInboxInput("sent-atomic-successor", "next question", now));
     const lease = await inbox.beginProcessing(persisted.record.immutable.recordKey);
     if (!lease) throw new Error("expected inbox processing lease");
     await lease.transition("session_started");
@@ -209,7 +210,8 @@ describe("durable inbox", () => {
     const recovered = await inbox.getRecord(persisted.record.immutable.recordKey);
     expect(recovered?.state).toBe("sent");
     expect(recovered?.encryptedEnvelope).toBeUndefined();
-    expect(await inbox.listDue()).toEqual([]);
+    expect((await inbox.listDue()).map((record) => record.immutable.recordKey))
+      .toEqual([successor.record.immutable.recordKey]);
   });
 
   it("serializes each thread and turns stranded encrypted content into redacted dead-letter metadata", async () => {
@@ -355,6 +357,7 @@ describe("durable inbox", () => {
     await expect(inbox.persistVerified(firstInput)).rejects.toThrow(/process loss/);
     const firstKey = inboxRecordKey(firstInput.projectId, firstInput.messageId);
     expect((await inbox.getRecord(firstKey))?.immutable.threadSequence).toBe(1);
+    expect((await inbox.listDue()).map((record) => record.immutable.recordKey)).toEqual([firstKey]);
 
     const second = await inbox.persistVerified(createInboxInput("message-atomic-second", "second", now));
     expect(second.record.immutable.threadSequence).toBe(2);
@@ -397,7 +400,22 @@ describe("durable inbox", () => {
     expect(exhausted?.status.failureCategory).toBe("processing_retries_exhausted");
   });
 
-  it("pages past a busy thread tail so another thread head is not starved", async () => {
+  it("fails visibly when a legacy pending queue has no ready-thread backfill", async () => {
+    let now = 0;
+    const redis = new MemoryRedis(() => now);
+    const inbox = new DurableInbox({
+      redis,
+      cipher: createQueueCipher(queueKey),
+      identityHashSecret: identitySecret,
+      clock: () => now,
+    });
+    const stored = await inbox.persistVerified(createInboxInput("legacy-ready-index", "queued", now));
+    await redis.zRem("air:inbox:v1:ready-threads", stored.record.immutable.threadHash);
+
+    await expect(inbox.listDue()).rejects.toThrow(/ready-thread index backfill required/);
+  });
+
+  it("keeps another ready thread visible past 501+ busy-thread tails", async () => {
     let now = 0;
     const redis = new MemoryRedis(() => now);
     const inbox = new DurableInbox({
@@ -407,7 +425,7 @@ describe("durable inbox", () => {
       clock: () => now,
     });
     const busyThread: Awaited<ReturnType<typeof inbox.persistVerified>>[] = [];
-    for (let index = 0; index < 100; index += 1) {
+    for (let index = 0; index < 600; index += 1) {
       busyThread.push(await inbox.persistVerified(
         createInboxInput(`busy-${String(index).padStart(3, "0")}`, `busy ${index}`, now),
       ));
@@ -437,7 +455,49 @@ describe("durable inbox", () => {
     await active.release();
   });
 
-  it("does not skip a live due record while clearing a stale pending page", async () => {
+  it("indexes only the ready head past a larger busy-thread backlog", async () => {
+    let now = 0;
+    const redis = new MemoryRedis(() => now);
+    const inbox = new DurableInbox({
+      redis,
+      cipher: createQueueCipher(queueKey),
+      identityHashSecret: identitySecret,
+      clock: () => now,
+    });
+    const busyThread: Awaited<ReturnType<typeof inbox.persistVerified>>[] = [];
+    for (let index = 0; index < 1_100; index += 1) {
+      busyThread.push(await inbox.persistVerified(
+        createInboxInput(`rotating-busy-${String(index).padStart(4, "0")}`, `busy ${index}`, now),
+      ));
+      now += 1;
+    }
+    const active = await inbox.beginProcessing(busyThread[0]!.record.immutable.recordKey);
+    expect(active).not.toBeNull();
+    if (!active) throw new Error("expected busy thread head");
+
+    const otherSender = "+14155558888";
+    const otherChatGuid = "iMessage;-;+14155558888";
+    const otherInput = createInboxInput("rotating-other-thread", "other question", now);
+    const other = await inbox.persistVerified({
+      ...otherInput,
+      senderHash: hashSenderIdentifier(identitySecret, otherSender),
+      threadHash: hashThreadIdentifier(identitySecret, otherChatGuid),
+      envelope: {
+        ...otherInput.envelope,
+        chatGuid: otherChatGuid,
+        senderId: otherSender,
+      },
+    });
+
+    // The ready-thread index contains one member for the busy thread's active
+    // head, not its 1,099 later records, so the other thread is due at once.
+    expect((await inbox.listDue(24)).map((record) => record.immutable.recordKey))
+      .toContain(other.record.immutable.recordKey);
+    await active.transition("dead_letter", { failureCategory: "test" });
+    await active.release();
+  });
+
+  it("finds a live head after clearing stale predecessors", async () => {
     let now = 0;
     const redis = new MemoryRedis(() => now);
     const inbox = new DurableInbox({
@@ -449,8 +509,8 @@ describe("durable inbox", () => {
       metadataRetentionMs: 5_000,
     });
 
-    // Fifty stale members fill the old page size. Removing them while advancing
-    // a ZRANGEBYSCORE offset used to skip the following live entry.
+    // Clearing stale queue predecessors must keep advancing from the prefix,
+    // rather than losing the eventual live head behind them.
     for (let index = 0; index < 50; index += 1) {
       await inbox.persistVerified(createInboxInput(`stale-${String(index).padStart(2, "0")}`, "stale", now));
     }

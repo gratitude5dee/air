@@ -17,6 +17,13 @@ import { embedQuery, RERANK_CANDIDATE_LIMIT, rerankCandidates } from "./voyage.j
 import { operationalLogger } from "./logging.js";
 import { UpstreamTimeoutError } from "./upstream.js";
 
+/**
+ * Provenance: the query planning, Atlas hybrid-search, expansion, and source
+ * conversion behavior in this module is ported from the existing MusicRAG
+ * TypeScript pipeline at `/Users/gratitud3/Downloads/musicindustry/musicRAG/web/lib`.
+ * Keep behavioral changes covered by Air fixtures or the golden evaluation.
+ */
+
 /** Must stay aligned with the bounded Voyage reranker request. */
 export const CANDIDATE_LIMIT = RERANK_CANDIDATE_LIMIT;
 export const TOP_RANKED_LIMIT = 8;
@@ -212,10 +219,10 @@ export function compactFilters(filters?: Filters): Document | undefined {
   if (filters?.channel) clauses.push({ channel: filters.channel });
   if (filters?.guest) clauses.push({ guests: { $eq: filters.guest } });
   if (filters?.topic) clauses.push({ topics: { $eq: filters.topic } });
-  if (filters?.date_from_ts || filters?.date_to_ts) {
+  if (filters?.date_from_ts !== undefined || filters?.date_to_ts !== undefined) {
     const range: Document = {};
-    if (filters.date_from_ts) range.$gte = filters.date_from_ts;
-    if (filters.date_to_ts) range.$lte = filters.date_to_ts;
+    if (filters.date_from_ts !== undefined) range.$gte = filters.date_from_ts;
+    if (filters.date_to_ts !== undefined) range.$lte = filters.date_to_ts;
     clauses.push({ upload_ts: range });
   }
   if (clauses.length === 0) return undefined;

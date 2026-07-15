@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { createiMessageAdapter } from "@photon-ai/chat-adapter-imessage";
 import { describe, expect, it } from "vitest";
 import {
   decodeWebhookJson,
@@ -38,6 +39,64 @@ function payload(): Record<string, unknown> {
 }
 
 describe("Spectrum webhook verifier", () => {
+  it("shares the official adapter's raw HMAC, thread-id, and text fixture", async () => {
+    const timestamp = Math.floor(Date.now() / 1_000);
+    const raw = JSON.stringify(payload(), null, 2);
+    const signature = signed(raw, timestamp);
+    const adapter = createiMessageAdapter({
+      projectId: "contract-project",
+      projectSecret: "contract-project-secret",
+      webhookSecret: secret,
+    });
+    const delivered: unknown[][] = [];
+    (
+      adapter as unknown as {
+        chat: { processMessage(...args: unknown[]): void };
+      }
+    ).chat = {
+      processMessage: (...args) => delivered.push(args),
+    };
+
+    expect(
+      verifySpectrumSignature({
+        rawBody: Buffer.from(raw, "utf8"),
+        secret,
+        signature,
+        timestamp: String(timestamp),
+        now: timestamp,
+      }),
+    ).toEqual({ ok: true });
+
+    const normalized = normalizeSpectrumWebhook({
+      payload: decodeWebhookJson(Buffer.from(raw, "utf8")),
+      projectId: "contract-project",
+      webhookId: "contract-delivery-001",
+      receivedAt: timestamp * 1_000,
+    });
+    if (!normalized) throw new Error("expected a normalized messages event");
+
+    const response = await adapter.handleWebhook(
+      new Request("https://air.example/webhooks/imessage", {
+        method: "POST",
+        headers: {
+          "x-spectrum-signature": signature,
+          "x-spectrum-timestamp": String(timestamp),
+        },
+        body: raw,
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(delivered).toHaveLength(1);
+    const [, threadId, message] = delivered[0] ?? [];
+    expect(threadId).toBe("imessage:iMessage;-;+15555550123~+15555550124");
+    expect(adapter.encodeThreadId({
+      chatGuid: normalized.chatGuid,
+      ...(normalized.phone ? { phone: normalized.phone } : {}),
+    })).toBe(threadId);
+    expect((message as { text?: unknown }).text).toBe(normalized.text);
+  });
+
   it("uses untouched bytes with the official v0 signing shape", () => {
     const raw = JSON.stringify(payload());
     expect(
@@ -112,5 +171,35 @@ describe("Spectrum webhook verifier", () => {
       contentType: "text",
     });
     expect(envelope && isEligibleInboundMessage(envelope)).toBe(true);
+  });
+
+  it("infers an omitted Spectrum space.type from the official iMessage chat GUID", () => {
+    const missingType = payload();
+    delete (missingType.space as { type?: string }).type;
+    const envelope = normalizeSpectrumWebhook({
+      payload: missingType,
+      projectId: "contract-project",
+      webhookId: "delivery-without-space-type",
+    });
+    expect(envelope?.spaceType).toBe("dm");
+    expect(envelope && isEligibleInboundMessage(envelope)).toBe(true);
+
+    const groupWithoutType = payload();
+    const groupSpace = groupWithoutType.space as { id: string; type?: string };
+    groupSpace.id = "iMessage;+;group-chat-guid";
+    delete groupSpace.type;
+    expect(normalizeSpectrumWebhook({
+      payload: groupWithoutType,
+      projectId: "contract-project",
+      webhookId: "group-delivery-without-space-type",
+    })?.spaceType).toBe("group");
+
+    const contradictoryType = payload();
+    (contradictoryType.space as { type?: string }).type = "group";
+    expect(() => normalizeSpectrumWebhook({
+      payload: contradictoryType,
+      projectId: "contract-project",
+      webhookId: "contradictory-space-type",
+    })).toThrow(WebhookInputError);
   });
 });

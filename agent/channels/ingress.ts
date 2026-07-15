@@ -7,7 +7,6 @@ import {
   drainFromOperatorRoute,
   handleIMessageWebhook,
   healthResponse,
-  publicStatusResponse,
 } from "../../lib/imessage-channel-runtime.js";
 
 /**
@@ -17,7 +16,6 @@ import {
  */
 export default defineChannel({
   routes: [
-    GET("/", async () => publicStatusResponse()),
     GET("/healthz", async () => healthResponse()),
     POST("/webhooks/imessage", async (request, args) => {
       assertIMessageRuntimeConfiguration();

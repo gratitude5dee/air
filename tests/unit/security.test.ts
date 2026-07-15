@@ -11,6 +11,32 @@ import {
 
 const secret = "unit-test-identity-secret";
 
+function productionEnvironment(
+  overrides: Readonly<Record<string, string | undefined>> = {},
+): Record<string, string | undefined> {
+  const senderHash = hashSenderIdentifier(secret, "+14155551234");
+  return {
+    IMESSAGE_PROJECT_ID: "project",
+    IMESSAGE_PROJECT_SECRET: "project-secret",
+    IMESSAGE_WEBHOOK_SECRET: "webhook-secret",
+    REDIS_URL: "rediss://example.invalid:6379",
+    MONGODB_URI: "mongodb+srv://readonly@example.invalid/music_rag",
+    MONGODB_DB: "music_rag",
+    MONGODB_SERVER_SELECTION_TIMEOUT_MS: "8000",
+    MONGODB_CONNECT_TIMEOUT_MS: "8000",
+    VOYAGE_API_KEY: "voyage-key",
+    EMBED_MODEL: "voyage-4-large",
+    RERANK_MODEL: "rerank-2.5",
+    GENERATION_MODEL: "google/gemini-3.5-flash",
+    AIR_ID_HASH_SECRET: secret,
+    AIR_QUEUE_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64"),
+    AIR_ALLOWED_SENDER_HASHES: senderHash,
+    AIR_PUBLIC_BASE_URL: "https://air.wzrd.tech",
+    CRON_SECRET: "cron-secret",
+    ...overrides,
+  };
+}
+
 describe("sender privacy", () => {
   it("normalizes before HMAC hashing and never returns the raw identifier", () => {
     const formatted = hashSenderIdentifier(secret, "+1 (415) 555-1234");
@@ -74,28 +100,21 @@ describe("sender privacy", () => {
   it("fails closed in production until every critical secret and an approved hash exist", () => {
     expect(() => loadAirEnvironment({}, { mode: "production" })).toThrow(/missing required production environment/);
     const senderHash = hashSenderIdentifier(secret, "+14155551234");
-    const loaded = loadAirEnvironment({
-      IMESSAGE_PROJECT_ID: "project",
-      IMESSAGE_PROJECT_SECRET: "project-secret",
-      IMESSAGE_WEBHOOK_SECRET: "webhook-secret",
-      REDIS_URL: "rediss://example.invalid:6379",
-      MONGODB_URI: "mongodb+srv://readonly@example.invalid/music_rag",
-      MONGODB_DB: "music_rag",
-      MONGODB_SERVER_SELECTION_TIMEOUT_MS: "8000",
-      MONGODB_CONNECT_TIMEOUT_MS: "8000",
-      VOYAGE_API_KEY: "voyage-key",
-      EMBED_MODEL: "voyage-4-large",
-      RERANK_MODEL: "rerank-2.5",
-      GENERATION_MODEL: "google/gemini-3.5-flash",
-      AIR_ID_HASH_SECRET: secret,
-      AIR_QUEUE_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64"),
-      AIR_ALLOWED_SENDER_HASHES: senderHash,
-      AIR_PUBLIC_BASE_URL: "https://air.wzrd.tech",
-      CRON_SECRET: "cron-secret",
-    }, { mode: "production" });
+    const loaded = loadAirEnvironment(productionEnvironment(), { mode: "production" });
 
     expect(loaded.allowedSenderHashes).toEqual([senderHash]);
     expect(loaded.mode).toBe("production");
+  });
+
+  it("rejects AI Gateway API-key authentication in production", () => {
+    expect(() => loadAirEnvironment(productionEnvironment({
+      AI_GATEWAY_API_KEY: "development-only-key",
+    }), { mode: "production" })).toThrow(/AI_GATEWAY_API_KEY is not allowed in production/);
+
+    expect(loadAirEnvironment({
+      NODE_ENV: "development",
+      AI_GATEWAY_API_KEY: "development-only-key",
+    }).mode).toBe("development");
   });
 
   it("treats Vercel production as production even without a normal NODE_ENV", () => {

@@ -31,7 +31,7 @@ export const operationalLogger: RedactedLogger = createRedactedLogger((event) =>
 const SENSITIVE_KEY = /(?:message|text|content|body|sender|phone|email|handle|snippet|payload|signature|secret|token|authorization|cookie|password|api[_-]?key|uri|url)/i;
 /** Only application HMACs may be emitted as identifier-like values. */
 const SAFE_HMAC_KEY = /^(?:correlationId|senderHash|threadHash|responseHash|webhookIdHash|deliveryHash|recordHash)$/i;
-const SAFE_MEASUREMENT_KEY = /(?:count|duration|latency|attempt|retry|status|state|age|depth|length|bytes|version|intent|category)$/i;
+const SAFE_MEASUREMENT_KEY = /(?:count|duration|latency|attempt|retry|status|state|age|depth|length|bytes|version|intent|category)(?:Ms)?$/i;
 const SAFE_STRING_KEY = /(?:status|state|intent|category|adapter|provider|operation|version|result)$/i;
 const HMAC_HEX = /^[a-f0-9]{64}$/;
 

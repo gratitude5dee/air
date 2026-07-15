@@ -23,6 +23,7 @@ export interface RedisLike {
     max: number,
     options?: { limit?: number; offset?: number },
   ): Promise<string[]>;
+  zCard(key: string): Promise<number>;
   zRem(key: string, ...members: string[]): Promise<number>;
   zRemRangeByScore(key: string, min: number, max: number): Promise<number>;
   eval(
@@ -66,6 +67,7 @@ export interface NodeRedisCompatibleClient {
     max: number,
     options?: { LIMIT?: { offset: number; count: number } },
   ): Promise<string[]>;
+  zCard(key: string): Promise<number>;
   zRem(key: string, members: string | string[]): Promise<number>;
   zRemRangeByScore(key: string, min: number, max: number): Promise<number>;
   eval(
@@ -112,6 +114,7 @@ export function createNodeRedisAdapter(client: NodeRedisCompatibleClient): Redis
           ? undefined
           : { LIMIT: { offset: options.offset ?? 0, count: options.limit } },
       ),
+    zCard: (key) => client.zCard(key),
     zRem: (key, ...members) => client.zRem(key, members),
     zRemRangeByScore: (key, min, max) => client.zRemRangeByScore(key, min, max),
     eval: (script, options) => client.eval(script, options),
@@ -304,10 +307,11 @@ return 0
  * from its thread queue for a later delivery to overtake.
  *
  * KEYS: metadata record, encrypted payload record, global pending index,
- *       per-thread queue, per-thread sequence counter.
+ *       per-thread queue, per-thread sequence counter, received-at index,
+ *       ready-thread-head index.
  * ARGV: redacted metadata JSON template, metadata TTL seconds, encrypted
  *       record JSON template, payload TTL seconds, pending score, record key,
- *       sequence-counter TTL seconds.
+ *       sequence-counter TTL seconds, received-at score, thread hash.
  *
  * Both JSON templates must contain exactly one `"threadSequence":-1` marker.
  * Redis replaces it with the atomically minted sequence before storing them.
@@ -327,6 +331,7 @@ end
 
 local sequence = redis.call("INCR", KEYS[5])
 redis.call("EXPIRE", KEYS[5], ARGV[7])
+local threadWasEmpty = redis.call("ZCARD", KEYS[4]) == 0
 local replacement = '"threadSequence":' .. sequence
 local metadataJson = string.gsub(ARGV[1], markerPattern, replacement, 1)
 local payloadJson = string.gsub(ARGV[3], markerPattern, replacement, 1)
@@ -335,6 +340,10 @@ redis.call("SET", KEYS[1], metadataJson, "NX", "EX", ARGV[2])
 redis.call("SET", KEYS[2], payloadJson, "EX", ARGV[4])
 redis.call("ZADD", KEYS[3], ARGV[5], ARGV[6])
 redis.call("ZADD", KEYS[4], sequence, ARGV[6])
+redis.call("ZADD", KEYS[6], ARGV[8], ARGV[6])
+if threadWasEmpty then
+  redis.call("ZADD", KEYS[7], ARGV[5], ARGV[9])
+end
 return { 1, sequence }
 `;
 
@@ -418,20 +427,56 @@ return 1
  * its envelope and be mislabeled as a dead letter after a process crash.
  *
  * KEYS: redacted metadata record, encrypted payload record, global pending
- *       index, per-thread queue.
+ *       index, per-thread queue, received-at index, ready-thread-head index.
  * ARGV: redacted metadata JSON, metadata TTL seconds, encrypted payload JSON,
  *       payload TTL seconds, payload-present flag (1/0), index mode
- *       (queued/terminal), pending score, record key, thread sequence.
+ *       (queued/terminal), pending score, record key, thread sequence,
+ *       received-at score, thread hash.
  */
 export const WRITE_INBOX_RECORD_LUA = `
 -- AIR_WRITE_INBOX_RECORD_V1
 local payloadPresent = ARGV[5]
 local indexMode = ARGV[6]
+local threadHash = ARGV[11]
 if (payloadPresent ~= "1" and payloadPresent ~= "0") then
   return redis.error_reply("invalid inbox payload flag")
 end
 if (indexMode ~= "queued" and indexMode ~= "terminal") then
   return redis.error_reply("invalid inbox index mode")
+end
+if not threadHash or threadHash == "" then
+  return redis.error_reply("invalid inbox thread hash")
+end
+
+local function readyScoreForThreadHead(recordKey)
+  local metadata = redis.call("GET", recordKey .. ":metadata")
+  if not metadata then return nil end
+  local decodedOk, decoded = pcall(cjson.decode, metadata)
+  if not decodedOk or type(decoded) ~= "table" then return nil end
+  if decoded.state == "received" or decoded.state == "failed_retryable" then
+    return redis.call("ZSCORE", KEYS[3], recordKey)
+  end
+  local status = decoded.status
+  if type(status) ~= "table" then return nil end
+  local leaseExpiry = status.processingLeaseExpiresAtMs
+  if type(leaseExpiry) == "number" and leaseExpiry >= 0 then
+    return tostring(leaseExpiry)
+  end
+  return nil
+end
+
+local function promoteReadyThreadHead()
+  local heads = redis.call("ZRANGE", KEYS[4], 0, 0)
+  if #heads == 0 then
+    redis.call("ZREM", KEYS[6], threadHash)
+    return
+  end
+  local score = readyScoreForThreadHead(heads[1])
+  if score then
+    redis.call("ZADD", KEYS[6], score, threadHash)
+  else
+    redis.call("ZREM", KEYS[6], threadHash)
+  end
 end
 
 if payloadPresent == "1" then
@@ -444,10 +489,13 @@ redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
 if indexMode == "queued" then
   redis.call("ZADD", KEYS[3], ARGV[7], ARGV[8])
   redis.call("ZADD", KEYS[4], ARGV[9], ARGV[8])
+  redis.call("ZADD", KEYS[5], ARGV[10], ARGV[8])
 else
   redis.call("ZREM", KEYS[3], ARGV[8])
   redis.call("ZREM", KEYS[4], ARGV[8])
+  redis.call("ZREM", KEYS[5], ARGV[8])
 end
+promoteReadyThreadHead()
 return 1
 `;
 
@@ -662,6 +710,10 @@ export class MemoryRedis implements RedisLike {
     return options.limit === undefined ? values.slice(offset) : values.slice(offset, offset + options.limit);
   }
 
+  async zCard(key: string): Promise<number> {
+    return this.getZSet(key, false)?.value.size ?? 0;
+  }
+
   async zRem(key: string, ...members: string[]): Promise<number> {
     const entry = this.getZSet(key, false);
     if (!entry) return 0;
@@ -755,6 +807,8 @@ export class MemoryRedis implements RedisLike {
     const pendingKey = keys[2];
     const threadQueueKey = keys[3];
     const sequenceKey = keys[4];
+    const receivedAtIndexKey = keys[5];
+    const readyThreadsIndexKey = keys[6];
     const metadataTemplate = args[0];
     const metadataTtlValue = args[1];
     const payloadTemplate = args[2];
@@ -762,19 +816,25 @@ export class MemoryRedis implements RedisLike {
     const pendingScoreValue = args[4];
     const recordKey = args[5];
     const sequenceTtlValue = args[6];
+    const receivedAtScoreValue = args[7];
+    const threadHash = args[8];
     if (
       !metadataKey ||
       !payloadKey ||
       !pendingKey ||
       !threadQueueKey ||
       !sequenceKey ||
+      !receivedAtIndexKey ||
+      !readyThreadsIndexKey ||
       metadataTemplate === undefined ||
       metadataTtlValue === undefined ||
       payloadTemplate === undefined ||
       payloadTtlValue === undefined ||
       pendingScoreValue === undefined ||
       !recordKey ||
-      sequenceTtlValue === undefined
+      sequenceTtlValue === undefined ||
+      receivedAtScoreValue === undefined ||
+      !threadHash
     ) {
       throw new Error("invalid inbox publish script arguments");
     }
@@ -791,6 +851,7 @@ export class MemoryRedis implements RedisLike {
     const payloadTtlSeconds = Number(payloadTtlValue);
     const sequenceTtlSeconds = Number(sequenceTtlValue);
     const pendingScore = Number(pendingScoreValue);
+    const receivedAtScore = Number(receivedAtScoreValue);
     if (
       !Number.isSafeInteger(metadataTtlSeconds) ||
       metadataTtlSeconds < 1 ||
@@ -798,7 +859,9 @@ export class MemoryRedis implements RedisLike {
       payloadTtlSeconds < 1 ||
       !Number.isSafeInteger(sequenceTtlSeconds) ||
       sequenceTtlSeconds < 1 ||
-      !Number.isFinite(pendingScore)
+      !Number.isFinite(pendingScore) ||
+      !Number.isSafeInteger(receivedAtScore) ||
+      receivedAtScore < 0
     ) {
       throw new Error("invalid inbox publish script arguments");
     }
@@ -829,7 +892,11 @@ export class MemoryRedis implements RedisLike {
       expiresAt: now + sequenceTtlSeconds * 1_000,
     });
     this.getZSet(pendingKey, true).value.set(recordKey, pendingScore);
-    this.getZSet(threadQueueKey, true).value.set(recordKey, sequence);
+    const threadQueue = this.getZSet(threadQueueKey, true);
+    const threadWasEmpty = threadQueue.value.size === 0;
+    threadQueue.value.set(recordKey, sequence);
+    this.getZSet(receivedAtIndexKey, true).value.set(recordKey, receivedAtScore);
+    if (threadWasEmpty) this.getZSet(readyThreadsIndexKey, true).value.set(threadHash, pendingScore);
     return [1, sequence];
   }
 
@@ -980,6 +1047,8 @@ export class MemoryRedis implements RedisLike {
     const payloadKey = keys[1];
     const pendingKey = keys[2];
     const threadQueueKey = keys[3];
+    const receivedAtIndexKey = keys[4];
+    const readyThreadsIndexKey = keys[5];
     const metadata = args[0];
     const metadataTtlValue = args[1];
     const payload = args[2];
@@ -989,11 +1058,15 @@ export class MemoryRedis implements RedisLike {
     const pendingScoreValue = args[6];
     const recordKey = args[7];
     const sequenceValue = args[8];
+    const receivedAtScoreValue = args[9];
+    const threadHash = args[10];
     if (
       !metadataKey ||
       !payloadKey ||
       !pendingKey ||
       !threadQueueKey ||
+      !receivedAtIndexKey ||
+      !readyThreadsIndexKey ||
       metadata === undefined ||
       metadataTtlValue === undefined ||
       payload === undefined ||
@@ -1002,7 +1075,9 @@ export class MemoryRedis implements RedisLike {
       (indexMode !== "queued" && indexMode !== "terminal") ||
       pendingScoreValue === undefined ||
       !recordKey ||
-      sequenceValue === undefined
+      sequenceValue === undefined ||
+      receivedAtScoreValue === undefined ||
+      !threadHash
     ) {
       throw new Error("invalid inbox write script arguments");
     }
@@ -1010,13 +1085,16 @@ export class MemoryRedis implements RedisLike {
     const payloadTtlSeconds = Number(payloadTtlValue);
     const pendingScore = Number(pendingScoreValue);
     const threadSequence = Number(sequenceValue);
+    const receivedAtScore = Number(receivedAtScoreValue);
     if (
       !Number.isSafeInteger(metadataTtlSeconds) ||
       metadataTtlSeconds < 1 ||
       (payloadPresent === "1" && (!Number.isSafeInteger(payloadTtlSeconds) || payloadTtlSeconds < 1)) ||
       !Number.isFinite(pendingScore) ||
       !Number.isSafeInteger(threadSequence) ||
-      threadSequence < 1
+      threadSequence < 1 ||
+      !Number.isSafeInteger(receivedAtScore) ||
+      receivedAtScore < 0
     ) {
       throw new Error("invalid inbox write script arguments");
     }
@@ -1037,16 +1115,89 @@ export class MemoryRedis implements RedisLike {
     });
     const pending = this.getZSet(pendingKey, false);
     const threadQueue = this.getZSet(threadQueueKey, false);
+    const receivedAtIndex = this.getZSet(receivedAtIndexKey, false);
     if (indexMode === "queued") {
       this.getZSet(pendingKey, true).value.set(recordKey, pendingScore);
       this.getZSet(threadQueueKey, true).value.set(recordKey, threadSequence);
+      this.getZSet(receivedAtIndexKey, true).value.set(recordKey, receivedAtScore);
     } else {
       if (pending?.value.delete(recordKey) && pending.value.size === 0) this.values.delete(pendingKey);
       if (threadQueue?.value.delete(recordKey) && threadQueue.value.size === 0) {
         this.values.delete(threadQueueKey);
       }
+      if (receivedAtIndex?.value.delete(recordKey) && receivedAtIndex.value.size === 0) {
+        this.values.delete(receivedAtIndexKey);
+      }
     }
+    this.reconcileInboxReadyThread(
+      pendingKey,
+      threadQueueKey,
+      readyThreadsIndexKey,
+      threadHash,
+    );
     return 1;
+  }
+
+  private reconcileInboxReadyThread(
+    pendingKey: string,
+    threadQueueKey: string,
+    readyThreadsIndexKey: string,
+    threadHash: string,
+  ): void {
+    const readyThreads = this.getZSet(readyThreadsIndexKey, false);
+    const threadQueue = this.getZSet(threadQueueKey, false);
+    if (!threadQueue || threadQueue.value.size === 0) {
+      if (readyThreads?.value.delete(threadHash) && readyThreads.value.size === 0) {
+        this.values.delete(readyThreadsIndexKey);
+      }
+      return;
+    }
+    const [headRecordKey] = [...threadQueue.value.entries()]
+      .sort(([firstValue, firstScore], [secondValue, secondScore]) =>
+        firstScore === secondScore ? firstValue.localeCompare(secondValue) : firstScore - secondScore,
+      )[0] ?? [];
+    if (!headRecordKey) return;
+
+    const metadataEntry = this.getEntry(`${headRecordKey}:metadata`);
+    if (metadataEntry?.kind !== "string") {
+      if (readyThreads?.value.delete(threadHash) && readyThreads.value.size === 0) {
+        this.values.delete(readyThreadsIndexKey);
+      }
+      return;
+    }
+    let metadata: {
+      state?: unknown;
+      status?: { processingLeaseExpiresAtMs?: unknown } | undefined;
+    };
+    try {
+      metadata = JSON.parse(metadataEntry.value) as {
+        state?: unknown;
+        status?: { processingLeaseExpiresAtMs?: unknown } | undefined;
+      };
+    } catch {
+      if (readyThreads?.value.delete(threadHash) && readyThreads.value.size === 0) {
+        this.values.delete(readyThreadsIndexKey);
+      }
+      return;
+    }
+
+    let score: number | undefined;
+    if (metadata.state === "received" || metadata.state === "failed_retryable") {
+      score = this.getZSet(pendingKey, false)?.value.get(headRecordKey);
+    } else if (
+      typeof metadata.status?.processingLeaseExpiresAtMs === "number" &&
+      Number.isFinite(metadata.status.processingLeaseExpiresAtMs) &&
+      metadata.status.processingLeaseExpiresAtMs >= 0
+    ) {
+      score = metadata.status.processingLeaseExpiresAtMs;
+    }
+    if (score === undefined) {
+      if (readyThreads?.value.delete(threadHash) && readyThreads.value.size === 0) {
+        this.values.delete(readyThreadsIndexKey);
+      }
+      return;
+    }
+    this.getZSet(readyThreadsIndexKey, true).value.set(threadHash, score);
   }
 
   private evalRateLimit(

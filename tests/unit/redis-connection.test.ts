@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { connectRedisFromUrl } from "../../lib/redis.js";
+import { connectRedisFromUrl, createNodeRedisAdapter } from "../../lib/redis.js";
 
 function hangingClient() {
   let errorListener: ((error: Error) => void) | undefined;
@@ -16,6 +16,7 @@ function hangingClient() {
     async pTTL(): Promise<number> { return -2; },
     async zAdd(): Promise<number> { return 0; },
     async zRangeByScore(): Promise<string[]> { return []; },
+    async zCard(_key: string): Promise<number> { return 0; },
     async zRem(): Promise<number> { return 0; },
     async zRemRangeByScore(): Promise<number> { return 0; },
     async eval(): Promise<unknown> { return 0; },
@@ -31,6 +32,18 @@ function hangingClient() {
 }
 
 describe("Redis production connection", () => {
+  it("normalizes sorted-set cardinality from node-redis", async () => {
+    const client = hangingClient();
+    let observedKey: string | undefined;
+    client.zCard = async (key: string) => {
+      observedKey = key;
+      return 7;
+    };
+
+    expect(await createNodeRedisAdapter(client).zCard("air:inbox:v1:pending")).toBe(7);
+    expect(observedKey).toBe("air:inbox:v1:pending");
+  });
+
   it("bounds cold connection setup and destroys a hanging client", async () => {
     const client = hangingClient();
     const startedAt = Date.now();

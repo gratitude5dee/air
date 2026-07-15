@@ -2,10 +2,15 @@ import type { CorpusDocument } from "./types.js";
 import { operationalLogger } from "./logging.js";
 import { UpstreamTimeoutError } from "./upstream.js";
 
-// MusicRAG currently routes Voyage-compatible embedding/reranking requests
-// through this endpoint. Keep it configurable for the dedicated production
-// credential path without changing the proven request shapes.
-const DEFAULT_VOYAGE_BASE_URL = "https://ai.mongodb.com/v1";
+/**
+ * Provenance: MusicRAG's Voyage embedding and reranking request contract,
+ * ported from `/Users/gratitud3/Downloads/musicindustry/musicRAG/web/lib`.
+ */
+
+// MusicRAG routes Voyage-compatible embedding/reranking requests through this
+// pinned endpoint. Do not make it an environment override: the request carries
+// the Voyage bearer credential and user question content.
+const VOYAGE_BASE_URL = "https://ai.mongodb.com/v1";
 export const VOYAGE_DIMENSIONS = 1_024;
 /** Leave room for MongoDB work and a bounded generation attempt in a 60s function. */
 export const VOYAGE_REQUEST_TIMEOUT_MS = 8_000;
@@ -33,13 +38,6 @@ export interface VoyageRequestOptions {
   readonly timeoutMs?: number | undefined;
 }
 
-function voyageBaseUrl(): string {
-  return (process.env.VOYAGE_API_BASE_URL?.trim() || DEFAULT_VOYAGE_BASE_URL).replace(
-    /\/$/,
-    "",
-  );
-}
-
 function voyageApiKey(): string {
   const key = process.env.VOYAGE_API_KEY?.trim();
   if (!key) throw new Error("VOYAGE_API_KEY is required for grounded retrieval");
@@ -63,7 +61,7 @@ async function voyageFetch(
   }, timeoutMs);
   const signal = options.signal ? AbortSignal.any([controller.signal, options.signal]) : controller.signal;
   try {
-    return await fetch(`${voyageBaseUrl()}${path}`, {
+    return await fetch(`${VOYAGE_BASE_URL}${path}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${voyageApiKey()}`,
@@ -90,10 +88,7 @@ export async function embedQuery(
   const startedAtMs = Date.now();
 
   try {
-    const model =
-      process.env.EMBED_MODEL === "voyage-context-4"
-        ? process.env.EMBED_FALLBACK_MODEL?.trim() || "voyage-4-large"
-        : process.env.EMBED_MODEL?.trim() || "voyage-4-large";
+    const model = process.env.EMBED_MODEL?.trim() || "voyage-4-large";
     const response = await voyageFetch("/embeddings", {
       model,
       input: [query],

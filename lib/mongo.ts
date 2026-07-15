@@ -1,5 +1,10 @@
 import { MongoClient, type Db, type MongoClientOptions } from "mongodb";
 
+/**
+ * Provenance: MusicRAG's reusable read-only MongoDB client pattern, adapted
+ * for Air's bounded Vercel Function connection requirements.
+ */
+
 const DEFAULT_TIMEOUT_MS = 8_000;
 const DEFAULT_DATABASE = "music_rag";
 

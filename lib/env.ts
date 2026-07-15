@@ -68,6 +68,9 @@ export function loadAirEnvironment(
     if (missing.length > 0) {
       throw new Error(`missing required production environment: ${missing.join(", ")}`);
     }
+    if (optional(source.AI_GATEWAY_API_KEY)) {
+      throw new Error("AI_GATEWAY_API_KEY is not allowed in production; use Vercel OIDC");
+    }
   }
 
   const queueEncryptionKey = optional(source.AIR_QUEUE_ENCRYPTION_KEY);

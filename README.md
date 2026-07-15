@@ -38,12 +38,11 @@ flowchart LR
 The public webhook reads the raw request bytes once, limits the body to 64 KiB,
 validates the Photon HMAC, normalizes only required fields, encrypts the
 envelope, and persists it before returning success. The official adapter is
-used for thread IDs and outbound delivery, never as the public webhook
-dispatcher. Air intentionally removes Chat SDK's generated adapter-webhook
-route, so `/webhooks/imessage` is the only compiled public iMessage ingress.
-An inert `GET /_internal/air-imessage-channel` returns `404` with `no-store`;
-it exists solely to keep Eve's cross-channel receiver registered and cannot
-dispatch Photon traffic or an Eve turn.
+used for thread IDs and outbound delivery. Its generated receiver remains
+pinned at the intentionally unregistered `/_internal/chat-sdk/imessage` path,
+where the official adapter verifies HMAC but Air has no dispatching bot
+handlers, so a delivery cannot start an Eve session. Photon must be configured
+only for `/webhooks/imessage`, which is Air's sole intended dispatch path.
 
 ## Local setup
 
@@ -81,11 +80,14 @@ the adapter-compatible signature format: header `X-Spectrum-Signature` is
 same durable record by Photon project ID plus message ID; the webhook delivery
 ID remains redacted metadata.
 
-Never configure any Chat SDK adapter route in Photon. The bridge is retained
-for Redis-backed state, Eve events, thread reconstruction, and outbound posts,
-but its generated adapter webhook route is deliberately absent from Air's
-compiled public route table. The build verification checks that no
-`/_internal/chat-sdk/imessage` or `/eve/v1/imessage` route is emitted.
+Never configure the Chat SDK adapter route in Photon. The bridge is retained
+for Redis-backed state and Photon-backed thread posts; Eve workflow state holds
+only an opaque delivery-target HMAC, while the physical thread remains in an
+encrypted Redis target until a post is made. Its generated
+`GET`/`POST /_internal/chat-sdk/imessage` receiver is a framework-required,
+intentionally unregistered HMAC-verification boundary, not an alternate
+ingress. The build verification permits exactly that internal route pair and
+rejects any additional application dispatch path.
 
 ## Behavior and privacy
 
@@ -97,6 +99,9 @@ compiled public route table. The build verification checks that no
 - Sender IDs and thread IDs are HMAC pseudonyms in application Redis keys and
   logs. Message text, transcript snippets, credentials, signatures, and raw
   payloads are never logged.
+- Eve workflow titles are fixed and its channel metadata/state contains only
+  opaque HMACs; a physical iMessage thread is resolved from encrypted Redis
+  only during an outbound Chat SDK post.
 - The model cannot use shell, file, browser, web-search, or database-write
   tools. All Eve built-ins are explicitly disabled.
 
@@ -160,11 +165,31 @@ npm run build
 ```
 
 `npm run build` runs a manifest regression check: `answer_music_question` must
-be the only callable tool, the attempt-scoped receiver must be registered, and
-no alternate Chat SDK iMessage webhook can be emitted. Test a signed fixture,
+be the only callable tool, the adapter receiver must remain pinned to its
+unregistered internal route, and no alternate Chat SDK iMessage webhook can be
+emitted. Test a signed fixture,
 duplicate delivery, invalid signature, interrupted post-ack drain, group
 notice, allowlist rejection, rate limit, known-corpus answer, and missing
 evidence before any production webhook is enabled.
+
+### MusicRAG golden retrieval gate
+
+Air owns the supplied 40-question MusicRAG fixture in
+[`eval/musicrag-golden.jsonl`](eval/musicrag-golden.jsonl). Its pure metric
+harness is covered by normal unit tests; it does not need MongoDB, Voyage, or
+generation credentials. The credential-gated live retrieval run is separate:
+
+```sh
+# Trusted operator shell only: read-only Atlas + Voyage credentials required.
+npm run eval:golden
+```
+
+It runs the actual Air retrieval path sequentially against the existing corpus,
+prints only the aggregate Recall@10, MRR@10, and nDCG@10 summary, and fails if
+the three-decimal recorded MusicRAG agent baseline is not met. It does not
+generate answers, send messages, write Atlas data, or claim a result until the
+command is executed. See [`eval/README.md`](eval/README.md) for fixture
+provenance and credential requirements.
 
 ## Deployment and rollback
 

@@ -1,5 +1,10 @@
 import type { CorpusDocument } from "./types.js";
 
+/**
+ * Provenance: MusicRAG's episode-aware fusion and diversification logic,
+ * ported from `/Users/gratitud3/Downloads/musicindustry/musicRAG/web/lib`.
+ */
+
 export const RERANK_WEIGHT = 0.7;
 export const RRF_WEIGHT = 0.3;
 export const EPISODE_DAMPING = 0.5;

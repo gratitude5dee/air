@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   __setAirRuntimeForTests,
   createAirRuntime,
@@ -8,17 +8,33 @@ import {
   handleIMessageInputRequested,
   handleIMessageMessageCompleted,
   handleIMessageSessionCompleted,
+  handleIMessageSessionFailed,
+  handleIMessageTurnFailed,
   handleIMessageTurnStarted,
   handleIMessageWebhook,
+  type AirChatThread,
   type AirIMessageAdapter,
   type AirRuntime,
 } from "../../lib/imessage-channel-runtime.js";
 import { type VerifiedInboxInput } from "../../lib/durable-inbox.js";
 import { outboxRecordKey } from "../../lib/durable-outbox.js";
 import { loadAirEnvironment } from "../../lib/env.js";
-import { acquireRedisLease, MemoryRedis } from "../../lib/redis.js";
+import {
+  acquireRedisLease,
+  COMPARE_AND_DELETE_LUA,
+  MemoryRedis,
+  WRITE_INBOX_RECORD_LUA,
+  WRITE_OUTBOX_RECORD_LUA,
+} from "../../lib/redis.js";
 import { deriveOpaqueId, hashSenderIdentifier, hashThreadIdentifier } from "../../lib/security.js";
-import { AR_AGENT_CAPABILITY_BLURB } from "../../lib/messages.js";
+import {
+  AR_AGENT_ACCESS_NOTICE,
+  AR_AGENT_CAPABILITY_BLURB,
+  AR_AGENT_DM_ONLY_NOTICE,
+  AR_AGENT_RATE_LIMIT_NOTICE,
+  AR_AGENT_RETRY_NOTICE,
+  AR_AGENT_TOO_LONG_NOTICE,
+} from "../../lib/messages.js";
 
 const identitySecret = "runtime-test-identity";
 const senderId = "+14155551234";
@@ -30,7 +46,9 @@ class FakeAdapter implements AirIMessageAdapter {
   public readonly read: string[] = [];
 
   encodeThreadId(input: { readonly chatGuid: string; readonly phone?: string }): string {
-    return `imessage:${input.phone ?? ""}:${input.chatGuid}`;
+    return input.phone
+      ? `imessage:${input.chatGuid}~${input.phone}`
+      : `imessage:${input.chatGuid}`;
   }
 
   async postMessage(threadId: string, message: string): Promise<unknown> {
@@ -43,6 +61,70 @@ class FakeAdapter implements AirIMessageAdapter {
   }
 
   async startTyping(): Promise<void> {}
+}
+
+class ActiveMapOrderingRedis extends MemoryRedis {
+  public runtime: AirRuntime | undefined;
+  public recordKey: string | undefined;
+  public readonly inboxStatesAtActiveMapDeletion: Array<string | undefined> = [];
+  private failAfterNextSendUnknownWrite = false;
+  private failAfterNextPreSendOutboxWrite = false;
+  private failAfterNextSentOutboxWrite = false;
+
+  public constructor(clock?: () => number) {
+    super(clock);
+  }
+
+  failAfterNextSendUnknownTransition(): void {
+    this.failAfterNextSendUnknownWrite = true;
+  }
+
+  failAfterNextPreSendOutboxTransition(): void {
+    this.failAfterNextPreSendOutboxWrite = true;
+  }
+
+  failAfterNextSentOutboxTransition(): void {
+    this.failAfterNextSentOutboxWrite = true;
+  }
+
+  override async eval(
+    script: string,
+    options: { keys: readonly string[]; arguments: readonly string[] },
+  ): Promise<unknown> {
+    const key = options.keys[0];
+    if (
+      script === COMPARE_AND_DELETE_LUA &&
+      key?.startsWith("air:active-turn:v1:") &&
+      this.runtime &&
+      this.recordKey
+    ) {
+      const record = await this.runtime.inbox.getRecord(this.recordKey);
+      this.inboxStatesAtActiveMapDeletion.push(record?.state);
+    }
+    const isSendUnknownWrite =
+      script === WRITE_INBOX_RECORD_LUA &&
+      (JSON.parse(options.arguments[0] ?? "{}") as { state?: unknown }).state === "send_unknown";
+    const isPreSendOutboxWrite =
+      script === WRITE_OUTBOX_RECORD_LUA &&
+      (JSON.parse(options.arguments[0] ?? "{}") as { state?: unknown }).state === "failed_retryable";
+    const isSentOutboxWrite =
+      script === WRITE_OUTBOX_RECORD_LUA &&
+      (JSON.parse(options.arguments[0] ?? "{}") as { state?: unknown }).state === "sent";
+    const result = await super.eval(script, options);
+    if (this.failAfterNextSendUnknownWrite && isSendUnknownWrite) {
+      this.failAfterNextSendUnknownWrite = false;
+      throw new Error("simulated disconnect after send_unknown inbox commit");
+    }
+    if (this.failAfterNextPreSendOutboxWrite && isPreSendOutboxWrite) {
+      this.failAfterNextPreSendOutboxWrite = false;
+      throw new Error("simulated disconnect after pre-send outbox commit");
+    }
+    if (this.failAfterNextSentOutboxWrite && isSentOutboxWrite) {
+      this.failAfterNextSentOutboxWrite = false;
+      throw new Error("simulated disconnect after sent outbox commit");
+    }
+    return result;
+  }
 }
 
 function environment(allowed = hashSenderIdentifier(identitySecret, senderId)) {
@@ -59,25 +141,40 @@ function environment(allowed = hashSenderIdentifier(identitySecret, senderId)) {
 }
 
 function input(messageId: string, text: string, receivedAtMs = Date.now()): VerifiedInboxInput {
+  return inputFor({ messageId, text, receivedAtMs });
+}
+
+function inputFor(options: {
+  readonly messageId: string;
+  readonly text: string;
+  readonly chatGuid?: string;
+  readonly senderId?: string;
+  readonly isGroup?: boolean;
+  readonly receivedAtMs?: number;
+}): VerifiedInboxInput {
+  const targetChatGuid = options.chatGuid ?? chatGuid;
+  const targetSenderId = options.senderId ?? senderId;
+  const isGroup = options.isGroup ?? false;
+  const receivedAtMs = options.receivedAtMs ?? Date.now();
   return {
     projectId: "project-test",
-    messageId,
-    webhookId: `delivery-${messageId}`,
-    senderHash: hashSenderIdentifier(identitySecret, senderId),
-    threadHash: hashThreadIdentifier(identitySecret, chatGuid),
+    messageId: options.messageId,
+    webhookId: `delivery-${options.messageId}`,
+    senderHash: hashSenderIdentifier(identitySecret, targetSenderId),
+    threadHash: hashThreadIdentifier(identitySecret, targetChatGuid),
     contentType: "text",
-    isGroup: false,
+    isGroup,
     receivedAtMs,
     envelope: {
       projectId: "project-test",
-      messageId,
-      webhookId: `delivery-${messageId}`,
-      chatGuid,
+      messageId: options.messageId,
+      webhookId: `delivery-${options.messageId}`,
+      chatGuid: targetChatGuid,
       sendingLine: "+15555550123",
-      senderId,
+      senderId: targetSenderId,
       direction: "inbound",
-      content: { type: "text", text },
-      isGroup: false,
+      content: { type: "text", text: options.text },
+      isGroup,
       receivedAtMs,
     },
   };
@@ -229,6 +326,310 @@ describe("durable iMessage transport", () => {
     expect(adapter.sent).toEqual([{ threadId: "chat-sdk-thread", message: AR_AGENT_CAPABILITY_BLURB }]);
   });
 
+  it("turn.failed records a redacted diagnostic before sending the fixed retry notice", async () => {
+    const runtime = injectedRuntime();
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const persisted = await runtime.inbox.persistVerified(input("turn-failed-1", "How should a release roll out?"));
+    const observedAtPost: Array<{ state: string | undefined; failureCategory: string | undefined }> = [];
+    const thread = {
+      id: adapter.encodeThreadId({ chatGuid, phone: "+15555550123" }),
+      post: async (message: string) => {
+        const record = await runtime.inbox.getRecord(persisted.record.immutable.recordKey);
+        observedAtPost.push({ state: record?.state, failureCategory: record?.status.failureCategory });
+        adapter.sent.push({ threadId: "chat-sdk-thread", message });
+        return { id: "chat-sdk-outbound" };
+      },
+    };
+
+    await drainDurableInbox({ adapter, receive: async () => ({ id: "turn-failed-session" }) });
+    await handleIMessageTurnStarted({
+      event: { turnId: "turn-failed-turn" },
+      eventChannel: { thread },
+      sessionId: "turn-failed-session",
+    });
+    await handleIMessageActionResult({
+      event: completedToolResult("turn-failed-turn", "A validated answer that must not be sent. [S1]"),
+      eventChannel: { thread },
+      sessionId: "turn-failed-session",
+    });
+    await handleIMessageTurnFailed({
+      event: { turnId: "turn-failed-turn" },
+      eventChannel: { thread },
+      sessionId: "turn-failed-session",
+    });
+
+    expect(adapter.sent).toEqual([{ threadId: "chat-sdk-thread", message: AR_AGENT_RETRY_NOTICE }]);
+    expect(observedAtPost).toEqual([{ state: "sending", failureCategory: "eve_turn_failed" }]);
+    const record = await runtime.inbox.getRecord(persisted.record.immutable.recordKey);
+    expect(record?.state).toBe("sent");
+    expect(record?.status.failureCategory).toBe("eve_turn_failed");
+  });
+
+  it("session.failed ignores a prior validated answer and retains its diagnostic after send", async () => {
+    const runtime = injectedRuntime();
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const thread = chatThread(adapter);
+    const persisted = await runtime.inbox.persistVerified(input("session-failed-1", "How should a release roll out?"));
+
+    await drainDurableInbox({ adapter, receive: async () => ({ id: "session-failed-session" }) });
+    await handleIMessageTurnStarted({
+      event: { turnId: "session-failed-turn" },
+      eventChannel: { thread },
+      sessionId: "session-failed-session",
+    });
+    await handleIMessageActionResult({
+      event: completedToolResult("session-failed-turn", "A validated answer that must not be sent. [S1]"),
+      eventChannel: { thread },
+      sessionId: "session-failed-session",
+    });
+    await handleIMessageSessionFailed({
+      event: { sessionId: "session-failed-session" },
+      eventChannel: { thread },
+    });
+
+    expect(adapter.sent).toEqual([{ threadId: "chat-sdk-thread", message: AR_AGENT_RETRY_NOTICE }]);
+    const record = await runtime.inbox.getRecord(persisted.record.immutable.recordKey);
+    expect(record?.state).toBe("sent");
+    expect(record?.status.failureCategory).toBe("eve_session_failed");
+  });
+
+  it("clears the active map only after an Eve handoff failure durably ends the attempt", async () => {
+    const redis = new ActiveMapOrderingRedis();
+    const runtime = createAirRuntime({ environment: environment(), redis });
+    redis.runtime = runtime;
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const persisted = await runtime.inbox.persistVerified(input("handoff-order-1", "How should a release roll out?"));
+    redis.recordKey = persisted.record.immutable.recordKey;
+
+    await drainDurableInbox({
+      adapter,
+      receive: async () => {
+        throw new Error("fixture receive failure");
+      },
+    });
+
+    const record = await runtime.inbox.getRecord(persisted.record.immutable.recordKey);
+    expect(record?.state).toBe("failed_retryable");
+    expect(record?.status.failureCategory).toBe("eve_receive_failed");
+    expect(redis.inboxStatesAtActiveMapDeletion).toEqual(["failed_retryable"]);
+  });
+
+  it("keeps the active map when the send_unknown transition has an unknown commit outcome", async () => {
+    const redis = new ActiveMapOrderingRedis();
+    const runtime = createAirRuntime({ environment: environment(), redis });
+    redis.runtime = runtime;
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const persisted = await runtime.inbox.persistVerified(input(
+      "send-unknown-transition-failure-1",
+      "How should a release roll out?",
+    ));
+    redis.recordKey = persisted.record.immutable.recordKey;
+    const thread = {
+      id: adapter.encodeThreadId({ chatGuid, phone: "+15555550123" }),
+      post: async () => {
+        throw new Error("simulated Photon post timeout");
+      },
+    };
+
+    await drainDurableInbox({
+      adapter,
+      receive: async () => ({ id: "send-unknown-transition-failure-session" }),
+    });
+    await handleIMessageTurnStarted({
+      event: { turnId: "send-unknown-transition-failure-turn" },
+      eventChannel: { thread },
+      sessionId: "send-unknown-transition-failure-session",
+    });
+    await handleIMessageActionResult({
+      event: completedToolResult(
+        "send-unknown-transition-failure-turn",
+        "A post with an uncertain provider outcome. [S1]",
+      ),
+      eventChannel: { thread },
+      sessionId: "send-unknown-transition-failure-session",
+    });
+
+    redis.failAfterNextSendUnknownTransition();
+    await handleIMessageMessageCompleted({
+      event: { finishReason: "stop", turnId: "send-unknown-transition-failure-turn" },
+      eventChannel: { thread },
+      sessionId: "send-unknown-transition-failure-session",
+    });
+
+    const activeKey = `air:active-turn:v1:${deriveOpaqueId(identitySecret, "chat-sdk-thread", thread.id)}`;
+    expect((await runtime.inbox.getRecord(persisted.record.immutable.recordKey))?.state).toBe("send_unknown");
+    expect((await runtime.outbox.getRecord(outboxRecordKey(persisted.record.immutable.correlationId)))?.state)
+      .toBe("send_unknown");
+    expect(await redis.get(activeKey)).not.toBeNull();
+    expect(redis.inboxStatesAtActiveMapDeletion).toEqual([]);
+  });
+
+  it("retries a missing Chat SDK post as a known pre-send failure even after a lost Redis response", async () => {
+    let now = 0;
+    const redis = new ActiveMapOrderingRedis(() => now);
+    const runtime = createAirRuntime({ environment: environment(), redis, clock: () => now });
+    redis.runtime = runtime;
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const persisted = await runtime.inbox.persistVerified(input(
+      "missing-chat-post-1",
+      "How should a release roll out?",
+      now,
+    ));
+    redis.recordKey = persisted.record.immutable.recordKey;
+    const malformedThread = {
+      id: adapter.encodeThreadId({ chatGuid, phone: "+15555550123" }),
+    } as unknown as AirChatThread;
+
+    await drainDurableInbox({
+      adapter,
+      receive: async () => ({ id: "missing-chat-post-session" }),
+    });
+    await handleIMessageTurnStarted({
+      event: { turnId: "missing-chat-post-turn" },
+      eventChannel: { thread: malformedThread },
+      sessionId: "missing-chat-post-session",
+    });
+    await handleIMessageActionResult({
+      event: completedToolResult("missing-chat-post-turn", "The retry must send this response once. [S1]"),
+      eventChannel: { thread: malformedThread },
+      sessionId: "missing-chat-post-session",
+    });
+
+    redis.failAfterNextPreSendOutboxTransition();
+    await handleIMessageMessageCompleted({
+      event: { finishReason: "stop", turnId: "missing-chat-post-turn" },
+      eventChannel: { thread: malformedThread },
+      sessionId: "missing-chat-post-session",
+    });
+
+    const retryableInbox = await runtime.inbox.getRecord(persisted.record.immutable.recordKey);
+    const retryableOutbox = await runtime.outbox.getRecord(outboxRecordKey(persisted.record.immutable.correlationId));
+    expect(retryableInbox).toMatchObject({ state: "failed_retryable" });
+    expect(retryableInbox?.status.failureCategory).toBe("chat_thread_unavailable");
+    expect(retryableOutbox).toMatchObject({ state: "failed_retryable" });
+    expect(retryableOutbox?.status.failureCategory).toBe("chat_thread_unavailable");
+    expect(adapter.sent).toEqual([]);
+    expect(redis.inboxStatesAtActiveMapDeletion).toEqual(["failed_retryable"]);
+
+    now = retryableInbox?.status.nextAttemptAtMs ?? now + 1_000;
+    await drainDurableInbox({
+      adapter,
+      receive: async () => {
+        throw new Error("the durable outbox must recover without another Eve handoff");
+      },
+    });
+
+    expect(adapter.sent).toEqual([
+      { threadId: malformedThread.id, message: "The retry must send this response once. [S1]" },
+    ]);
+    expect((await runtime.inbox.getRecord(persisted.record.immutable.recordKey))?.state).toBe("sent");
+    expect((await runtime.outbox.getRecord(outboxRecordKey(persisted.record.immutable.correlationId)))?.state)
+      .toBe("sent");
+  });
+
+  it("reconciles a lost markSent response to durable sent without relabeling the provider outcome", async () => {
+    const redis = new ActiveMapOrderingRedis();
+    const runtime = createAirRuntime({ environment: environment(), redis });
+    redis.runtime = runtime;
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const persisted = await runtime.inbox.persistVerified(input(
+      "lost-mark-sent-response-1",
+      "How should a release roll out?",
+    ));
+    redis.recordKey = persisted.record.immutable.recordKey;
+    const thread = chatThread(adapter);
+
+    await drainDurableInbox({ adapter, receive: async () => ({ id: "lost-mark-sent-session" }) });
+    await handleIMessageTurnStarted({
+      event: { turnId: "lost-mark-sent-turn" },
+      eventChannel: { thread },
+      sessionId: "lost-mark-sent-session",
+    });
+    await handleIMessageActionResult({
+      event: completedToolResult("lost-mark-sent-turn", "The answer is sent once. [S1]"),
+      eventChannel: { thread },
+      sessionId: "lost-mark-sent-session",
+    });
+
+    redis.failAfterNextSentOutboxTransition();
+    await handleIMessageMessageCompleted({
+      event: { finishReason: "stop", turnId: "lost-mark-sent-turn" },
+      eventChannel: { thread },
+      sessionId: "lost-mark-sent-session",
+    });
+
+    expect(adapter.sent).toEqual([
+      { threadId: "chat-sdk-thread", message: "The answer is sent once. [S1]" },
+    ]);
+    expect((await runtime.outbox.getRecord(outboxRecordKey(persisted.record.immutable.correlationId)))?.state)
+      .toBe("sent");
+    expect((await runtime.inbox.getRecord(persisted.record.immutable.recordKey))?.state).toBe("sent");
+    expect(redis.inboxStatesAtActiveMapDeletion).toEqual(["sent"]);
+  });
+
+  it("keeps a late provider success send_unknown after its sending lease has expired", async () => {
+    let now = 0;
+    const { runtime } = controlledRuntime(() => now);
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const persisted = await runtime.inbox.persistVerified(input(
+      "late-provider-success-1",
+      "How should a release roll out?",
+      now,
+    ));
+    const thread = {
+      id: adapter.encodeThreadId({ chatGuid, phone: "+15555550123" }),
+      post: async (message: string) => {
+        adapter.sent.push({ threadId: "chat-sdk-thread", message });
+        // A different invocation observes the expired outbox lease while the
+        // provider call is still in flight. The late local success must not
+        // overwrite that conservative durable decision.
+        now += 75_001;
+        await runtime.outbox.listDue();
+        return { id: "late-provider-outbound" };
+      },
+    };
+
+    await drainDurableInbox({ adapter, receive: async () => ({ id: "late-provider-session" }) });
+    await handleIMessageTurnStarted({
+      event: { turnId: "late-provider-turn" },
+      eventChannel: { thread },
+      sessionId: "late-provider-session",
+    });
+    await handleIMessageActionResult({
+      event: completedToolResult("late-provider-turn", "A late success must stay ambiguous. [S1]"),
+      eventChannel: { thread },
+      sessionId: "late-provider-session",
+    });
+    await handleIMessageMessageCompleted({
+      event: { finishReason: "stop", turnId: "late-provider-turn" },
+      eventChannel: { thread },
+      sessionId: "late-provider-session",
+    });
+
+    expect(adapter.sent).toEqual([
+      { threadId: "chat-sdk-thread", message: "A late success must stay ambiguous. [S1]" },
+    ]);
+    expect((await runtime.outbox.getRecord(outboxRecordKey(persisted.record.immutable.correlationId)))?.state)
+      .toBe("send_unknown");
+    expect((await runtime.inbox.getRecord(persisted.record.immutable.recordKey))?.state)
+      .toBe("send_unknown");
+
+    await drainDurableInbox({
+      adapter,
+      receive: async () => {
+        throw new Error("send_unknown must not start a new Eve turn");
+      },
+    });
+    expect(adapter.sent).toHaveLength(1);
+  });
+
   it("handles a greeting without starting Eve or retrieval work", async () => {
     const runtime = injectedRuntime();
     __setAirRuntimeForTests(runtime);
@@ -297,6 +698,229 @@ describe("durable iMessage transport", () => {
 
     expect(adapter.read).toEqual([]);
     expect(adapter.sent).toHaveLength(1);
+  });
+
+  it("sends one group-only notice per thread for seven days without starting Eve", async () => {
+    let now = 0;
+    const { runtime } = controlledRuntime(() => now);
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const groupChatGuid = "iMessage;+;group-contract-thread";
+    const first = await runtime.inbox.persistVerified(inputFor({
+      messageId: "group-notice-first",
+      text: "Can you answer this in a group?",
+      chatGuid: groupChatGuid,
+      isGroup: true,
+      receivedAtMs: now,
+    }));
+
+    await drainDurableInbox({
+      adapter,
+      receive: async () => {
+        throw new Error("a group delivery must not start Eve");
+      },
+    });
+    const repeat = await runtime.inbox.persistVerified(inputFor({
+      messageId: "group-notice-repeat",
+      text: "Please answer this group follow-up too.",
+      chatGuid: groupChatGuid,
+      isGroup: true,
+      receivedAtMs: now,
+    }));
+    await drainDurableInbox({
+      adapter,
+      receive: async () => {
+        throw new Error("a repeated group delivery must not start Eve");
+      },
+    });
+
+    expect(adapter.sent).toEqual([
+      {
+        threadId: `imessage:${groupChatGuid}~+15555550123`,
+        message: AR_AGENT_DM_ONLY_NOTICE,
+      },
+    ]);
+    expect((await runtime.inbox.getRecord(first.record.immutable.recordKey))?.state).toBe("sent");
+    expect((await runtime.inbox.getRecord(repeat.record.immutable.recordKey))?.status.failureCategory)
+      .toBe("group_notice_suppressed");
+
+    now += 7 * 24 * 60 * 60 * 1_000;
+    const afterWindow = await runtime.inbox.persistVerified(inputFor({
+      messageId: "group-notice-after-window",
+      text: "May the group ask again now?",
+      chatGuid: groupChatGuid,
+      isGroup: true,
+      receivedAtMs: now,
+    }));
+    await drainDurableInbox({
+      adapter,
+      receive: async () => {
+        throw new Error("a post-window group delivery must not start Eve");
+      },
+    });
+
+    expect(adapter.sent).toEqual([
+      {
+        threadId: `imessage:${groupChatGuid}~+15555550123`,
+        message: AR_AGENT_DM_ONLY_NOTICE,
+      },
+      {
+        threadId: `imessage:${groupChatGuid}~+15555550123`,
+        message: AR_AGENT_DM_ONLY_NOTICE,
+      },
+    ]);
+    expect((await runtime.inbox.getRecord(afterWindow.record.immutable.recordKey))?.state).toBe("sent");
+  });
+
+  it("silently suppresses a repeated non-allowlisted sender without a handoff", async () => {
+    const deniedSender = "+14155559999";
+    const runtime = createAirRuntime({
+      environment: environment(hashSenderIdentifier(identitySecret, "+14155558888")),
+      redis: new MemoryRedis(),
+    });
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const first = await runtime.inbox.persistVerified(inputFor({
+      messageId: "access-notice-first",
+      text: "Can I use AR Agent?",
+      senderId: deniedSender,
+    }));
+    const repeat = await runtime.inbox.persistVerified(inputFor({
+      messageId: "access-notice-repeat",
+      text: "What about this second request?",
+      senderId: deniedSender,
+      chatGuid: "iMessage;-;+14155559999-second-thread",
+    }));
+
+    await drainDurableInbox({
+      adapter,
+      receive: async () => {
+        throw new Error("a non-allowlisted sender must not start Eve");
+      },
+    });
+
+    expect(adapter.read).toEqual([]);
+    expect(adapter.sent).toEqual([
+      {
+        threadId: `imessage:${chatGuid}~+15555550123`,
+        message: AR_AGENT_ACCESS_NOTICE,
+      },
+    ]);
+    expect((await runtime.inbox.getRecord(first.record.immutable.recordKey))?.state).toBe("sent");
+    expect((await runtime.inbox.getRecord(repeat.record.immutable.recordKey))?.status.failureCategory)
+      .toBe("access_notice_suppressed");
+  });
+
+  it("records an intentional silent policy drop without emitting a dead-letter alert", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const runtime = createAirRuntime({
+        environment: environment(hashSenderIdentifier(identitySecret, "+14155558888")),
+        redis: new MemoryRedis(),
+      });
+      __setAirRuntimeForTests(runtime);
+      const adapter = new FakeAdapter();
+      const deniedSender = "+14155559999";
+      await runtime.inbox.persistVerified(inputFor({
+        messageId: "policy-drop-notice",
+        text: "Can I use AR Agent?",
+        senderId: deniedSender,
+      }));
+      await runtime.inbox.persistVerified(inputFor({
+        messageId: "policy-drop-suppressed",
+        text: "Please answer this repeat too.",
+        senderId: deniedSender,
+        chatGuid: "iMessage;-;+14155559999-policy-drop-repeat",
+      }));
+
+      await drainDurableInbox({
+        adapter,
+        receive: async () => {
+          throw new Error("a denied sender must not start Eve");
+        },
+      });
+
+      const events = log.mock.calls.flatMap(([line]) => {
+        try {
+          return [JSON.parse(String(line)) as { event?: unknown; fields?: { category?: unknown } }];
+        } catch {
+          return [];
+        }
+      });
+      expect(events).toContainEqual(expect.objectContaining({
+        event: "imessage.policy_drop",
+        fields: expect.objectContaining({ category: "access_notice_suppressed" }),
+      }));
+      expect(events).not.toContainEqual(expect.objectContaining({
+        event: "imessage.dead_letter",
+        fields: expect.objectContaining({ category: "access_notice_suppressed" }),
+      }));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("rejects a question over 2,000 characters before an Eve handoff", async () => {
+    const runtime = injectedRuntime();
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const persisted = await runtime.inbox.persistVerified(input("too-long-question", "x".repeat(2_001)));
+    const handoffs: unknown[] = [];
+
+    await drainDurableInbox({
+      adapter,
+      receive: async (turn) => {
+        handoffs.push(turn);
+        return { id: "unexpected-too-long-session" };
+      },
+    });
+
+    expect(handoffs).toEqual([]);
+    expect(adapter.sent).toEqual([
+      { threadId: `imessage:${chatGuid}~+15555550123`, message: AR_AGENT_TOO_LONG_NOTICE },
+    ]);
+    expect((await runtime.inbox.getRecord(persisted.record.immutable.recordKey))?.state).toBe("sent");
+  });
+
+  it("does not hand off rate-limited questions, including silently suppressed repeats", async () => {
+    let now = 1_000_000;
+    const { runtime } = controlledRuntime(() => now);
+    __setAirRuntimeForTests(runtime);
+    const adapter = new FakeAdapter();
+    const handoffs: Array<{ readonly message: string }> = [];
+    const inputs = [];
+    for (const suffix of ["one", "two", "three", "four", "five"]) {
+      inputs.push(await runtime.inbox.persistVerified(inputFor({
+        messageId: `rate-limit-${suffix}`,
+        text: `What is the evidence for rate-limit contract ${suffix}?`,
+        chatGuid: `iMessage;-;+14155551234-rate-limit-${suffix}`,
+        receivedAtMs: now,
+      })));
+      now += 1;
+    }
+
+    await drainDurableInbox({
+      adapter,
+      receive: async (turn) => {
+        handoffs.push({ message: turn.message });
+        return { id: `rate-limit-session-${handoffs.length}` };
+      },
+    });
+
+    expect(handoffs.map((turn) => turn.message)).toEqual([
+      "What is the evidence for rate-limit contract one?",
+      "What is the evidence for rate-limit contract two?",
+      "What is the evidence for rate-limit contract three?",
+    ]);
+    expect(adapter.sent).toEqual([
+      {
+        threadId: "imessage:iMessage;-;+14155551234-rate-limit-four~+15555550123",
+        message: AR_AGENT_RATE_LIMIT_NOTICE,
+      },
+    ]);
+    expect((await runtime.inbox.getRecord(inputs[3]?.record.immutable.recordKey ?? ""))?.state).toBe("sent");
+    expect((await runtime.inbox.getRecord(inputs[4]?.record.immutable.recordKey ?? ""))?.status.failureCategory)
+      .toBe("rate_notice_suppressed");
   });
 
   it("fences delayed session A callbacks after the inbox is recovered by session B", async () => {
