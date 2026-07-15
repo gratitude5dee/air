@@ -1,0 +1,24 @@
+# Supplied reference trees: preserve locally, never commit them to Air.
+/advanced-imessage-ts-main/
+/vercel-chat-adapter-imessage-main/
+/vercel-eve-imessage-example-main/
+/zap-main/
+
+# Local task material and machine-specific files.
+/goal.md
+.DS_Store
+.vercel/
+
+# Credentials and local runtime artifacts.
+.env
+.env.*
+!.env.example
+node_modules/
+.eve/
+.output/
+.workflow-data/
+dist/
+coverage/
+.tmp/
+*.log
+.vercel
