@@ -71,6 +71,12 @@ export interface AirVideoIMessageAdapter {
 export interface VideoWebhookRuntimeOptions {
   readonly adapter: AirVideoIMessageAdapter;
   readonly waitUntil: (promise: Promise<unknown>) => void;
+  /**
+   * The public route supplies this fail-closed deployment guard. It runs only
+   * after the raw Spectrum signature has been verified, so an unsigned probe
+   * cannot be turned into a framework-level configuration exception.
+   */
+  readonly assertRuntimeConfiguration: () => void;
 }
 
 export interface VideoDrainOptions {
@@ -134,6 +140,14 @@ export async function handleIMessageVideoWebhook(
     timestamp: request.headers.get(SPECTRUM_TIMESTAMP_HEADER),
   });
   if (!verification.ok) return emptyResponse(verification.status);
+
+  try {
+    options.assertRuntimeConfiguration();
+  } catch {
+    // Deployment configuration is unavailable or unsafe. Do not parse,
+    // persist, or acknowledge a signed delivery in that state.
+    return emptyResponse(503);
+  }
 
   try {
     const normalized = normalizeSpectrumWebhook({

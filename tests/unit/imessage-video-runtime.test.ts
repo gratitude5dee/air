@@ -168,6 +168,20 @@ class FixtureAdapter implements AirVideoIMessageAdapter {
   }
 }
 
+function webhookOptions(
+  adapter: AirVideoIMessageAdapter,
+  background: Promise<unknown>[],
+  assertRuntimeConfiguration: () => void = () => undefined,
+) {
+  return {
+    adapter,
+    waitUntil: (task: Promise<unknown>) => {
+      background.push(task);
+    },
+    assertRuntimeConfiguration,
+  };
+}
+
 afterEach(() => {
   __setAirRuntimeForTests(undefined);
   spectrumMock.getAttachment.mockReset();
@@ -176,6 +190,39 @@ afterEach(() => {
 });
 
 describe("iMessage video runtime safeguards", () => {
+  it("verifies an unsigned request before evaluating deployment configuration", async () => {
+    const assertRuntimeConfiguration = vi.fn(() => {
+      throw new Error("missing deployment configuration");
+    });
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleIMessageVideoWebhook(
+      new Request("https://air.example.test/webhooks/imessage", { method: "POST", body: "{}" }),
+      webhookOptions(new FixtureAdapter(), background, assertRuntimeConfiguration),
+    );
+
+    expect(response.status).toBe(400);
+    expect(assertRuntimeConfiguration).not.toHaveBeenCalled();
+    expect(background).toEqual([]);
+  });
+
+  it("returns a retryable 503 rather than throwing when signed ingress configuration is incomplete", async () => {
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+    const assertRuntimeConfiguration = vi.fn(() => {
+      throw new Error("missing deployment configuration");
+    });
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(textPayload({ messageId: "configuration-guard" })),
+      webhookOptions(new FixtureAdapter(), background, assertRuntimeConfiguration),
+    );
+
+    expect(response.status).toBe(503);
+    expect(assertRuntimeConfiguration).toHaveBeenCalledTimes(1);
+    expect(background).toEqual([]);
+  });
+
   it("cancels an oversized attachment stream before it can become an in-memory Buffer", async () => {
     const runtime = createRuntime();
     __setAirRuntimeForTests(runtime);
@@ -200,10 +247,10 @@ describe("iMessage video runtime safeguards", () => {
     const background: Promise<unknown>[] = [];
     const reserve = vi.spyOn(runtime.limiter, "reserveAtReceipt");
 
-    const response = await handleIMessageVideoWebhook(signedRequest(attachmentPayload()), {
-      adapter,
-      waitUntil: (task) => background.push(task),
-    });
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(attachmentPayload()),
+      webhookOptions(adapter, background),
+    );
     await Promise.all(background);
 
     expect(response.status).toBe(200);
@@ -221,10 +268,10 @@ describe("iMessage video runtime safeguards", () => {
     const adapter = new FixtureAdapter();
     const background: Promise<unknown>[] = [];
 
-    const response = await handleIMessageVideoWebhook(signedRequest(reactionPayload()), {
-      adapter,
-      waitUntil: (task) => background.push(task),
-    });
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(reactionPayload()),
+      webhookOptions(adapter, background),
+    );
 
     expect(response.status).toBe(204);
     expect(background).toEqual([]);
@@ -242,7 +289,7 @@ describe("iMessage video runtime safeguards", () => {
 
     const response = await handleIMessageVideoWebhook(
       signedRequest(attachmentPayload({ chatGuid: "unclassified-chat-guid", spaceType: null })),
-      { adapter, waitUntil: (task) => background.push(task) },
+      webhookOptions(adapter, background),
     );
 
     expect(response.status).toBe(204);
@@ -290,10 +337,10 @@ describe("iMessage video runtime safeguards", () => {
     const adapter = new FixtureAdapter();
     const background: Promise<unknown>[] = [];
 
-    const response = await handleIMessageVideoWebhook(signedRequest(attachmentPayload()), {
-      adapter,
-      waitUntil: (task) => background.push(task),
-    });
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(attachmentPayload()),
+      webhookOptions(adapter, background),
+    );
     await Promise.all(background);
 
     const correlation = deriveCorrelationId(identitySecret, projectId, "video-runtime-message");
@@ -342,18 +389,12 @@ describe("iMessage video runtime safeguards", () => {
 
     const first = await handleIMessageVideoWebhook(signedRequest(textPayload({
       messageId: "video-runtime-first",
-    })), {
-      adapter,
-      waitUntil: (task) => firstBackground.push(task),
-    });
+    })), webhookOptions(adapter, firstBackground));
     await Promise.all(firstBackground);
 
     const second = await handleIMessageVideoWebhook(signedRequest(textPayload({
       messageId: "video-runtime-second",
-    })), {
-      adapter,
-      waitUntil: (task) => secondBackground.push(task),
-    });
+    })), webhookOptions(adapter, secondBackground));
     await Promise.all(secondBackground);
 
     const jobs = new VideoJobStore({
@@ -383,10 +424,10 @@ describe("iMessage video runtime safeguards", () => {
     const background: Promise<unknown>[] = [];
     const fetch = vi.spyOn(globalThis, "fetch");
 
-    const response = await handleIMessageVideoWebhook(signedRequest(payload), {
-      adapter,
-      waitUntil: (task) => background.push(task),
-    });
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(payload),
+      webhookOptions(adapter, background),
+    );
     await Promise.all(background);
 
     const correlation = deriveCorrelationId(identitySecret, projectId, "video-runtime-no-line");

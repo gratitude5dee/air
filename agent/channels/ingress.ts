@@ -19,10 +19,10 @@ export default defineChannel({
   routes: [
     GET("/healthz", async () => healthResponse()),
     POST("/webhooks/imessage", async (request, args) => {
-      assertIMessageRuntimeConfiguration();
       return handleIMessageVideoWebhook(request, {
         adapter: imessageAdapter,
         waitUntil: args.waitUntil,
+        assertRuntimeConfiguration: assertIMessageRuntimeConfiguration,
       });
     }),
     POST("/internal/drain-inbox", async (request, args) => {
