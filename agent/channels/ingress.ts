@@ -19,16 +19,20 @@ export default defineChannel({
   routes: [
     GET("/healthz", async () => healthResponse()),
     POST("/webhooks/imessage", async (request, args) => {
-      assertIMessageRuntimeConfiguration();
       return handleIMessageVideoWebhook(request, {
         adapter: imessageAdapter,
         waitUntil: args.waitUntil,
+        assertRuntimeConfiguration: assertIMessageRuntimeConfiguration,
       });
     }),
     POST("/internal/drain-inbox", async (request, args) => {
-      assertIMessageRuntimeConfiguration();
       const authorized = await authorizeIMessageVideoDrain(request);
       if (authorized instanceof Response) return authorized;
+      try {
+        assertIMessageRuntimeConfiguration();
+      } catch {
+        return new Response(null, { status: 503 });
+      }
       args.waitUntil(drainIMessageVideoJobs({
         adapter: imessageAdapter,
         runtime: authorized.runtime,

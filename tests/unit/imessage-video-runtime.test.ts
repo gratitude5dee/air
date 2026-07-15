@@ -5,9 +5,13 @@ const spectrumMock = vi.hoisted(() => ({
   getAttachment: vi.fn(),
 }));
 
+const heicMock = vi.hoisted(() => vi.fn());
+
 vi.mock("@spectrum-ts/imessage", () => ({
   imessage: () => ({ getAttachment: spectrumMock.getAttachment }),
 }));
+
+vi.mock("heic-convert", () => ({ default: heicMock }));
 
 import {
   __setAirRuntimeForTests,
@@ -15,6 +19,7 @@ import {
 } from "../../lib/imessage-channel-runtime.js";
 import { loadAirEnvironment } from "../../lib/env.js";
 import {
+  authorizeIMessageVideoDrain,
   drainIMessageVideoJobs,
   handleIMessageVideoWebhook,
   MAX_INPUT_IMAGE_BYTES,
@@ -56,7 +61,7 @@ function createRuntime() {
   });
 }
 
-function signedRequest(payload: Record<string, unknown>): Request {
+function signedRequest(payload: Record<string, unknown>, options: { readonly webhookId?: string } = {}): Request {
   const timestamp = String(Math.floor(Date.now() / 1_000));
   const raw = JSON.stringify(payload);
   const signature = `v0=${createHmac("sha256", webhookSecret)
@@ -68,7 +73,7 @@ function signedRequest(payload: Record<string, unknown>): Request {
       "content-type": "application/json",
       "x-spectrum-signature": signature,
       "x-spectrum-timestamp": timestamp,
-      "x-spectrum-webhook-id": "video-runtime-delivery",
+      "x-spectrum-webhook-id": options.webhookId ?? "video-runtime-delivery",
     },
     body: raw,
   });
@@ -168,14 +173,76 @@ class FixtureAdapter implements AirVideoIMessageAdapter {
   }
 }
 
+function webhookOptions(
+  adapter: AirVideoIMessageAdapter,
+  background: Promise<unknown>[],
+  assertRuntimeConfiguration: () => void = () => undefined,
+) {
+  return {
+    adapter,
+    waitUntil: (task: Promise<unknown>) => {
+      background.push(task);
+    },
+    assertRuntimeConfiguration,
+  };
+}
+
 afterEach(() => {
   __setAirRuntimeForTests(undefined);
   spectrumMock.getAttachment.mockReset();
+  heicMock.mockReset();
   vi.restoreAllMocks();
   vi.unstubAllEnvs();
 });
 
 describe("iMessage video runtime safeguards", () => {
+  it("verifies an unsigned request before evaluating deployment configuration", async () => {
+    const assertRuntimeConfiguration = vi.fn(() => {
+      throw new Error("missing deployment configuration");
+    });
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleIMessageVideoWebhook(
+      new Request("https://air.example.test/webhooks/imessage", { method: "POST", body: "{}" }),
+      webhookOptions(new FixtureAdapter(), background, assertRuntimeConfiguration),
+    );
+
+    expect(response.status).toBe(400);
+    expect(assertRuntimeConfiguration).not.toHaveBeenCalled();
+    expect(background).toEqual([]);
+  });
+
+  it("returns a retryable 503 rather than throwing when signed ingress configuration is incomplete", async () => {
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+    const assertRuntimeConfiguration = vi.fn(() => {
+      throw new Error("missing deployment configuration");
+    });
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(textPayload({ messageId: "configuration-guard" })),
+      webhookOptions(new FixtureAdapter(), background, assertRuntimeConfiguration),
+    );
+
+    expect(response.status).toBe(503);
+    expect(assertRuntimeConfiguration).toHaveBeenCalledTimes(1);
+    expect(background).toEqual([]);
+  });
+
+  it("rejects an unauthenticated manual drain before runtime configuration is evaluated", async () => {
+    __setAirRuntimeForTests(undefined);
+    vi.stubEnv("VERCEL_ENV", "production");
+    // If authorization tried to load the runtime first, this incomplete
+    // production configuration would produce a 503 instead of a 401.
+    vi.stubEnv("IMESSAGE_PROJECT_ID", "");
+    const response = await authorizeIMessageVideoDrain(
+      new Request("https://air.example.test/internal/drain-inbox", { method: "POST" }),
+    );
+
+    expect(response).toBeInstanceOf(Response);
+    expect((response as Response).status).toBe(401);
+  });
+
   it("cancels an oversized attachment stream before it can become an in-memory Buffer", async () => {
     const runtime = createRuntime();
     __setAirRuntimeForTests(runtime);
@@ -200,10 +267,10 @@ describe("iMessage video runtime safeguards", () => {
     const background: Promise<unknown>[] = [];
     const reserve = vi.spyOn(runtime.limiter, "reserveAtReceipt");
 
-    const response = await handleIMessageVideoWebhook(signedRequest(attachmentPayload()), {
-      adapter,
-      waitUntil: (task) => background.push(task),
-    });
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(attachmentPayload()),
+      webhookOptions(adapter, background),
+    );
     await Promise.all(background);
 
     expect(response.status).toBe(200);
@@ -221,10 +288,10 @@ describe("iMessage video runtime safeguards", () => {
     const adapter = new FixtureAdapter();
     const background: Promise<unknown>[] = [];
 
-    const response = await handleIMessageVideoWebhook(signedRequest(reactionPayload()), {
-      adapter,
-      waitUntil: (task) => background.push(task),
-    });
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(reactionPayload()),
+      webhookOptions(adapter, background),
+    );
 
     expect(response.status).toBe(204);
     expect(background).toEqual([]);
@@ -242,7 +309,7 @@ describe("iMessage video runtime safeguards", () => {
 
     const response = await handleIMessageVideoWebhook(
       signedRequest(attachmentPayload({ chatGuid: "unclassified-chat-guid", spaceType: null })),
-      { adapter, waitUntil: (task) => background.push(task) },
+      webhookOptions(adapter, background),
     );
 
     expect(response.status).toBe(204);
@@ -290,10 +357,10 @@ describe("iMessage video runtime safeguards", () => {
     const adapter = new FixtureAdapter();
     const background: Promise<unknown>[] = [];
 
-    const response = await handleIMessageVideoWebhook(signedRequest(attachmentPayload()), {
-      adapter,
-      waitUntil: (task) => background.push(task),
-    });
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(attachmentPayload()),
+      webhookOptions(adapter, background),
+    );
     await Promise.all(background);
 
     const correlation = deriveCorrelationId(identitySecret, projectId, "video-runtime-message");
@@ -320,6 +387,200 @@ describe("iMessage video runtime safeguards", () => {
     expect(adapter.posted).toEqual(["Generating your 5-second video now."]);
   });
 
+  it("converts a validated HEIC first frame to JPEG before the direct upload", async () => {
+    const runtime = createRuntime();
+    __setAirRuntimeForTests(runtime);
+    vi.stubEnv("IMESSAGE_PROJECT_ID", projectId);
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+    const heic = Buffer.from([0, 0, 0, 0, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]);
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0]);
+    heicMock.mockResolvedValue(jpeg);
+    spectrumMock.getAttachment.mockResolvedValue({
+      size: heic.byteLength,
+      stream: async () => new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(heic);
+          controller.close();
+        },
+      }),
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url.endsWith("/api/services/air/v1/uploads")) {
+        return new Response(JSON.stringify({
+          uploadUrl: "https://storage.googleapis.com/gmi/converted-frame.jpg?signature=fixture",
+          publicUrl: "https://storage.googleapis.com/gmi/converted-frame.jpg",
+          headers: { "content-type": "image/jpeg" },
+          method: "PUT",
+          expiresAt: "2099-01-01T00:00:00.000Z",
+        }), { status: 201, headers: { "content-type": "application/json" } });
+      }
+      if (url.startsWith("https://storage.googleapis.com/")) return new Response(null, { status: 200 });
+      if (url.endsWith("/api/services/air/v1/runs")) {
+        return new Response(JSON.stringify({ runId: "run_heic_fixture", status: "queued" }), {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error("unexpected network destination");
+    });
+    const payload = attachmentPayload();
+    const content = (payload.message as { content: { items: Array<{ content: Record<string, unknown> }> } }).content;
+    const attachment = content.items[1]?.content;
+    if (!attachment) throw new Error("expected attachment fixture");
+    attachment.name = "frame.heic";
+    attachment.mimeType = "image/heic";
+    attachment.size = heic.byteLength;
+    const adapter = new FixtureAdapter();
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(payload),
+      webhookOptions(adapter, background),
+    );
+    await Promise.all(background);
+
+    expect(response.status).toBe(200);
+    expect(heicMock).toHaveBeenCalledWith(expect.objectContaining({ buffer: heic, format: "JPEG" }));
+    expect(adapter.posted).toEqual([AIR_VIDEO_GENERATING_NOTICE]);
+  });
+
+  it("coalesces concurrent duplicate signed deliveries into one Zap submission", async () => {
+    const runtime = createRuntime();
+    __setAirRuntimeForTests(runtime);
+    vi.stubEnv("IMESSAGE_PROJECT_ID", projectId);
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+    let runPosts = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.endsWith("/api/services/air/v1/runs")) {
+        throw new Error("unexpected network destination");
+      }
+      runPosts += 1;
+      return new Response(JSON.stringify({ runId: "run_concurrent_duplicate", status: "queued" }), {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    const adapter = new FixtureAdapter();
+    const firstBackground: Promise<unknown>[] = [];
+    const secondBackground: Promise<unknown>[] = [];
+    const payload = textPayload({ messageId: "concurrent-duplicate" });
+
+    const [first, second] = await Promise.all([
+      handleIMessageVideoWebhook(
+        signedRequest(payload, { webhookId: "delivery-concurrent-a" }),
+        webhookOptions(adapter, firstBackground),
+      ),
+      handleIMessageVideoWebhook(
+        signedRequest(payload, { webhookId: "delivery-concurrent-b" }),
+        webhookOptions(adapter, secondBackground),
+      ),
+    ]);
+    await Promise.all([...firstBackground, ...secondBackground]);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(runPosts).toBe(1);
+    expect(adapter.posted).toEqual([AIR_VIDEO_GENERATING_NOTICE]);
+  });
+
+  it("waits for durable Zap acceptance before sending the generating acknowledgement", async () => {
+    const runtime = createRuntime();
+    __setAirRuntimeForTests(runtime);
+    vi.stubEnv("IMESSAGE_PROJECT_ID", projectId);
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+
+    let resolveRun: ((response: Response) => void) | undefined;
+    let markRunStarted: (() => void) | undefined;
+    const runStarted = new Promise<void>((resolve) => {
+      markRunStarted = resolve;
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.endsWith("/api/services/air/v1/runs")) {
+        throw new Error("unexpected network destination");
+      }
+      markRunStarted?.();
+      return new Promise<Response>((resolve) => {
+        resolveRun = resolve;
+      });
+    });
+    const adapter = new FixtureAdapter();
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(textPayload({ messageId: "ack-after-acceptance" })),
+      webhookOptions(adapter, background),
+    );
+    await runStarted;
+
+    const correlation = deriveCorrelationId(identitySecret, projectId, "ack-after-acceptance");
+    const jobs = new VideoJobStore({
+      redis: runtime.redis,
+      cipher: runtime.cipher,
+      identityHashSecret: identitySecret,
+    });
+    expect(response.status).toBe(200);
+    expect(adapter.posted).toEqual([]);
+    const awaitingAcceptance = await jobs.get(videoJobRecordKey(correlation));
+    expect(awaitingAcceptance?.state).toBe("submission_unknown");
+    expect(awaitingAcceptance?.status.acknowledgementAttemptedAtMs).toBeUndefined();
+
+    resolveRun?.(new Response(JSON.stringify({ runId: "run_ack_fixture", status: "queued" }), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    }));
+    await Promise.all(background);
+
+    expect(adapter.posted).toEqual([AIR_VIDEO_GENERATING_NOTICE]);
+    expect(await jobs.get(videoJobRecordKey(correlation))).toMatchObject({
+      state: "queued",
+      status: { acknowledgementAttemptedAtMs: expect.any(Number) },
+    });
+  });
+
+  it("acknowledges an immediately completed accepted Zap run without regressing it", async () => {
+    const runtime = createRuntime();
+    __setAirRuntimeForTests(runtime);
+    vi.stubEnv("IMESSAGE_PROJECT_ID", projectId);
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      runId: "run_completed_fixture",
+      status: "video_ready",
+      video: {
+        url: "https://blob.vercel-storage.com/air/fixture.mp4",
+        mimeType: "video/mp4",
+      },
+    }), {
+      // A completed status is an idempotent replay, which Zap returns as 200;
+      // a first-time 202 acceptance is necessarily queued.
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    const adapter = new FixtureAdapter();
+    const background: Promise<unknown>[] = [];
+
+    await handleIMessageVideoWebhook(
+      signedRequest(textPayload({ messageId: "ack-immediate-completion" })),
+      webhookOptions(adapter, background),
+    );
+    await Promise.all(background);
+
+    const correlation = deriveCorrelationId(identitySecret, projectId, "ack-immediate-completion");
+    const jobs = new VideoJobStore({
+      redis: runtime.redis,
+      cipher: runtime.cipher,
+      identityHashSecret: identitySecret,
+    });
+    const completed = await jobs.get(videoJobRecordKey(correlation));
+    expect(completed).toMatchObject({
+      state: "video_ready",
+      status: { acknowledgementAttemptedAtMs: expect.any(Number) },
+    });
+    expect(adapter.posted).toEqual([AIR_VIDEO_GENERATING_NOTICE]);
+  });
+
   it("does not reserve quota for a receipt that loses the active-job fence", async () => {
     const runtime = createRuntime();
     __setAirRuntimeForTests(runtime);
@@ -342,18 +603,12 @@ describe("iMessage video runtime safeguards", () => {
 
     const first = await handleIMessageVideoWebhook(signedRequest(textPayload({
       messageId: "video-runtime-first",
-    })), {
-      adapter,
-      waitUntil: (task) => firstBackground.push(task),
-    });
+    })), webhookOptions(adapter, firstBackground));
     await Promise.all(firstBackground);
 
     const second = await handleIMessageVideoWebhook(signedRequest(textPayload({
       messageId: "video-runtime-second",
-    })), {
-      adapter,
-      waitUntil: (task) => secondBackground.push(task),
-    });
+    })), webhookOptions(adapter, secondBackground));
     await Promise.all(secondBackground);
 
     const jobs = new VideoJobStore({
@@ -383,10 +638,10 @@ describe("iMessage video runtime safeguards", () => {
     const background: Promise<unknown>[] = [];
     const fetch = vi.spyOn(globalThis, "fetch");
 
-    const response = await handleIMessageVideoWebhook(signedRequest(payload), {
-      adapter,
-      waitUntil: (task) => background.push(task),
-    });
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(payload),
+      webhookOptions(adapter, background),
+    );
     await Promise.all(background);
 
     const correlation = deriveCorrelationId(identitySecret, projectId, "video-runtime-no-line");
@@ -458,6 +713,87 @@ describe("iMessage video runtime safeguards", () => {
       state: "retryable",
       status: { failureCategory: "zap_poll_retryable" },
     });
+  });
+
+  it("delivers a validated MP4 as an attachment-only iMessage", async () => {
+    const runtime = createRuntime();
+    const jobs = new VideoJobStore({
+      redis: runtime.redis,
+      cipher: runtime.cipher,
+      identityHashSecret: identitySecret,
+    });
+    const created = await jobs.createOrGet({
+      correlationId: deriveCorrelationId(identitySecret, projectId, "attachment-delivery"),
+      senderHash: hashSenderIdentifier(identitySecret, sender),
+      prompt: "A whale made of clouds",
+      delivery: { chatGuid: "iMessage;-;+14155550000", phone: "+14155550001" },
+    });
+    const submission = await jobs.beginWork(created.record.immutable.recordKey);
+    if (!submission) throw new Error("expected submission intent");
+    await submission.transition({
+      expectedStates: ["submission_unknown"],
+      state: "video_ready",
+      zapRunId: "run_attachment_delivery",
+      video: { url: "https://blob.vercel-storage.com/air/attachment.mp4", mimeType: "video/mp4" },
+    });
+    await submission.release();
+
+    const mp4 = Buffer.from([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(mp4, {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": String(mp4.byteLength) },
+    }));
+    const adapter = new FixtureAdapter();
+
+    await drainIMessageVideoJobs({ runtime, adapter });
+
+    expect(adapter.posted).toHaveLength(1);
+    expect(adapter.posted[0]).toMatchObject({
+      raw: "",
+      files: [{ filename: "air-video.mp4", mimeType: "video/mp4" }],
+    });
+    const sent = adapter.posted[0] as { files: Array<{ data: Buffer }> };
+    expect(sent.files[0]?.data.equals(mp4)).toBe(true);
+    expect(await jobs.get(created.record.immutable.recordKey)).toMatchObject({ state: "delivered" });
+    expect(await jobs.getPayload(created.record.immutable.recordKey)).toBeNull();
+  });
+
+  it("uses the approved Blob URL only after deterministic output validation fails", async () => {
+    const runtime = createRuntime();
+    const jobs = new VideoJobStore({
+      redis: runtime.redis,
+      cipher: runtime.cipher,
+      identityHashSecret: identitySecret,
+    });
+    const videoUrl = "https://blob.vercel-storage.com/air/oversized.mp4";
+    const created = await jobs.createOrGet({
+      correlationId: deriveCorrelationId(identitySecret, projectId, "approved-fallback"),
+      senderHash: hashSenderIdentifier(identitySecret, sender),
+      prompt: "A sunset over an alien sea",
+      delivery: { chatGuid: "iMessage;-;+14155550000", phone: "+14155550001" },
+    });
+    const submission = await jobs.beginWork(created.record.immutable.recordKey);
+    if (!submission) throw new Error("expected submission intent");
+    await submission.transition({
+      expectedStates: ["submission_unknown"],
+      state: "video_ready",
+      zapRunId: "run_approved_fallback",
+      video: { url: videoUrl, mimeType: "video/mp4" },
+    });
+    await submission.release();
+
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, {
+      status: 200,
+      headers: { "content-type": "video/mp4", "content-length": String(25 * 1024 * 1024 + 1) },
+    }));
+    const adapter = new FixtureAdapter();
+
+    await drainIMessageVideoJobs({ runtime, adapter });
+
+    expect(adapter.posted).toEqual([
+      `Your video is ready, but it could not be attached. Temporary link: ${videoUrl}`,
+    ]);
+    expect(await jobs.get(created.record.immutable.recordKey)).toMatchObject({ state: "delivered" });
   });
 
   it("does not send a fallback link for an unapproved output URL", async () => {
