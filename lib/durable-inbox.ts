@@ -5,7 +5,6 @@ import {
   assertPseudonymousHash,
   COMPARE_AND_DELETE_LUA,
   COMPARE_AND_PEXPIRE_LUA,
-  encodeRedisKeyPart,
   PERSIST_INBOX_NEW_RECORD_LUA,
   WRITE_INBOX_RECORD_LUA,
   type RedisLease,
@@ -30,6 +29,8 @@ export const INBOX_STATES = Object.freeze([
   "response_ready",
   "sending",
   "sent",
+  /** A durable video job owns all remaining recovery; no inbox replay is safe. */
+  "handed_off",
   "failed_retryable",
   "send_unknown",
   "dead_letter",
@@ -50,6 +51,13 @@ export interface InboxEnvelope {
   readonly content: {
     readonly type: InboxContentType;
     readonly text: string | null;
+    /** Photon attachment references only; bytes are fetched just-in-time. */
+    readonly attachments?: readonly {
+      readonly id: string;
+      readonly name: string | null;
+      readonly mimeType: string | null;
+      readonly size: number | null;
+    }[] | undefined;
   };
   readonly isGroup: boolean;
   readonly receivedAtMs: number;
@@ -79,8 +87,6 @@ export interface VerifiedInboxInput {
 
 export interface ImmutableInboxMetadata {
   readonly recordKey: string;
-  readonly projectId: string;
-  readonly messageId: string;
   readonly correlationId: CorrelationId;
   readonly senderHash: SenderHash;
   readonly threadHash: ThreadHash;
@@ -199,14 +205,15 @@ export interface DurableInboxOptions {
   readonly rateLimitPrefix?: string | undefined;
 }
 
-const TERMINAL_STATES = new Set<InboxState>(["sent", "send_unknown", "dead_letter"]);
+const TERMINAL_STATES = new Set<InboxState>(["sent", "handed_off", "send_unknown", "dead_letter"]);
 const TRANSITIONS: Readonly<Record<InboxState, readonly InboxState[]>> = Object.freeze({
   received: ["processing", "dead_letter"],
-  processing: ["session_started", "response_ready", "failed_retryable", "dead_letter"],
+  processing: ["session_started", "response_ready", "handed_off", "failed_retryable", "dead_letter"],
   session_started: ["response_ready", "failed_retryable", "dead_letter"],
   response_ready: ["sending", "failed_retryable", "dead_letter"],
   sending: ["sent", "failed_retryable", "send_unknown", "dead_letter"],
   sent: [],
+  handed_off: [],
   failed_retryable: ["processing", "dead_letter"],
   send_unknown: [],
   dead_letter: [],
@@ -232,10 +239,13 @@ const READY_THREADS_BACKFILL_REQUIRED_ERROR = "inbox ready-thread index backfill
 const INGRESS_RECORD_LEASE_WAIT_MS = 250;
 const RECORD_LEASE_RETRY_INTERVAL_MS = 5;
 
-export function inboxRecordKey(projectId: string, messageId: string, prefix = "air:inbox:v1"): string {
-  assertProviderIdentifier(projectId, "project id");
-  assertProviderIdentifier(messageId, "message id");
-  return `${prefix}:record:${encodeRedisKeyPart(projectId)}:${encodeRedisKeyPart(messageId)}`;
+/**
+ * Redis key names are HMAC-only: provider project/message identifiers remain
+ * exclusively in the encrypted receipt envelope.
+ */
+export function inboxRecordKey(correlationId: CorrelationId | string, prefix = "air:inbox:v1"): string {
+  assertPseudonymousHash(correlationId, "inbox correlation id");
+  return `${prefix}:record:${correlationId}`;
 }
 
 export function canTransitionInboxState(from: InboxState, to: InboxState): boolean {
@@ -308,8 +318,8 @@ export class DurableInbox {
       webhookId: input.webhookId ?? input.envelope.webhookId,
       receivedAtMs: now,
     });
-    const recordKey = inboxRecordKey(input.projectId, input.messageId, this.prefix);
     const correlationId = deriveCorrelationId(this.identityHashSecret, input.projectId, input.messageId);
+    const recordKey = inboxRecordKey(correlationId, this.prefix);
     const rateLimitReservation = validateRateLimitReservation(
       input.rateLimitReservation,
       correlationId,
@@ -355,8 +365,6 @@ export class DurableInbox {
         schemaVersion: 1,
         immutable: {
           recordKey,
-          projectId: input.projectId,
-          messageId: input.messageId,
           correlationId,
           senderHash: verifiedIdentity.senderHash,
           threadHash,
@@ -862,10 +870,16 @@ export class DurableInbox {
       ) {
         return current;
       }
-      next = makeTransitionRecord(current, "failed_retryable", now, {
-        failureCategory: "worker_lease_expired",
-        nextAttemptAtMs: now,
-      });
+      // A static reply may have reached Photon immediately before this worker
+      // vanished. Its delivery outcome is unknowable, so never replay it.
+      next = current.state === "sending"
+        ? makeTransitionRecord(current, "send_unknown", now, {
+          failureCategory: "photon_static_send_unknown",
+        })
+        : makeTransitionRecord(current, "failed_retryable", now, {
+          failureCategory: "worker_lease_expired",
+          nextAttemptAtMs: now,
+        });
       await this.writeStoredRecord(next, now);
     } finally {
       await lease.release();
@@ -1229,7 +1243,7 @@ function makeTransitionRecord(
     throw new Error("processing inbox state requires an attempt hash");
   }
   const terminal = TERMINAL_STATES.has(targetState);
-  const clearPayload = targetState === "sent" || targetState === "dead_letter";
+  const clearPayload = targetState === "sent" || targetState === "handed_off" || targetState === "dead_letter";
   const processingLeaseExpiresAtMs = targetState === "processing"
     ? options.processingLeaseExpiresAtMs
     : terminal || targetState === "failed_retryable"
@@ -1348,6 +1362,28 @@ function validateVerifiedEnvelope(input: VerifiedInboxInput): void {
   if (envelope.direction !== "inbound") throw new Error("only inbound deliveries enter the durable inbox");
   if (envelope.isGroup !== input.isGroup || envelope.content.type !== input.contentType) {
     throw new Error("verified envelope metadata does not match inbox metadata");
+  }
+  if (envelope.content.text !== null && typeof envelope.content.text !== "string") {
+    throw new Error("verified envelope text is invalid");
+  }
+  const attachments = envelope.content.attachments;
+  if (attachments !== undefined) {
+    if (!Array.isArray(attachments) || attachments.length > 16) {
+      throw new Error("verified envelope attachments are invalid");
+    }
+    for (const attachment of attachments) {
+      if (
+        !attachment ||
+        typeof attachment.id !== "string" ||
+        !attachment.id ||
+        attachment.id.length > 4_096 ||
+        (attachment.name !== null && typeof attachment.name !== "string") ||
+        (attachment.mimeType !== null && typeof attachment.mimeType !== "string") ||
+        (attachment.size !== null && (!Number.isSafeInteger(attachment.size) || attachment.size < 0))
+      ) {
+        throw new Error("verified envelope attachments are invalid");
+      }
+    }
   }
 }
 

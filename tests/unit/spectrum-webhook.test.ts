@@ -173,6 +173,125 @@ describe("Spectrum webhook verifier", () => {
     expect(envelope && isEligibleInboundMessage(envelope)).toBe(true);
   });
 
+  it("retains a direct attachment's Photon GUID and bounded metadata, never bytes", () => {
+    const image = payload();
+    (image.message as { content: unknown }).content = {
+      type: "attachment",
+      id: "photon-attachment-guid-001",
+      name: "first-frame.heic",
+      mimeType: "image/heic",
+      size: 1_234_567,
+      // Cloud webhooks must never deliver these functions; this fixture also
+      // verifies the normalizer only retains the safe reference fields.
+      read: "not-a-function",
+      stream: "not-a-function",
+      sourceUrl: "https://provider.example/private-image",
+    };
+
+    const envelope = normalizeSpectrumWebhook({
+      payload: image,
+      projectId: "contract-project",
+      webhookId: "attachment-delivery-001",
+    });
+
+    expect(envelope).toMatchObject({
+      contentType: "attachment",
+      text: null,
+      attachments: [
+        {
+          id: "photon-attachment-guid-001",
+          name: "first-frame.heic",
+          mimeType: "image/heic",
+          size: 1_234_567,
+        },
+      ],
+    });
+    expect(envelope?.attachments[0]).not.toHaveProperty("read");
+    expect(envelope?.attachments[0]).not.toHaveProperty("stream");
+    expect(envelope?.attachments[0]).not.toHaveProperty("sourceUrl");
+  });
+
+  it("extracts prompt text and every attachment from compact and nested group payloads", () => {
+    const grouped = payload();
+    (grouped.message as { content: unknown }).content = {
+      type: "group",
+      items: [
+        {
+          id: "nested-text-message",
+          content: { type: "text", text: "Make this feel like a 1970s film." },
+        },
+        {
+          id: "nested-image-message",
+          content: {
+            type: "attachment",
+            // A few Photon payloads label the same attachment GUID `guid`.
+            guid: "photon-attachment-guid-002",
+            name: "reference.png",
+            mimeType: "image/png",
+            size: 456,
+          },
+        },
+        {
+          // Compact content-only group item, nested one level further.
+          type: "group",
+          items: [
+            {
+              type: "attachment",
+              id: "photon-attachment-guid-003",
+              name: "second-reference.jpg",
+              mimeType: "image/jpeg",
+              size: 789,
+            },
+          ],
+        },
+      ],
+    };
+
+    const envelope = normalizeSpectrumWebhook({
+      payload: grouped,
+      projectId: "contract-project",
+      webhookId: "attachment-group-delivery-001",
+    });
+
+    expect(envelope).toMatchObject({
+      contentType: "group",
+      text: "Make this feel like a 1970s film.",
+      attachments: [
+        {
+          id: "photon-attachment-guid-002",
+          name: "reference.png",
+          mimeType: "image/png",
+          size: 456,
+        },
+        {
+          id: "photon-attachment-guid-003",
+          name: "second-reference.jpg",
+          mimeType: "image/jpeg",
+          size: 789,
+        },
+      ],
+    });
+    // The workflow can now reject this as a multi-attachment request instead
+    // of silently losing the second attachment during normalization.
+    expect(envelope?.attachments).toHaveLength(2);
+  });
+
+  it("rejects attachment content with no usable Photon GUID", () => {
+    const malformed = payload();
+    (malformed.message as { content: unknown }).content = {
+      type: "attachment",
+      name: "missing-guid.png",
+      mimeType: "image/png",
+      size: 42,
+    };
+
+    expect(() => normalizeSpectrumWebhook({
+      payload: malformed,
+      projectId: "contract-project",
+      webhookId: "bad-attachment-delivery-001",
+    })).toThrow(WebhookInputError);
+  });
+
   it("infers an omitted Spectrum space.type from the official iMessage chat GUID", () => {
     const missingType = payload();
     delete (missingType.space as { type?: string }).type;

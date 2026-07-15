@@ -25,7 +25,7 @@ describe("rolling sender limits", () => {
     });
 
     now += 60_001;
-    await expect(limiter.consume(senderHash, correlation(6))).resolves.toMatchObject({ accepted: true });
+    await expect(limiter.consume("b".repeat(64), correlation(6))).resolves.toMatchObject({ accepted: true });
   });
 
   it("enforces the rolling 24-hour cap and treats a repeated correlation id idempotently", async () => {
@@ -37,12 +37,12 @@ describe("rolling sender limits", () => {
     expect(first).toMatchObject({ accepted: true, minuteCount: 1, dayCount: 1 });
     expect(duplicate).toMatchObject({ accepted: true, duplicate: true, minuteCount: 1, dayCount: 1 });
 
-    for (let index = 2; index <= 20; index += 1) {
+    for (let index = 2; index <= 3; index += 1) {
       now += 61_000;
       await expect(limiter.consume(senderHash, correlation(index))).resolves.toMatchObject({ accepted: true });
     }
     now += 61_000;
-    await expect(limiter.consume(senderHash, correlation(21))).resolves.toMatchObject({
+    await expect(limiter.consume(senderHash, correlation(4))).resolves.toMatchObject({
       accepted: false,
       reason: "day",
       shouldNotify: true,

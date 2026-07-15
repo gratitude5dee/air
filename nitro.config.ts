@@ -8,7 +8,7 @@ import { defineNitroConfig } from "nitro/config";
 export default defineNitroConfig({
   // Eve registers its framework home page after Nitro has loaded this project
   // config. Nitro preserves the first static method match, so this supported
-  // application handler keeps GET / branded as AR Agent rather than exposing
+  // application handler keeps GET / branded as Air rather than exposing
   // Eve's package-name-derived landing page.
   handlers: [
     {

@@ -4,25 +4,20 @@ import { parseAllowedSenderHashes, type SenderHash } from "./security.js";
 export type EnvironmentSource = Readonly<Record<string, string | undefined>>;
 export type DeploymentMode = "development" | "preview" | "production";
 
+/** Runtime configuration for the private iMessage → Zap video service. */
 export interface AirEnvironment {
   readonly mode: DeploymentMode;
   readonly imessageProjectId?: string | undefined;
   readonly imessageProjectSecret?: string | undefined;
   readonly imessageWebhookSecret?: string | undefined;
   readonly redisUrl?: string | undefined;
-  readonly mongoUri?: string | undefined;
-  readonly mongoDatabase: string;
-  readonly voyageApiKey?: string | undefined;
-  readonly embedModel: string;
-  readonly rerankModel: string;
-  readonly generationModel: string;
+  readonly zapAirServiceUrl?: string | undefined;
+  readonly zapAirServiceToken?: string | undefined;
   readonly idHashSecret?: string | undefined;
   readonly queueEncryptionKey?: string | undefined;
   readonly allowedSenderHashes: readonly SenderHash[];
   readonly cronSecret?: string | undefined;
   readonly publicBaseUrl: string;
-  readonly mongoServerSelectionTimeoutMs: number;
-  readonly mongoConnectTimeoutMs: number;
 }
 
 export const PRODUCTION_REQUIRED_ENV = Object.freeze([
@@ -30,14 +25,8 @@ export const PRODUCTION_REQUIRED_ENV = Object.freeze([
   "IMESSAGE_PROJECT_SECRET",
   "IMESSAGE_WEBHOOK_SECRET",
   "REDIS_URL",
-  "MONGODB_URI",
-  "MONGODB_DB",
-  "MONGODB_SERVER_SELECTION_TIMEOUT_MS",
-  "MONGODB_CONNECT_TIMEOUT_MS",
-  "VOYAGE_API_KEY",
-  "EMBED_MODEL",
-  "RERANK_MODEL",
-  "GENERATION_MODEL",
+  "ZAP_AIR_SERVICE_URL",
+  "ZAP_AIR_SERVICE_TOKEN",
   "AIR_ID_HASH_SECRET",
   "AIR_QUEUE_ENCRYPTION_KEY",
   "AIR_ALLOWED_SENDER_HASHES",
@@ -45,7 +34,7 @@ export const PRODUCTION_REQUIRED_ENV = Object.freeze([
   "CRON_SECRET",
 ] as const);
 
-/** Returns missing variable names only; never include secret values in an error or log. */
+/** Returns names only; no secret values ever leave this module. */
 export function missingRequiredEnvironment(
   source: EnvironmentSource,
   names: readonly string[] = PRODUCTION_REQUIRED_ENV,
@@ -53,11 +42,6 @@ export function missingRequiredEnvironment(
   return names.filter((name) => !source[name]?.trim());
 }
 
-/**
- * Parse configuration without doing I/O. Production is intentionally strict:
- * there is no permissive startup when the allowlist, queue key, Redis, or
- * transport-verification secrets are absent.
- */
 export function loadAirEnvironment(
   source: EnvironmentSource = process.env,
   options: { mode?: DeploymentMode } = {},
@@ -68,9 +52,6 @@ export function loadAirEnvironment(
     if (missing.length > 0) {
       throw new Error(`missing required production environment: ${missing.join(", ")}`);
     }
-    if (optional(source.AI_GATEWAY_API_KEY)) {
-      throw new Error("AI_GATEWAY_API_KEY is not allowed in production; use Vercel OIDC");
-    }
   }
 
   const queueEncryptionKey = optional(source.AIR_QUEUE_ENCRYPTION_KEY);
@@ -80,55 +61,61 @@ export function loadAirEnvironment(
     throw new Error("AIR_ALLOWED_SENDER_HASHES must contain at least one approved sender hash");
   }
 
+  const zapAirServiceUrl = optional(source.ZAP_AIR_SERVICE_URL);
+  const zapAirServiceToken = optional(source.ZAP_AIR_SERVICE_TOKEN);
+  if (zapAirServiceUrl) validateZapAirServiceUrl(zapAirServiceUrl);
+  if (zapAirServiceToken && (zapAirServiceToken.length > 4_096 || /[\r\n]/.test(zapAirServiceToken))) {
+    throw new Error("ZAP_AIR_SERVICE_TOKEN is invalid");
+  }
+
   return Object.freeze({
     mode,
     imessageProjectId: optional(source.IMESSAGE_PROJECT_ID),
     imessageProjectSecret: optional(source.IMESSAGE_PROJECT_SECRET),
     imessageWebhookSecret: optional(source.IMESSAGE_WEBHOOK_SECRET),
     redisUrl: optional(source.REDIS_URL),
-    mongoUri: optional(source.MONGODB_URI),
-    mongoDatabase: optional(source.MONGODB_DB) ?? "music_rag",
-    voyageApiKey: optional(source.VOYAGE_API_KEY),
-    embedModel: optional(source.EMBED_MODEL) ?? "voyage-4-large",
-    rerankModel: optional(source.RERANK_MODEL) ?? "rerank-2.5",
-    generationModel: optional(source.GENERATION_MODEL) ?? "google/gemini-3.5-flash",
+    zapAirServiceUrl,
+    zapAirServiceToken,
     idHashSecret: optional(source.AIR_ID_HASH_SECRET),
     queueEncryptionKey,
     allowedSenderHashes,
     cronSecret: optional(source.CRON_SECRET),
     publicBaseUrl: optional(source.AIR_PUBLIC_BASE_URL) ?? "https://air.wzrd.tech",
-    mongoServerSelectionTimeoutMs: parsePositiveInteger(
-      source.MONGODB_SERVER_SELECTION_TIMEOUT_MS,
-      8_000,
-      "MONGODB_SERVER_SELECTION_TIMEOUT_MS",
-    ),
-    mongoConnectTimeoutMs: parsePositiveInteger(
-      source.MONGODB_CONNECT_TIMEOUT_MS,
-      8_000,
-      "MONGODB_CONNECT_TIMEOUT_MS",
-    ),
   });
 }
 
+/** Allows loopback HTTP only for local test fixtures. */
+function validateZapAirServiceUrl(value: string): void {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("ZAP_AIR_SERVICE_URL is invalid");
+  }
+  const loopback = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname.toLowerCase());
+  if (
+    (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) ||
+    !url.hostname ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    (url.pathname !== "/" && url.pathname !== "")
+  ) {
+    throw new Error("ZAP_AIR_SERVICE_URL is invalid");
+  }
+}
+
 export function inferDeploymentMode(source: EnvironmentSource): DeploymentMode;
-/** Backward-compatible NODE_ENV-only form for callers outside the runtime. */
 export function inferDeploymentMode(nodeEnvironment: string | undefined): DeploymentMode;
 export function inferDeploymentMode(sourceOrNodeEnvironment: EnvironmentSource | string | undefined): DeploymentMode {
   const source = typeof sourceOrNodeEnvironment === "object" && sourceOrNodeEnvironment !== null
     ? sourceOrNodeEnvironment
     : undefined;
-  const vercelEnvironment = source
-    ? optional(source.VERCEL_ENV)
-    : undefined;
-  // Vercel sets NODE_ENV=production for previews too. Its deployment mode is
-  // therefore the authoritative signal: a production deployment must never
-  // silently use development defaults because NODE_ENV is absent or unusual.
+  const vercelEnvironment = source ? optional(source.VERCEL_ENV) : undefined;
   if (vercelEnvironment === "production") return "production";
   if (vercelEnvironment === "preview") return "preview";
-
-  const nodeEnvironment = source
-    ? optional(source.NODE_ENV)
-    : sourceOrNodeEnvironment;
+  const nodeEnvironment = source ? optional(source.NODE_ENV) : sourceOrNodeEnvironment;
   if (nodeEnvironment === "production") return "production";
   if (nodeEnvironment === "preview") return "preview";
   return "development";
@@ -137,17 +124,4 @@ export function inferDeploymentMode(sourceOrNodeEnvironment: EnvironmentSource |
 function optional(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed || undefined;
-}
-
-function parsePositiveInteger(
-  value: string | undefined,
-  fallback: number,
-  name: string,
-): number {
-  if (!value?.trim()) return fallback;
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1) {
-    throw new Error(`${name} must be a positive integer`);
-  }
-  return parsed;
 }

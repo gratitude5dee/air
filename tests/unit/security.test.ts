@@ -1,12 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { loadAirEnvironment } from "../../lib/env.js";
-import { redactLogFields } from "../../lib/logging.js";
 import {
   createSenderIdentity,
   hashSenderIdentifier,
   isSenderAllowed,
   parseAllowedSenderHashes,
-  validateAllowedSourceDeepLink,
 } from "../../lib/security.js";
 
 const secret = "unit-test-identity-secret";
@@ -20,14 +18,8 @@ function productionEnvironment(
     IMESSAGE_PROJECT_SECRET: "project-secret",
     IMESSAGE_WEBHOOK_SECRET: "webhook-secret",
     REDIS_URL: "rediss://example.invalid:6379",
-    MONGODB_URI: "mongodb+srv://readonly@example.invalid/music_rag",
-    MONGODB_DB: "music_rag",
-    MONGODB_SERVER_SELECTION_TIMEOUT_MS: "8000",
-    MONGODB_CONNECT_TIMEOUT_MS: "8000",
-    VOYAGE_API_KEY: "voyage-key",
-    EMBED_MODEL: "voyage-4-large",
-    RERANK_MODEL: "rerank-2.5",
-    GENERATION_MODEL: "google/gemini-3.5-flash",
+    ZAP_AIR_SERVICE_URL: "https://zap.wzrd.tech",
+    ZAP_AIR_SERVICE_TOKEN: "zap-air-service-token",
     AIR_ID_HASH_SECRET: secret,
     AIR_QUEUE_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64"),
     AIR_ALLOWED_SENDER_HASHES: senderHash,
@@ -37,7 +29,7 @@ function productionEnvironment(
   };
 }
 
-describe("sender privacy", () => {
+describe("sender privacy and Air video environment", () => {
   it("normalizes before HMAC hashing and never returns the raw identifier", () => {
     const formatted = hashSenderIdentifier(secret, "+1 (415) 555-1234");
     const canonical = hashSenderIdentifier(secret, "+14155551234");
@@ -50,7 +42,7 @@ describe("sender privacy", () => {
     expect(email.senderHash).not.toContain("artist");
   });
 
-  it("fails closed for empty/invalid allowlists and compares valid hashes", () => {
+  it("fails closed for empty or malformed allowlists", () => {
     const sender = hashSenderIdentifier(secret, "+14155551234");
     expect(isSenderAllowed(sender, [])).toBe(false);
     expect(isSenderAllowed(sender, [sender])).toBe(true);
@@ -59,46 +51,9 @@ describe("sender privacy", () => {
     expect(parseAllowedSenderHashes(`${sender}, ${sender}`)).toEqual([sender]);
   });
 
-  it("allows only approved HTTPS source hosts and removes sensitive log fields", () => {
-    expect(validateAllowedSourceDeepLink("https://www.youtube.com/watch?v=abc")).not.toBeNull();
-    expect(validateAllowedSourceDeepLink("https://youtube.com/watch?v=abc123&t=1m30s"))
-      .toBe("https://www.youtube.com/watch?v=abc123&t=90");
-    expect(validateAllowedSourceDeepLink("https://youtu.be/abc123?start=90"))
-      .toBe("https://youtu.be/abc123?t=90");
-    expect(validateAllowedSourceDeepLink("http://youtube.com/watch?v=abc")).toBeNull();
-    expect(validateAllowedSourceDeepLink("https://evil.example/youtube.com")).toBeNull();
-    expect(validateAllowedSourceDeepLink("https://evil.example@youtube.com/watch?v=abc")).toBeNull();
-    expect(validateAllowedSourceDeepLink("https://youtube.com/redirect?q=https%3A%2F%2Fevil.example"))
-      .toBeNull();
-    expect(validateAllowedSourceDeepLink("https://www.youtube.com/watch?v=abc123&q=https%3A%2F%2Fevil.example"))
-      .toBeNull();
-    expect(validateAllowedSourceDeepLink("https://youtu.be/redirect?q=https%3A%2F%2Fevil.example"))
-      .toBeNull();
-    expect(validateAllowedSourceDeepLink("https://youtu.be/abc123?si=tracking-token")).toBeNull();
-    expect(validateAllowedSourceDeepLink(`https://youtu.be/abc123?start=${"9".repeat(1_000)}`))
-      .toBeNull();
-
-    const fields = redactLogFields({
-      sender: "+14155551234",
-      senderId: "+14155551234",
-      messageId: "provider-message-123",
-      webhookId: "provider-webhook-123",
-      threadId: "imessage-thread-123",
-      text: "private question",
-      signature: "secret-signature",
-      senderHash: "a".repeat(64),
-      sourceCount: 2,
-      errorCategory: "timeout",
-    });
-    expect(fields).toEqual({
-      senderHash: "a".repeat(64),
-      sourceCount: 2,
-      errorCategory: "timeout",
-    });
-  });
-
-  it("fails closed in production until every critical secret and an approved hash exist", () => {
-    expect(() => loadAirEnvironment({}, { mode: "production" })).toThrow(/missing required production environment/);
+  it("fails closed in production until every private video-service value exists", () => {
+    expect(() => loadAirEnvironment({}, { mode: "production" }))
+      .toThrow(/missing required production environment/);
     const senderHash = hashSenderIdentifier(secret, "+14155551234");
     const loaded = loadAirEnvironment(productionEnvironment(), { mode: "production" });
 
@@ -106,15 +61,13 @@ describe("sender privacy", () => {
     expect(loaded.mode).toBe("production");
   });
 
-  it("rejects AI Gateway API-key authentication in production", () => {
+  it("validates the private Zap origin and bearer-token shape", () => {
     expect(() => loadAirEnvironment(productionEnvironment({
-      AI_GATEWAY_API_KEY: "development-only-key",
-    }), { mode: "production" })).toThrow(/AI_GATEWAY_API_KEY is not allowed in production/);
-
-    expect(loadAirEnvironment({
-      NODE_ENV: "development",
-      AI_GATEWAY_API_KEY: "development-only-key",
-    }).mode).toBe("development");
+      ZAP_AIR_SERVICE_URL: "http://zap.wzrd.tech",
+    }), { mode: "production" })).toThrow(/ZAP_AIR_SERVICE_URL is invalid/);
+    expect(() => loadAirEnvironment(productionEnvironment({
+      ZAP_AIR_SERVICE_TOKEN: "valid-prefix\ninvalid-suffix",
+    }), { mode: "production" })).toThrow(/ZAP_AIR_SERVICE_TOKEN is invalid/);
   });
 
   it("treats Vercel production as production even without a normal NODE_ENV", () => {

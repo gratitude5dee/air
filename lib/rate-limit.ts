@@ -4,7 +4,7 @@ import type { SenderHash } from "./security.js";
 
 export const DEFAULT_RATE_LIMIT_POLICY = Object.freeze({
   perMinute: 3,
-  perRollingDay: 20,
+  perRollingDay: 3,
   minuteWindowMs: 60_000,
   dayWindowMs: 86_400_000,
 });

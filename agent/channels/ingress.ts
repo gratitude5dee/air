@@ -1,36 +1,39 @@
 import { GET, POST, defineChannel } from "eve/channels";
-import imessageChannel, {
+import {
   assertIMessageRuntimeConfiguration,
   imessageAdapter,
-} from "./imessage.js";
+} from "../../lib/imessage-adapter.js";
 import {
-  drainFromOperatorRoute,
-  handleIMessageWebhook,
-  healthResponse,
-} from "../../lib/imessage-channel-runtime.js";
+  authorizeIMessageVideoDrain,
+  drainIMessageVideoJobs,
+  handleIMessageVideoWebhook,
+} from "../../lib/imessage-video-runtime.js";
+import { healthResponse } from "../../lib/imessage-channel-runtime.js";
 
 /**
- * Air's sole public inbound dispatcher. The Chat SDK adapter route is mounted
- * elsewhere but intentionally has no bot handlers; Photon must point only at
- * `/webhooks/imessage` so a signed delivery is durable before acknowledgement.
+ * Air's sole public inbound dispatcher. No Chat SDK adapter webhook route is
+ * mounted; Photon must point only at `/webhooks/imessage` so a signed delivery
+ * is durable before acknowledgement.
  */
 export default defineChannel({
   routes: [
     GET("/healthz", async () => healthResponse()),
     POST("/webhooks/imessage", async (request, args) => {
       assertIMessageRuntimeConfiguration();
-      return handleIMessageWebhook(request, {
+      return handleIMessageVideoWebhook(request, {
         adapter: imessageAdapter,
-        receive: (input) => args.receive(imessageChannel, input),
         waitUntil: args.waitUntil,
       });
     }),
     POST("/internal/drain-inbox", async (request, args) => {
       assertIMessageRuntimeConfiguration();
-      return drainFromOperatorRoute(request, {
+      const authorized = await authorizeIMessageVideoDrain(request);
+      if (authorized instanceof Response) return authorized;
+      args.waitUntil(drainIMessageVideoJobs({
         adapter: imessageAdapter,
-        receive: (input) => args.receive(imessageChannel, input),
-      });
+        runtime: authorized.runtime,
+      }));
+      return new Response(null, { status: 202 });
     }),
   ],
 });

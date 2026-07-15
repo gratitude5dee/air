@@ -3,7 +3,6 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const summaryPath = resolve(".eve/agent-summary.json");
-const adapterInternalPath = "/_internal/chat-sdk/imessage";
 const drainCron = "* * * * *";
 
 /**
@@ -12,11 +11,6 @@ const drainCron = "* * * * *";
  * callback), but it must not gain another Air HTTP dispatch path.
  */
 const expectedChannels = [
-  // The official adapter receiver remains at this intentionally unregistered
-  // path. Photon is configured only for Air's durable ingress; without bridge
-  // dispatch handlers, a signed delivery here cannot start an Eve session.
-  { name: "imessage", method: "GET", urlPath: adapterInternalPath },
-  { name: "imessage", method: "POST", urlPath: adapterInternalPath },
   { name: "ingress", method: "GET", urlPath: "/healthz" },
   { name: "ingress", method: "POST", urlPath: "/webhooks/imessage" },
   { name: "ingress", method: "POST", urlPath: "/internal/drain-inbox" },
@@ -147,10 +141,10 @@ async function verifyVercelPublicStatusRoute() {
   const body = await response.json();
   if (
     !body ||
-    body.name !== "AR Agent" ||
-    body.status !== "transcript-grounded iMessage research"
+    body.name !== "Air" ||
+    body.status !== "allowlisted iMessage Seedance video generation"
   ) {
-    throw new Error("public GET / route is not branded as AR Agent");
+    throw new Error("public GET / route is not branded as Air");
   }
 }
 
@@ -186,8 +180,8 @@ async function main() {
   const tools = requiredArray(summary, "tools");
 
   const toolNames = tools.map((tool) => tool?.name).filter((name) => typeof name === "string");
-  if (toolNames.length !== 1 || toolNames[0] !== "answer_music_question") {
-    throw new Error("compiled Eve tool surface is not limited to answer_music_question");
+  if (toolNames.length !== 0) {
+    throw new Error("compiled Eve build must not expose model tools");
   }
 
   verifyNoDeclarations(summary, "skills");

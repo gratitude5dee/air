@@ -1,161 +1,102 @@
-# AR Agent (`air`)
+# Air
 
-AR Agent is a small, allowlisted iMessage research assistant for A&R and the
-music industry. It answers only from the existing read-only `music_rag`
-transcript corpus, validates every factual answer's citations, and sends an
-iMessage response only after its encrypted durable queue records it.
+Air is a private, allowlisted iMessage video generator. A user sends a text
+prompt and may attach one image; Air submits a fixed Seedance Fast request
+through Zap and returns the resulting MP4 in the same iMessage thread.
 
-## What is deliberately in scope
+Air no longer uses MongoDB, Atlas, Voyage, retrieval, citations, or an AI
+Gateway generation path. Zap owns GMI credentials, provider polling, spend
+limits, and short-lived video storage.
 
-- iMessage direct messages through Photon’s official Chat SDK adapter.
-- Photon/Spectrum signed webhooks at `POST /webhooks/imessage`.
-- Eve with Redis-backed Chat SDK state and one callable tool:
-  `answer_music_question`.
-- Hybrid MongoDB Atlas retrieval, Voyage embedding/reranking, and Vercel AI
-  Gateway generation using `google/gemini-3.5-flash` at temperature `0.2`.
-- Encrypted Redis inbox/outbox, idempotency, per-thread serialization,
-  allowlisting, and rate limiting.
+## Request contract
 
-The V1 deliberately has no web chat, gateway polling, group-chat RAG,
-attachments, outbound campaigns, database writes, Box, or Zap integration.
+- Direct messages from an allowlisted sender only.
+- Text prompt: 1–2,000 characters.
+- Optional single JPEG, PNG, HEIC, or HEIF attachment, at most 10 MB.
+- HEIC/HEIF is converted to JPEG before upload.
+- One active generation per sender; max three accepted requests per rolling
+  24 hours.
+- The fixed Zap request is Seedance `seedance-2-0-fast-260128`, five seconds,
+  720p, adaptive ratio, generated audio, no watermark or web search.
+
+Unsupported input is rejected before a paid request. Air never stores media
+bytes in Redis. Prompts, attachment references, Zap IDs, and signed URLs are
+encrypted at rest and are never written to application logs or Redis metadata.
+Do not set an `OTEL_EXPORTER_OTLP_*` environment variable for Air: Spectrum
+telemetry requires a dedicated redacting pipeline before it can be exported.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-  U["iMessage user"] --> P["Photon / Spectrum Cloud"]
-  P --> W["POST /webhooks/imessage"]
-  W --> Q["Encrypted Redis inbox"]
-  Q --> E["Eve + Chat SDK channel"]
-  E --> T["answer_music_question"]
-  T --> M["Read-only MongoDB MusicRAG"]
-  T --> V["Voyage embedding + rerank"]
-  T --> G["Vercel AI Gateway"]
-  E --> P
-  D["Eve cron: every minute"] --> Q
+  U["Allowlisted iMessage user"] --> P["Photon / Spectrum Cloud"]
+  P --> W["Signed webhook"]
+  W --> R["Encrypted Upstash Redis"]
+  R --> A["Air worker"]
+  A --> Z["Private Zap service"]
+  Z --> G["GMI Seedance Fast"]
+  G --> B["Vercel Blob, 24 h"]
+  B --> A
+  A --> P
 ```
 
-The public webhook reads the raw request bytes once, limits the body to 64 KiB,
-validates the Photon HMAC, normalizes only required fields, encrypts the
-envelope, and persists it before returning success. The official adapter is
-used for thread IDs and outbound delivery. Its generated receiver remains
-pinned at the intentionally unregistered `/_internal/chat-sdk/imessage` path,
-where the official adapter verifies HMAC but Air has no dispatching bot
-handlers, so a delivery cannot start an Eve session. Photon must be configured
-only for `/webhooks/imessage`, which is Air's sole intended dispatch path.
+The webhook verifies the raw Photon signature and persists an encrypted,
+idempotent inbox record before it returns `200`. A post-ack worker and a
+minute recovery cron share the same ordered queue. Paid submission is first
+recorded as `submission_unknown`; an ambiguous provider result is never
+automatically resubmitted. A durable `sending` intent and an ambiguous
+iMessage delivery are operator-visible and never blindly sent again. Once a
+video job is durable, the inbox reaches terminal `handed_off` and cannot replay
+the request.
 
-## Local setup
+## Air environment
 
-Use Node 24 and npm. Copy placeholders only; do not use production Photon
-credentials locally or in a preview environment.
+Set these in Vercel Production only (names, never values, are listed here):
 
-```sh
-cp .env.example .env
-npm ci
-npm run check
-npm run build
-```
+- `IMESSAGE_PROJECT_ID`, `IMESSAGE_PROJECT_SECRET`,
+  `IMESSAGE_WEBHOOK_SECRET`
+- `REDIS_URL`
+- `ZAP_AIR_SERVICE_URL`, `ZAP_AIR_SERVICE_TOKEN`
+- `AIR_ID_HASH_SECRET`, `AIR_QUEUE_ENCRYPTION_KEY`,
+  `AIR_ALLOWED_SENDER_HASHES`
+- `AIR_PUBLIC_BASE_URL`, `CRON_SECRET`
 
-Required production configuration is documented in `.env.example`. The process
-fails closed when the production iMessage credentials, Redis URL, encryption
-key, sender-hash secret, allowlist, or cron secret is missing. `AIR_ALLOWED_SENDER_HASHES`
-contains HMAC hashes, never phone numbers or email handles.
+Use [`.env.example`](.env.example) for local placeholders. Air fails closed in
+production unless every required value and at least one sender hash exist.
+Generate an allowlist value locally with `hashSenderIdentifier` and store only
+the resulting lowercase 64-character HMAC digest.
 
-To produce an allowlist entry without printing the original handle, run a
-short, local one-off script in a trusted shell that calls
-`hashSenderIdentifier(AIR_ID_HASH_SECRET, handle)`; store only the resulting
-lowercase 64-character digest in Vercel Production.
+Zap Production additionally requires its existing Redis/Convex runtime plus:
 
-## Webhook setup
+- `GMI_API_KEY`, `GMI_SEEDANCE_FAST_USD_PER_SECOND`
+- `BLOB_READ_WRITE_TOKEN`
+- `ZAP_AIR_SERVICE_TOKEN`, `ZAP_AIR_IDEMPOTENCY_HMAC_SECRET`,
+  `ZAP_AIR_UPLOAD_TICKET_ENCRYPTION_KEY`
+- `ZAP_AIR_DAILY_CAP_USD`, `ZAP_AIR_MAX_RUN_USD`
 
-Configure Photon/Spectrum Cloud to deliver signed `messages` events to:
+Zap refuses generation until it has a verified current Seedance Fast rate and
+both cost caps. Air never receives the GMI API key.
+
+## Routes
+
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/` | `GET` | Minimal public Air status. |
+| `/healthz` | `GET` | Static health response; no dependency or secret details. |
+| `/webhooks/imessage` | `POST` | Photon/Spectrum signed ingress. |
+| `/internal/drain-inbox` | `POST` | `CRON_SECRET`-bearer protected recovery trigger. |
+
+The Photon webhook must point only at:
 
 ```text
 https://air.wzrd.tech/webhooks/imessage
 ```
 
-Set the per-webhook signing secret as `IMESSAGE_WEBHOOK_SECRET`. Air accepts
-the adapter-compatible signature format: header `X-Spectrum-Signature` is
-`v0=<hex>` over `v0:{X-Spectrum-Timestamp}:{raw body}`. Replays share the
-same durable record by Photon project ID plus message ID; the webhook delivery
-ID remains redacted metadata.
+Do not configure that webhook until Zap and Air have a ready production
+deployment and the signed fixture has passed. Air uses the Spectrum Cloud
+webhook format; it is not compatible with the Photon Advanced Wire endpoint.
 
-Never configure the Chat SDK adapter route in Photon. The bridge is retained
-for Redis-backed state and Photon-backed thread posts; Eve workflow state holds
-only an opaque delivery-target HMAC, while the physical thread remains in an
-encrypted Redis target until a post is made. Its generated
-`GET`/`POST /_internal/chat-sdk/imessage` receiver is a framework-required,
-intentionally unregistered HMAC-verification boundary, not an alternate
-ingress. The build verification permits exactly that internal route pair and
-rejects any additional application dispatch path.
-
-## Behavior and privacy
-
-- Only inbound text DMs up to 2,000 characters can begin research.
-- Groups receive at most one DM-only notice per thread per seven days; they
-  never start retrieval or generation.
-- Non-allowlisted senders receive at most one access notice per seven days.
-- Allowed senders are limited to 3 questions/minute and 20/rolling day.
-- Sender IDs and thread IDs are HMAC pseudonyms in application Redis keys and
-  logs. Message text, transcript snippets, credentials, signatures, and raw
-  payloads are never logged.
-- Eve workflow titles are fixed and its channel metadata/state contains only
-  opaque HMACs; a physical iMessage thread is resolved from encrypted Redis
-  only during an outbound Chat SDK post.
-- The model cannot use shell, file, browser, web-search, or database-write
-  tools. All Eve built-ins are explicitly disabled.
-
-The RAG pipeline retrieves up to 80 hybrid candidates (`vector_index` plus
-`text_index`), reranks with `rerank-2.5`, keeps eight ranked chunks, expands
-neighbors within an approximately 8,000-token budget, diversifies episodes,
-and exposes at most ten sources to citation selection. It rejects URLs in the
-model answer, unsupported/unknown markers, uncited factual claims, and more
-than four cited sources. Source links are rendered programmatically and only
-for HTTPS `youtube.com`, `www.youtube.com`, or `youtu.be` URLs.
-
-## Operator routes
-
-| Route | Method | Purpose |
-| --- | --- | --- |
-| `/` | `GET` | Minimal public AR Agent status. |
-| `/healthz` | `GET` | `{ ok, version }` only; no upstream or secret details. |
-| `/webhooks/imessage` | `POST` | Signed, durable iMessage ingress. |
-| `/internal/drain-inbox` | `POST` | `CRON_SECRET`-protected recovery drain; returns no queue contents. |
-
-The Eve schedule runs once per minute as recovery only. It is not a Photon
-gateway or polling transport.
-
-## Send-unknown operator report
-
-For an ambiguous Photon delivery, inspect the bounded metadata-only report
-before making any manual resend decision:
-
-```sh
-npm run --silent ops:send-unknown -- --limit 100
-```
-
-Run it only in a trusted operator shell with `REDIS_URL` already configured.
-It prints JSON Lines containing exactly `correlationId`, `age` (milliseconds
-since the record became `send_unknown`), `attempt`, and `errorCategory`; it
-never reads or decrypts the encrypted response payload. The limit defaults to
-100 and is capped at 500. The report is read-only and does not retry or send
-anything.
-
-## Atlas preflight
-
-Air's MongoDB user must be read-only on `music_rag` and limited to the existing
-`chunks`, `episodes`, `entities`, and `channels` collections. Before production
-deployment, verify:
-
-1. `vector_index` targets `embedding` with 1,024 dimensions.
-2. `text_index` covers `text`, `title`, `guests`, and `topics`.
-3. Required source metadata exists and returned deep links validate.
-4. The Air user cannot insert, update, delete, create indexes, or administer
-   the cluster.
-5. Atlas network access is limited to an approved Vercel static-egress or
-   Secure Compute path—never `0.0.0.0/0`.
-
-## Verification
+## Local checks
 
 ```sh
 npm ci
@@ -164,67 +105,28 @@ npm test
 npm run build
 ```
 
-`npm run build` runs a manifest regression check: `answer_music_question` must
-be the only callable tool, the adapter receiver must remain pinned to its
-unregistered internal route, and no alternate Chat SDK iMessage webhook can be
-emitted. Test a signed fixture,
-duplicate delivery, invalid signature, interrupted post-ack drain, group
-notice, allowlist rejection, rate limit, known-corpus answer, and missing
-evidence before any production webhook is enabled.
+`npm run build` verifies that the compiled Eve app exposes only Air's three
+HTTP routes, its one recovery schedule, and no model tools. Eve is retained
+only as the route/cron host; Air does not start an Eve model session.
 
-### MusicRAG golden retrieval gate
+## Deployment sequence
 
-Air owns the supplied 40-question MusicRAG fixture in
-[`eval/musicrag-golden.jsonl`](eval/musicrag-golden.jsonl). Its pure metric
-harness is covered by normal unit tests; it does not need MongoDB, Voyage, or
-generation credentials. The credential-gated live retrieval run is separate:
+1. Push the Air and Zap branches to their GitHub repositories.
+2. Deploy Zap preview with fixture-only values; verify private upload, run,
+   poll, Blob, and cleanup behavior.
+3. Set Zap Production values, deploy it, and verify `zap.wzrd.tech`.
+4. Set Air Production values, deploy it, attach `air.wzrd.tech`, and verify
+   `/healthz` plus a signed webhook fixture.
+5. Add the Photon/Spectrum webhook last, then run the allowlisted real-device
+   text-to-video and image-to-video acceptance tests.
+
+For an uncertain delivery, run the read-only metadata report in a trusted
+operator shell:
 
 ```sh
-# Trusted operator shell only: read-only Atlas + Voyage credentials required.
-npm run eval:golden
+npm run --silent ops:send-unknown -- --limit 100
 ```
 
-It runs the actual Air retrieval path sequentially against the existing corpus,
-prints only the aggregate Recall@10, MRR@10, and nDCG@10 summary, and fails if
-the three-decimal recorded MusicRAG agent baseline is not met. It does not
-generate answers, send messages, write Atlas data, or claim a result until the
-command is executed. See [`eval/README.md`](eval/README.md) for fixture
-provenance and credential requirements.
-
-## Deployment and rollback
-
-1. Create the private `gratitude5dee/air` repository and push only this app.
-2. Create Vercel project `air` in the 5-Dee Studios team; pin Node 24.
-3. Deploy preview using fixture credentials and a separate read-only Atlas
-   identity. Do not put production Photon credentials in preview.
-4. Set Production secrets, confirm Vercel is `READY`, then attach
-   `air.wzrd.tech` and configure the Photon webhook.
-5. Run one allowlisted real-device canary before opening the beta.
-
-Rollback: disable the Photon webhook, allow started sessions to settle,
-preserve only redacted delivery metadata, promote the previous READY Vercel
-deployment with compatible secrets, re-enable the webhook, then run the
-allowlisted canary. Never automatically replay a `send_unknown` record;
-inspect its correlation ID, age, attempt, and error category before deciding
-whether to resend.
-
-## Monitoring and alert handoff
-
-Before enabling the production Photon webhook, configure a Vercel log drain or
-observability alert destination owned by the 5-Dee Studios team. Alert on
-`imessage.dead_letter`, `imessage.response_send_unknown`, sustained
-`imessage.webhook_rejected`, `imessage.webhook_unavailable`, inbox age over two
-minutes, and Atlas, Voyage, or AI Gateway failures. Include only the redacted
-correlation ID, queue age, retry count, and error class in alert payloads.
-
-Exercise that path with a synthetic non-PII failure during rollout, record the
-receiving on-call destination, and verify that no raw sender identifier or
-message content appears in Vercel logs or alerts.
-
-## Secret rotation
-
-Rotate Photon project/webhook credentials, the Atlas read-only user, Redis URL,
-Voyage key, queue-encryption key, identity-hash secret, and cron secret through
-Vercel Production. Use an overlap window whenever the upstream supports it;
-otherwise disable the Photon webhook first, rotate, deploy, verify signed
-fixtures, and re-enable it.
+It reports `submission_unknown`, `sending`, and `send_unknown` records. They
+must be investigated manually; the report does not decrypt payloads, retry, or
+send messages.

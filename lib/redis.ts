@@ -378,7 +378,7 @@ end
 -- For an eligible substantive DM, the receipt's quota decision is made in
 -- this same atomic publication as the encrypted inbox record. The resulting
 -- correlation decision is what a recovered worker reads later; it must never
--- consume quota after waiting behind an earlier same-thread RAG turn.
+-- consume quota after waiting behind an earlier same-thread video job.
 if ARGV[10] == "1" then
   if #KEYS ~= 13 then
     return redis.error_reply("missing inbox rate reservation keys")
@@ -906,6 +906,12 @@ export class MemoryRedis implements RedisLike {
       });
       return 1;
     }
+    if (script.includes("AIR_PERSIST_VIDEO_JOB_V1")) {
+      return this.evalPersistVideoJob(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_WRITE_VIDEO_JOB_V1")) {
+      return this.evalWriteVideoJob(options.keys, options.arguments);
+    }
     if (script.includes("AIR_PERSIST_INBOX_NEW_RECORD_V1")) {
       return this.evalPersistInboxNewRecord(options.keys, options.arguments);
     }
@@ -922,6 +928,220 @@ export class MemoryRedis implements RedisLike {
       return this.evalRateLimit(options.keys, options.arguments);
     }
     throw new Error("MemoryRedis does not implement this Lua script");
+  }
+
+  /** Mirrors the narrow atomic create primitive used by Air's Zap video jobs. */
+  private evalPersistVideoJob(
+    keys: readonly string[],
+    args: readonly string[],
+  ): number {
+    const metadataKey = keys[0];
+    const payloadKey = keys[1];
+    const dueKey = keys[2];
+    const activeSenderKey = keys[3];
+    const metadata = args[0];
+    const metadataTtlValue = args[1];
+    const payload = args[2];
+    const payloadTtlValue = args[3];
+    const dueScoreValue = args[4];
+    const recordKey = args[5];
+    const activeTtlValue = args[6];
+    if (
+      keys.length !== 4 ||
+      args.length !== 7 ||
+      !metadataKey ||
+      !payloadKey ||
+      !dueKey ||
+      !activeSenderKey ||
+      !metadata ||
+      !payload ||
+      metadataTtlValue === undefined ||
+      payloadTtlValue === undefined ||
+      dueScoreValue === undefined ||
+      !recordKey ||
+      activeTtlValue === undefined
+    ) {
+      throw new Error("invalid video job publish script arguments");
+    }
+    this.assertStringOrMissing(metadataKey);
+    this.assertStringOrMissing(payloadKey);
+    this.assertZSetOrMissing(dueKey);
+    this.assertStringOrMissing(activeSenderKey);
+    if (this.getEntry(metadataKey)) return 0;
+    if (this.getEntry(payloadKey)) return -1;
+    if (this.getEntry(activeSenderKey)) return -2;
+    const metadataTtlSeconds = Number(metadataTtlValue);
+    const payloadTtlSeconds = Number(payloadTtlValue);
+    const dueScore = Number(dueScoreValue);
+    const activeTtlSeconds = Number(activeTtlValue);
+    if (
+      !isCanonicalPositiveInteger(metadataTtlValue) ||
+      !Number.isSafeInteger(metadataTtlSeconds) ||
+      metadataTtlSeconds < 1 ||
+      !isCanonicalPositiveInteger(payloadTtlValue) ||
+      !Number.isSafeInteger(payloadTtlSeconds) ||
+      payloadTtlSeconds < 1 ||
+      !isCanonicalNonnegativeInteger(dueScoreValue) ||
+      !Number.isSafeInteger(dueScore) ||
+      dueScore < 0 ||
+      !isCanonicalPositiveInteger(activeTtlValue) ||
+      !Number.isSafeInteger(activeTtlSeconds) ||
+      activeTtlSeconds < 1
+    ) {
+      throw new Error("invalid video job publish script arguments");
+    }
+    const now = this.now();
+    this.values.set(metadataKey, {
+      kind: "string",
+      value: metadata,
+      expiresAt: now + metadataTtlSeconds * 1_000,
+    });
+    this.values.set(payloadKey, {
+      kind: "string",
+      value: payload,
+      expiresAt: now + payloadTtlSeconds * 1_000,
+    });
+    this.getZSet(dueKey, true).value.set(recordKey, dueScore);
+    this.values.set(activeSenderKey, {
+      kind: "string",
+      value: recordKey,
+      expiresAt: now + activeTtlSeconds * 1_000,
+    });
+    return 1;
+  }
+
+  /** Mirrors the atomic metadata/payload/index replacement for a video job state transition. */
+  private evalWriteVideoJob(
+    keys: readonly string[],
+    args: readonly string[],
+  ): number {
+    const metadataKey = keys[0];
+    const payloadKey = keys[1];
+    const dueKey = keys[2];
+    const leaseKey = keys[3];
+    const activeSenderKey = keys[4];
+    const manualReviewKey = keys[5];
+    const metadata = args[0];
+    const metadataTtlValue = args[1];
+    const payload = args[2];
+    const payloadTtlValue = args[3];
+    const payloadPresent = args[4];
+    const indexMode = args[5];
+    const dueScoreValue = args[6];
+    const recordKey = args[7];
+    const expectedStateVersionValue = args[8];
+    const leaseToken = args[9];
+    const activeMode = args[10];
+    const activeTtlValue = args[11];
+    const manualReviewMode = args[12];
+    if (
+      keys.length !== 6 ||
+      args.length !== 13 ||
+      !metadataKey ||
+      !payloadKey ||
+      !dueKey ||
+      !leaseKey ||
+      !activeSenderKey ||
+      !manualReviewKey ||
+      !metadata ||
+      metadataTtlValue === undefined ||
+      payload === undefined ||
+      payloadTtlValue === undefined ||
+      (payloadPresent !== "0" && payloadPresent !== "1") ||
+      (indexMode !== "due" && indexMode !== "terminal") ||
+      dueScoreValue === undefined ||
+      !recordKey ||
+      expectedStateVersionValue === undefined ||
+      !leaseToken ||
+      (activeMode !== "retain" && activeMode !== "release") ||
+      activeTtlValue === undefined ||
+      (manualReviewMode !== "manual" && manualReviewMode !== "remove")
+    ) {
+      throw new Error("invalid video job write script arguments");
+    }
+    if (
+      !isCanonicalPositiveInteger(expectedStateVersionValue) ||
+      !/^[A-Za-z0-9_-]{32,128}$/.test(leaseToken) ||
+      !isCanonicalPositiveInteger(activeTtlValue)
+    ) {
+      throw new Error("invalid video job write fence");
+    }
+    const leaseEntry = this.getEntry(leaseKey);
+    if (leaseEntry && leaseEntry.kind !== "string") throw new Error("Redis key has the wrong type");
+    if (!leaseEntry || leaseEntry.value !== leaseToken) return -2;
+    const metadataEntry = this.getEntry(metadataKey);
+    if (metadataEntry?.kind !== "string") return 0;
+    let storedStateVersion: unknown;
+    try {
+      storedStateVersion = (JSON.parse(metadataEntry.value) as { stateVersion?: unknown }).stateVersion;
+    } catch {
+      throw new Error("invalid stored video metadata");
+    }
+    if (storedStateVersion !== Number(expectedStateVersionValue)) return -3;
+    this.assertStringOrMissing(payloadKey);
+    this.assertZSetOrMissing(dueKey);
+    this.assertStringOrMissing(activeSenderKey);
+    this.assertZSetOrMissing(manualReviewKey);
+    const metadataTtlSeconds = Number(metadataTtlValue);
+    const payloadTtlSeconds = Number(payloadTtlValue);
+    const dueScore = Number(dueScoreValue);
+    const activeTtlSeconds = Number(activeTtlValue);
+    if (
+      !isCanonicalPositiveInteger(metadataTtlValue) ||
+      !Number.isSafeInteger(metadataTtlSeconds) ||
+      metadataTtlSeconds < 1 ||
+      (payloadPresent === "1" && (
+        !isCanonicalPositiveInteger(payloadTtlValue) ||
+        !Number.isSafeInteger(payloadTtlSeconds) ||
+        payloadTtlSeconds < 1
+      )) ||
+      !isCanonicalNonnegativeInteger(dueScoreValue) ||
+      !Number.isSafeInteger(dueScore) ||
+      dueScore < 0 ||
+      !Number.isSafeInteger(activeTtlSeconds) ||
+      activeTtlSeconds < 1
+    ) {
+      throw new Error("invalid video job write script arguments");
+    }
+    const activeEntry = this.getEntry(activeSenderKey);
+    if (activeMode === "retain" && activeEntry && activeEntry.value !== recordKey) return -4;
+    const now = this.now();
+    this.values.set(metadataKey, {
+      kind: "string",
+      value: metadata,
+      expiresAt: now + metadataTtlSeconds * 1_000,
+    });
+    if (payloadPresent === "1") {
+      this.values.set(payloadKey, {
+        kind: "string",
+        value: payload,
+        expiresAt: now + payloadTtlSeconds * 1_000,
+      });
+    } else {
+      this.values.delete(payloadKey);
+    }
+    const due = this.getZSet(dueKey, false);
+    if (indexMode === "due") {
+      this.getZSet(dueKey, true).value.set(recordKey, dueScore);
+    } else if (due?.value.delete(recordKey) && due.value.size === 0) {
+      this.values.delete(dueKey);
+    }
+    const manualReview = this.getZSet(manualReviewKey, false);
+    if (manualReviewMode === "manual") {
+      this.getZSet(manualReviewKey, true).value.set(recordKey, dueScore);
+    } else if (manualReview?.value.delete(recordKey) && manualReview.value.size === 0) {
+      this.values.delete(manualReviewKey);
+    }
+    if (activeMode === "release") {
+      if (activeEntry?.value === recordKey) this.values.delete(activeSenderKey);
+    } else {
+      this.values.set(activeSenderKey, {
+        kind: "string",
+        value: recordKey,
+        expiresAt: now + activeTtlSeconds * 1_000,
+      });
+    }
+    return 1;
   }
 
   private evalPersistInboxNewRecord(
@@ -1685,6 +1905,15 @@ export class MemoryRedis implements RedisLike {
     this.values.set(key, zset);
     return zset;
   }
+}
+
+/** Keep the deterministic emulator aligned with the Lua scripts' decimal-only inputs. */
+function isCanonicalPositiveInteger(value: string): boolean {
+  return /^[1-9][0-9]*$/.test(value) && value.length <= 16;
+}
+
+function isCanonicalNonnegativeInteger(value: string): boolean {
+  return value === "0" || isCanonicalPositiveInteger(value);
 }
 
 function parseMemoryRateDecision(
