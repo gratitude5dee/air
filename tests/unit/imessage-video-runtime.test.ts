@@ -15,6 +15,7 @@ import {
 } from "../../lib/imessage-channel-runtime.js";
 import { loadAirEnvironment } from "../../lib/env.js";
 import {
+  authorizeIMessageVideoDrain,
   drainIMessageVideoJobs,
   handleIMessageVideoWebhook,
   MAX_INPUT_IMAGE_BYTES,
@@ -223,6 +224,20 @@ describe("iMessage video runtime safeguards", () => {
     expect(background).toEqual([]);
   });
 
+  it("rejects an unauthenticated manual drain before runtime configuration is evaluated", async () => {
+    __setAirRuntimeForTests(undefined);
+    vi.stubEnv("VERCEL_ENV", "production");
+    // If authorization tried to load the runtime first, this incomplete
+    // production configuration would produce a 503 instead of a 401.
+    vi.stubEnv("IMESSAGE_PROJECT_ID", "");
+    const response = await authorizeIMessageVideoDrain(
+      new Request("https://air.example.test/internal/drain-inbox", { method: "POST" }),
+    );
+
+    expect(response).toBeInstanceOf(Response);
+    expect((response as Response).status).toBe(401);
+  });
+
   it("cancels an oversized attachment stream before it can become an in-memory Buffer", async () => {
     const runtime = createRuntime();
     __setAirRuntimeForTests(runtime);
@@ -365,6 +380,102 @@ describe("iMessage video runtime safeguards", () => {
       "https://zap.example.test/api/services/air/v1/runs",
     ]);
     expect(adapter.posted).toEqual(["Generating your 5-second video now."]);
+  });
+
+  it("waits for durable Zap acceptance before sending the generating acknowledgement", async () => {
+    const runtime = createRuntime();
+    __setAirRuntimeForTests(runtime);
+    vi.stubEnv("IMESSAGE_PROJECT_ID", projectId);
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+
+    let resolveRun: ((response: Response) => void) | undefined;
+    let markRunStarted: (() => void) | undefined;
+    const runStarted = new Promise<void>((resolve) => {
+      markRunStarted = resolve;
+    });
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (!url.endsWith("/api/services/air/v1/runs")) {
+        throw new Error("unexpected network destination");
+      }
+      markRunStarted?.();
+      return new Promise<Response>((resolve) => {
+        resolveRun = resolve;
+      });
+    });
+    const adapter = new FixtureAdapter();
+    const background: Promise<unknown>[] = [];
+
+    const response = await handleIMessageVideoWebhook(
+      signedRequest(textPayload({ messageId: "ack-after-acceptance" })),
+      webhookOptions(adapter, background),
+    );
+    await runStarted;
+
+    const correlation = deriveCorrelationId(identitySecret, projectId, "ack-after-acceptance");
+    const jobs = new VideoJobStore({
+      redis: runtime.redis,
+      cipher: runtime.cipher,
+      identityHashSecret: identitySecret,
+    });
+    expect(response.status).toBe(200);
+    expect(adapter.posted).toEqual([]);
+    const awaitingAcceptance = await jobs.get(videoJobRecordKey(correlation));
+    expect(awaitingAcceptance?.state).toBe("submission_unknown");
+    expect(awaitingAcceptance?.status.acknowledgementAttemptedAtMs).toBeUndefined();
+
+    resolveRun?.(new Response(JSON.stringify({ runId: "run_ack_fixture", status: "queued" }), {
+      status: 202,
+      headers: { "content-type": "application/json" },
+    }));
+    await Promise.all(background);
+
+    expect(adapter.posted).toEqual([AIR_VIDEO_GENERATING_NOTICE]);
+    expect(await jobs.get(videoJobRecordKey(correlation))).toMatchObject({
+      state: "queued",
+      status: { acknowledgementAttemptedAtMs: expect.any(Number) },
+    });
+  });
+
+  it("acknowledges an immediately completed accepted Zap run without regressing it", async () => {
+    const runtime = createRuntime();
+    __setAirRuntimeForTests(runtime);
+    vi.stubEnv("IMESSAGE_PROJECT_ID", projectId);
+    vi.stubEnv("IMESSAGE_WEBHOOK_SECRET", webhookSecret);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      runId: "run_completed_fixture",
+      status: "video_ready",
+      video: {
+        url: "https://blob.vercel-storage.com/air/fixture.mp4",
+        mimeType: "video/mp4",
+      },
+    }), {
+      // A completed status is an idempotent replay, which Zap returns as 200;
+      // a first-time 202 acceptance is necessarily queued.
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }));
+    const adapter = new FixtureAdapter();
+    const background: Promise<unknown>[] = [];
+
+    await handleIMessageVideoWebhook(
+      signedRequest(textPayload({ messageId: "ack-immediate-completion" })),
+      webhookOptions(adapter, background),
+    );
+    await Promise.all(background);
+
+    const correlation = deriveCorrelationId(identitySecret, projectId, "ack-immediate-completion");
+    const jobs = new VideoJobStore({
+      redis: runtime.redis,
+      cipher: runtime.cipher,
+      identityHashSecret: identitySecret,
+    });
+    const completed = await jobs.get(videoJobRecordKey(correlation));
+    expect(completed).toMatchObject({
+      state: "video_ready",
+      status: { acknowledgementAttemptedAtMs: expect.any(Number) },
+    });
+    expect(adapter.posted).toEqual([AIR_VIDEO_GENERATING_NOTICE]);
   });
 
   it("does not reserve quota for a receipt that loses the active-job fence", async () => {

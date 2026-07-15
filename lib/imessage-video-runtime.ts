@@ -35,6 +35,7 @@ import {
   videoJobActiveSenderKey,
   videoJobRecordKey,
   type VideoJobAttempt,
+  type VideoJobDeliveryTarget,
   type VideoJobRecord,
 } from "./video-job-store.js";
 import { acquireRedisLease } from "./redis.js";
@@ -264,6 +265,12 @@ export async function authorizeIMessageVideoDrain(
   request: Request,
 ): Promise<AuthorizedVideoDrain | Response> {
   if (request.method !== "POST") return emptyResponse(405);
+  // Reject unauthenticated probes before asking the runtime to validate or
+  // connect anything. This keeps a missing production configuration from
+  // turning an unauthenticated recovery request into a framework-level 500.
+  if (!isBearerAuthorized(request.headers.get("authorization"), process.env.CRON_SECRET?.trim())) {
+    return emptyResponse(401);
+  }
   let runtime: AirRuntime;
   try {
     runtime = await getAirRuntime();
@@ -432,9 +439,8 @@ async function processInboxRecord(
         return;
       }
 
-      let job;
       try {
-        job = await jobs.createOrGet({
+        await jobs.createOrGet({
           correlationId,
           senderHash: record.immutable.senderHash,
           prompt,
@@ -454,28 +460,9 @@ async function processInboxRecord(
         return;
       }
 
-      // The job is durable before the acknowledgement. Mark the send intent
-      // first; an uncertain acknowledgement is intentionally never replayed.
-      if (job.record.status.acknowledgementAttemptedAtMs === undefined) {
-        const marked = await jobs.transition(job.record.immutable.recordKey, {
-          expectedStates: [job.record.state],
-          state: job.record.state,
-          acknowledgementAttempted: true,
-          ...(job.record.status.failureCategory
-            ? { failureCategory: job.record.status.failureCategory }
-            : {}),
-        });
-        if (marked) {
-          try {
-            await adapter.postMessage(threadId, AIR_VIDEO_GENERATING_NOTICE);
-          } catch {
-            // The paid job remains recoverable; never retry an acknowledgement
-            // whose transport outcome is ambiguous.
-          }
-        }
-      }
-      // The encrypted inbox has served its purpose once the durable video job
-      // exists. The job itself owns all later provider and delivery recovery.
+      // A durable local submission intent exists before this handoff, but the
+      // user-facing generation acknowledgement waits for Zap to durably accept
+      // the run. The job owns that acknowledgement and all later recovery.
       await lease.transition("handed_off");
     } finally {
       await admission.release().catch(() => undefined);
@@ -498,10 +485,10 @@ async function processVideoJob(
   try {
     switch (attempt.operation) {
       case "submit":
-        await submitVideoJob(runtime, attempt);
+        await submitVideoJob(runtime, attempt, adapter);
         return;
       case "poll":
-        await pollVideoJob(runtime, attempt);
+        await pollVideoJob(runtime, attempt, adapter);
         return;
       case "send":
         await deliverVideoJob(runtime, attempt, adapter);
@@ -512,16 +499,21 @@ async function processVideoJob(
   }
 }
 
-async function submitVideoJob(runtime: AirRuntime, attempt: VideoJobAttempt): Promise<void> {
+async function submitVideoJob(
+  runtime: AirRuntime,
+  attempt: VideoJobAttempt,
+  adapter: AirVideoIMessageAdapter,
+): Promise<void> {
   const payload = attempt.payload;
   if (!payload) return;
+  let accepted: VideoJobRecord | null;
   try {
     const result = await zapClient(runtime).createRun({
       prompt: payload.prompt,
       ...(payload.firstFrameUrl === undefined ? {} : { firstFrameUrl: payload.firstFrameUrl }),
       idempotencyKey: attempt.idempotencyKey,
     });
-    await transitionSubmissionResult(attempt, result, runtime.clock());
+    accepted = await transitionSubmissionResult(attempt, result, runtime.clock());
   } catch (error) {
     // An accepted-but-malformed response, timeout, transport fault, or 5xx
     // can all follow a paid provider submission. Preserve the durable intent
@@ -539,54 +531,52 @@ async function submitVideoJob(runtime: AirRuntime, attempt: VideoJobAttempt): Pr
         failureCategory: "zap_submission_unknown",
       });
     }
+    return;
   }
+  await acknowledgeAcceptedZapRun(runtime, attempt, adapter, accepted, payload.delivery);
 }
 
 async function transitionSubmissionResult(
   attempt: VideoJobAttempt,
   result: ZapVideoRun,
   now: number,
-): Promise<void> {
+): Promise<VideoJobRecord | null> {
   switch (result.status) {
     case "queued":
     case "running":
-      await attempt.transition({
+      return attempt.transition({
         expectedStates: ["submission_unknown"],
         state: result.status,
         zapRunId: result.runId,
         nextAttemptAtMs: now + VIDEO_POLL_INTERVAL_MS,
         ...(result.progress === undefined ? {} : { progress: result.progress }),
       });
-      return;
     case "video_ready":
       if (!result.video) throw new VideoWorkflowError("zap_invalid_completion", false);
-      await attempt.transition({
+      return attempt.transition({
         expectedStates: ["submission_unknown"],
         state: "video_ready",
         zapRunId: result.runId,
         video: result.video,
         progress: 100,
       });
-      return;
     case "retryable":
-      await attempt.transition({
+      return attempt.transition({
         expectedStates: ["submission_unknown"],
         state: "retryable",
         zapRunId: result.runId,
         failureCategory: "zap_retryable",
         nextAttemptAtMs: now + VIDEO_RETRY_DELAY_MS,
       });
-      return;
     case "submission_unknown":
-      await attempt.transition({
+      return attempt.transition({
         expectedStates: ["submission_unknown"],
         state: "submission_unknown",
         zapRunId: result.runId,
         failureCategory: "zap_submission_unknown",
       });
-      return;
     case "dead_letter":
-      await attempt.transition({
+      return attempt.transition({
         expectedStates: ["submission_unknown"],
         state: "dead_letter",
         failureCategory: "zap_dead_letter",
@@ -594,7 +584,11 @@ async function transitionSubmissionResult(
   }
 }
 
-async function pollVideoJob(runtime: AirRuntime, attempt: VideoJobAttempt): Promise<void> {
+async function pollVideoJob(
+  runtime: AirRuntime,
+  attempt: VideoJobAttempt,
+  adapter: AirVideoIMessageAdapter,
+): Promise<void> {
   const payload = attempt.payload;
   if (!payload?.zapRunId) return;
   try {
@@ -602,31 +596,37 @@ async function pollVideoJob(runtime: AirRuntime, attempt: VideoJobAttempt): Prom
     const expectedStates = [attempt.record.state];
     switch (result.status) {
       case "queued":
-      case "running":
-        await attempt.transition({
+      case "running": {
+        const accepted = await attempt.transition({
           expectedStates,
           state: result.status,
           nextAttemptAtMs: runtime.clock() + VIDEO_POLL_INTERVAL_MS,
           ...(result.progress === undefined ? {} : { progress: result.progress }),
         });
+        await acknowledgeAcceptedZapRun(runtime, attempt, adapter, accepted, payload.delivery);
         return;
-      case "video_ready":
+      }
+      case "video_ready": {
         if (!result.video) throw new VideoWorkflowError("zap_invalid_completion", false);
-        await attempt.transition({
+        const accepted = await attempt.transition({
           expectedStates,
           state: "video_ready",
           video: result.video,
           progress: 100,
         });
+        await acknowledgeAcceptedZapRun(runtime, attempt, adapter, accepted, payload.delivery);
         return;
-      case "retryable":
-        await attempt.transition({
+      }
+      case "retryable": {
+        const accepted = await attempt.transition({
           expectedStates,
           state: "retryable",
           failureCategory: "zap_poll_retryable",
           nextAttemptAtMs: runtime.clock() + VIDEO_RETRY_DELAY_MS,
         });
+        await acknowledgeAcceptedZapRun(runtime, attempt, adapter, accepted, payload.delivery);
         return;
+      }
       case "submission_unknown":
         await attempt.transition({
           expectedStates,
@@ -646,12 +646,13 @@ async function pollVideoJob(runtime: AirRuntime, attempt: VideoJobAttempt): Prom
     // A malformed 200 cannot prove that Zap/provider work failed. Requeue its
     // existing durable run ID so a transient schema/proxy fault is recoverable.
     if (workflow.retryable || (error instanceof ZapVideoServiceError && error.code === "invalid_response")) {
-      await attempt.transition({
+      const accepted = await attempt.transition({
         expectedStates: [attempt.record.state],
         state: "retryable",
         failureCategory: "zap_poll_retryable",
         nextAttemptAtMs: runtime.clock() + VIDEO_RETRY_DELAY_MS,
       });
+      await acknowledgeAcceptedZapRun(runtime, attempt, adapter, accepted, payload.delivery);
     } else {
       await attempt.transition({
         expectedStates: [attempt.record.state],
@@ -660,6 +661,64 @@ async function pollVideoJob(runtime: AirRuntime, attempt: VideoJobAttempt): Prom
       });
     }
   }
+}
+
+/**
+ * The initial local record is only a submission intent. Mark and send the
+ * static acknowledgement only once a Zap run ID has been durably recorded in
+ * an accepted state. The mark is persisted before the transport attempt so an
+ * ambiguous Photon result is never automatically replayed.
+ */
+async function acknowledgeAcceptedZapRun(
+  runtime: AirRuntime,
+  attempt: VideoJobAttempt,
+  adapter: AirVideoIMessageAdapter,
+  accepted: VideoJobRecord | null,
+  delivery: VideoJobDeliveryTarget,
+): Promise<void> {
+  try {
+    if (
+      !accepted ||
+      accepted.status.acknowledgementAttemptedAtMs !== undefined ||
+      accepted.status.zapRunIdHash === undefined ||
+      !isAcceptedZapRunState(accepted.state)
+    ) {
+      return;
+    }
+    const current = attempt.record;
+    // The returned record proves Zap acceptance was committed before any user
+    // message intent is written. Do not acknowledge if this lease no longer
+    // owns that exact revision.
+    if (current.state !== accepted.state || current.stateVersion !== accepted.stateVersion) return;
+
+    const nextAttemptAtMs = accepted.status.nextAttemptAtMs === undefined
+      ? undefined
+      : Math.max(accepted.status.nextAttemptAtMs, runtime.clock());
+    const marked = await attempt.transition({
+      expectedStates: [accepted.state],
+      state: accepted.state,
+      ...(nextAttemptAtMs === undefined ? {} : { nextAttemptAtMs }),
+      ...(accepted.status.progress === undefined ? {} : { progress: accepted.status.progress }),
+      ...(accepted.status.failureCategory === undefined
+        ? {}
+        : { failureCategory: accepted.status.failureCategory }),
+      acknowledgementAttempted: true,
+    });
+    if (!marked) return;
+    const threadId = adapter.encodeThreadId({
+      chatGuid: delivery.chatGuid,
+      ...(delivery.phone === undefined ? {} : { phone: delivery.phone }),
+    });
+    await adapter.postMessage(threadId, AIR_VIDEO_GENERATING_NOTICE);
+  } catch {
+    // Acknowledgement bookkeeping and transport are intentionally isolated
+    // from provider-result handling. The paid run remains recoverable, and an
+    // ambiguous Photon acknowledgement is never replayed automatically.
+  }
+}
+
+function isAcceptedZapRunState(state: VideoJobRecord["state"]): boolean {
+  return state === "queued" || state === "running" || state === "video_ready" || state === "retryable";
 }
 
 async function deliverVideoJob(

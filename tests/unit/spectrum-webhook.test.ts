@@ -276,6 +276,55 @@ describe("Spectrum webhook verifier", () => {
     expect(envelope?.attachments).toHaveLength(2);
   });
 
+  it("recursively unwraps Spectrum reply content without retaining the reply target", () => {
+    const replied = payload();
+    (replied.message as { content: unknown }).content = {
+      type: "reply",
+      target: {
+        id: "historical-message-id",
+        content: { type: "text", text: "This must not become the prompt." },
+      },
+      content: {
+        type: "group",
+        items: [
+          { content: { type: "text", text: "Animate this as an ink wash." } },
+          {
+            content: {
+              type: "reply",
+              target: { id: "another-historical-message" },
+              content: {
+                type: "attachment",
+                id: "photon-reply-attachment-guid",
+                name: "reference.jpg",
+                mimeType: "image/jpeg",
+                size: 321,
+              },
+            },
+          },
+        ],
+      },
+    };
+
+    const envelope = normalizeSpectrumWebhook({
+      payload: replied,
+      projectId: "contract-project",
+      webhookId: "reply-delivery-001",
+    });
+
+    expect(envelope).toMatchObject({
+      contentType: "reply",
+      text: "Animate this as an ink wash.",
+      attachments: [
+        {
+          id: "photon-reply-attachment-guid",
+          name: "reference.jpg",
+          mimeType: "image/jpeg",
+          size: 321,
+        },
+      ],
+    });
+  });
+
   it("rejects attachment content with no usable Photon GUID", () => {
     const malformed = payload();
     (malformed.message as { content: unknown }).content = {

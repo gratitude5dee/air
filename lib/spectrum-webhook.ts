@@ -296,6 +296,17 @@ function extractWebhookContent(rawContent: unknown): ExtractedWebhookContent {
         }
         return;
       }
+      case "reply": {
+        // Spectrum represents a reply as `{ type: "reply", content, target }`.
+        // The target is historical context only; normalize the newly authored
+        // content exactly as if it arrived at the top level. This also lets a
+        // reply wrap a group, while the shared depth/seen guards bound nesting.
+        if (!("content" in content)) {
+          throw new WebhookInputError(400, "invalid_payload");
+        }
+        visit(content.content, depth + 1);
+        return;
+      }
       default:
         return;
     }

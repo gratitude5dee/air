@@ -26,9 +26,13 @@ export default defineChannel({
       });
     }),
     POST("/internal/drain-inbox", async (request, args) => {
-      assertIMessageRuntimeConfiguration();
       const authorized = await authorizeIMessageVideoDrain(request);
       if (authorized instanceof Response) return authorized;
+      try {
+        assertIMessageRuntimeConfiguration();
+      } catch {
+        return new Response(null, { status: 503 });
+      }
       args.waitUntil(drainIMessageVideoJobs({
         adapter: imessageAdapter,
         runtime: authorized.runtime,
