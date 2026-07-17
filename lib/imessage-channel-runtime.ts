@@ -108,7 +108,12 @@ export function publicStatusResponse(): Response {
       name: "Air",
       status: "allowlisted iMessage Seedance video generation",
     },
-    { headers: { "cache-control": "no-store" } },
+    {
+      headers: {
+        "cache-control": "no-store",
+        link: '</favicon.ico>; rel="icon"; type="image/x-icon"',
+      },
+    },
   );
 }
 
