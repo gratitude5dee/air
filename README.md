@@ -61,7 +61,7 @@ flowchart LR
 | `/webhooks/imessage` | `POST` | Signed iMessage receipt ingress. |
 | `/internal/drain-inbox` | `GET`, `POST` | `CRON_SECRET` bearer-protected minute recovery route. |
 | `/internal/readiness` | `GET` | `CRON_SECRET` bearer-protected, secret-safe readiness report. |
-| `/internal/release-fence` | `POST` | `AIR_RELEASE_FENCE_SECRET` bearer-protected release-generation CAS. |
+| `/internal/release-fence` | `GET`, `POST` | `AIR_RELEASE_FENCE_SECRET` bearer-protected epoch read and release-generation CAS. |
 
 `vercel.json` declares the recovery cron exactly once, every minute, with a
 60-second function limit. The operator routes do not reveal configuration
@@ -113,8 +113,9 @@ spend caps at zero. The full procedure is in [RUNBOOK.md](RUNBOOK.md).
 ## Release fence
 
 Every Studio outbox intent carries the deployment's `{ generation, phase }`.
-An authenticated operator must explicitly create or advance the shared Redis
-fence using `POST /internal/release-fence` and a literal `If-Match` generation;
+An authenticated operator reads the secret-free shared epoch with `GET` and
+explicitly creates or advances it using `POST /internal/release-fence` and a
+literal `If-Match` generation;
 deploying code or running Cron never arms it. The first record is dark
 generation `0` with `If-Match: -1`; later deployments advance exactly one
 generation at a time. The endpoint returns no state details and is not part of

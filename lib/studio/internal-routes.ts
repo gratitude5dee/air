@@ -129,7 +129,7 @@ export async function handleStudioReleaseFence(
   request: Request,
   options: StudioInternalRouteOptions = {},
 ): Promise<Response> {
-  if (request.method !== "POST") return methodNotAllowedResponse("POST");
+  if (request.method !== "POST" && request.method !== "GET") return methodNotAllowedResponse("GET, POST");
 
   let environment: StudioEnvironment;
   try {
@@ -143,8 +143,10 @@ export async function handleStudioReleaseFence(
     return privateEmptyResponse(401);
   }
 
-  const previousGeneration = parseReleaseFenceIfMatch(request.headers.get("if-match"));
-  if (previousGeneration === undefined) return privateEmptyResponse(409);
+  const previousGeneration = request.method === "POST"
+    ? parseReleaseFenceIfMatch(request.headers.get("if-match"))
+    : undefined;
+  if (request.method === "POST" && previousGeneration === undefined) return privateEmptyResponse(409);
 
   let runtime: StudioRuntime;
   try {
@@ -153,8 +155,20 @@ export async function handleStudioReleaseFence(
     return privateEmptyResponse(503);
   }
 
+  if (request.method === "GET") {
+    try {
+      const status = await runtime.store.getReleaseFenceStatus();
+      return Response.json(status, {
+        status: status.kind === "invalid" ? 503 : 200,
+        headers: { "cache-control": "no-store" },
+      });
+    } catch {
+      return privateEmptyResponse(503);
+    }
+  }
+
   try {
-    const outcome = await runtime.store.advanceReleaseFence(previousGeneration);
+    const outcome = await runtime.store.advanceReleaseFence(previousGeneration as number);
     if (outcome.kind === "advanced" || outcome.kind === "current") {
       return Response.json({ accepted: true }, { status: 202, headers: { "cache-control": "no-store" } });
     }

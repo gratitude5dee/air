@@ -421,16 +421,46 @@ describe("Studio Vercel internal routes", () => {
     }
   });
 
-  it("exposes the release-fence route only through its POST contract", async () => {
+  it("reads only the secret-free release-fence epoch with its dedicated GET contract", async () => {
+    const getReleaseFenceStatus = vi.fn(async () => ({
+      kind: "current" as const,
+      stamp: { generation: 4, phase: "production" as const },
+    }));
+    const response = await handleStudioReleaseFence(releaseFenceRequest(undefined, "GET"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => ({ store: { getReleaseFenceStatus } }) as unknown as StudioRuntime,
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      kind: "current",
+      stamp: { generation: 4, phase: "production" },
+    });
+    expect(getReleaseFenceStatus).toHaveBeenCalledTimes(1);
+
+    const unauthorized = await handleStudioReleaseFence(releaseFenceRequest(undefined, "GET", "wrong-secret"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => ({}) as StudioRuntime,
+    });
+    expect(unauthorized.status).toBe(401);
+  });
+
+  it("rejects unsupported release-fence methods before loading a runtime", async () => {
     const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
-    const response = await handleStudioReleaseFence(releaseFenceRequest("-1", "GET"), {
+    const response = await handleStudioReleaseFence(releaseFenceRequest(undefined, "POST"), {
       loadEnvironment: releaseFenceEnvironment,
       getRuntime,
     });
+    expect(response.status).toBe(409);
 
-    expect(response.status).toBe(405);
-    expect(response.headers.get("allow")).toBe("POST");
-    expect(await response.text()).toBe("");
+    const unsupported = await handleStudioReleaseFence(new Request("https://air.example.test/internal/release-fence", {
+      method: "PUT",
+    }), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime,
+    });
+    expect(unsupported.status).toBe(405);
+    expect(unsupported.headers.get("allow")).toBe("GET, POST");
     expect(getRuntime).not.toHaveBeenCalled();
   });
 });

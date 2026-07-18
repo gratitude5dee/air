@@ -48,6 +48,12 @@ export type StudioReleaseFenceAdvanceResult =
   | { readonly kind: "conflict" }
   | { readonly kind: "invalid" };
 
+/** Secret-free operator view used to choose an exact release-fence CAS value. */
+export type StudioReleaseFenceStatus =
+  | { readonly kind: "missing" }
+  | { readonly kind: "current"; readonly stamp: StudioReleaseStamp }
+  | { readonly kind: "invalid" };
+
 /**
  * A delivery attempt is only retried when the worker has established that no
  * iMessage side effect occurred.  An interrupted `sending` attempt is always
@@ -586,6 +592,21 @@ export class StudioStore {
     if (result === 2 || result === "2") return Object.freeze({ kind: "current" });
     if (result === -1 || result === "-1") return Object.freeze({ kind: "conflict" });
     return Object.freeze({ kind: "invalid" });
+  }
+
+  /**
+   * Reads only the global release epoch. It never opens a tenant record or
+   * decrypts data, and is exposed solely through the dedicated operator route.
+   */
+  public async getReleaseFenceStatus(): Promise<StudioReleaseFenceStatus> {
+    const raw = await this.redis.get(this.releaseFenceKey());
+    if (raw === null) return Object.freeze({ kind: "missing" });
+    const parsed = parseStored<unknown>(raw);
+    if (!isReleaseFenceRecord(parsed)) return Object.freeze({ kind: "invalid" });
+    return Object.freeze({
+      kind: "current",
+      stamp: Object.freeze({ generation: parsed.generation, phase: parsed.phase }),
+    });
   }
 
   public async persistInbox(input: {
@@ -3752,6 +3773,12 @@ function isValidReleaseStamp(value: unknown): value is StudioReleaseStamp {
     && (stamp.generation as number) >= 0
     && (stamp.phase === "dark" || stamp.phase === "canary" || stamp.phase === "production")
     && (stamp.phase === "dark" || (stamp.generation as number) >= 1);
+}
+
+function isReleaseFenceRecord(value: unknown): value is { readonly schemaVersion: 1 } & StudioReleaseStamp {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as { readonly schemaVersion?: unknown };
+  return record.schemaVersion === 1 && isValidReleaseStamp(value);
 }
 
 function sameReleaseStamp(left: unknown, right: unknown): boolean {

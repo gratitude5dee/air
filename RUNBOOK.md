@@ -43,9 +43,10 @@ The owner sends the test text; release automation never sends an iMessage.
    verify `/healthz` at `https://air.wzrd.tech` reports Air Studio version 2.
 2. Check protected `/internal/readiness`. Before the shared fence is advanced,
    a send path must not be treated as live.
-3. Explicitly create/advance the shared fence through
+3. Read the current secret-free fence epoch with authenticated
+   `GET /internal/release-fence`, then explicitly create/advance it through
    `POST /internal/release-fence`, authenticated with
-   `AIR_RELEASE_FENCE_SECRET` and literal `If-Match: -1` for generation 1.
+   `AIR_RELEASE_FENCE_SECRET` and the returned literal previous generation.
    A deployment or Cron invocation never arms the fence by itself.
 4. Wait for Vercel's production minute Cron, then verify protected readiness
    reports a fresh Cron heartbeat, verified transport, zero enabled models,

@@ -944,6 +944,20 @@ describe("Air v2 studio durable store", () => {
     expect(await store.advanceReleaseFence(0)).toEqual({ kind: "current" });
   });
 
+  it("reports only the global release epoch needed for an exact operator CAS", async () => {
+    const { redis, store, prefix } = fixture();
+    await expect(store.getReleaseFenceStatus()).resolves.toEqual({ kind: "missing" });
+
+    expect(await store.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    await expect(store.getReleaseFenceStatus()).resolves.toEqual({
+      kind: "current",
+      stamp: { generation: 0, phase: "dark" },
+    });
+
+    await redis.set(`${prefix}:operations:release-fence`, JSON.stringify({ schemaVersion: 1, generation: "0", phase: "dark" }));
+    await expect(store.getReleaseFenceStatus()).resolves.toEqual({ kind: "invalid" });
+  });
+
   it("rejects a nonterminal inbox finish state without extending its encrypted envelope", async () => {
     const { redis, store, prefix } = fixture();
     const { senderHash, threadHash } = identities();
