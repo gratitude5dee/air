@@ -1188,7 +1188,7 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_BEGIN_PROVIDER_SUBMISSION_V2")) {
       return this.evalStudioBeginProviderSubmission(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V1")) {
+    if (script.includes("AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V2")) {
       return this.evalStudioFinishProviderSubmission(options.keys, options.arguments);
     }
     throw new Error("MemoryRedis does not implement this Lua script");
@@ -1840,7 +1840,7 @@ export class MemoryRedis implements RedisLike {
       return JSON.stringify({ kind: "unavailable" });
     }
     if (this.studioString(leaseKey) !== token) return JSON.stringify({ kind: "lease_lost" });
-    const record = this.studioRecord(recordKey);
+    const record = this.studioRecordFailClosed(recordKey);
     if (!record) return JSON.stringify({ kind: "unavailable" });
     const response = (kind: string): string => JSON.stringify({ kind, subrun: record });
     const state = record.state;
@@ -1857,13 +1857,16 @@ export class MemoryRedis implements RedisLike {
     if (state === "canceled") return response("canceled");
     if (state !== "reserved") return JSON.stringify({ kind: "unavailable" });
 
-    const job = this.studioRecord(jobKey);
+    const job = this.studioRecordFailClosed(jobKey);
     if (
       !job
       || record.jobId !== expectedJobId
       || job.jobId !== expectedJobId
       || job.state !== "executing"
-      || this.studioStateVersion(job) !== expectedJobVersion
+      || typeof job.stateVersion !== "number"
+      || !Number.isSafeInteger(job.stateVersion)
+      || job.stateVersion < 1
+      || job.stateVersion !== expectedJobVersion
     ) {
       record.state = "canceled";
       record.stateVersion = this.studioStateVersion(record) + 1;
@@ -1893,26 +1896,63 @@ export class MemoryRedis implements RedisLike {
   }
 
   private evalStudioFinishProviderSubmission(keys: readonly string[], args: readonly string[]): string | false {
-    this.assertStudioArity(keys, args, 3, 6);
+    this.assertStudioArity(keys, args, 6, 9);
     const recordKey = this.studioKey(keys, 0);
     const referenceKey = this.studioKey(keys, 1);
     const leaseKey = this.studioKey(keys, 2);
+    const payloadKey = this.studioKey(keys, 3);
+    const jobKey = this.studioKey(keys, 4);
+    const releaseFenceKey = this.studioKey(keys, 5);
     const token = this.studioArgument(args, 0);
     const outcome = this.studioArgument(args, 1);
     const encryptedReference = this.studioArgument(args, 2);
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 3));
     const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
-    const referenceTtl = this.studioNonnegativeInteger(this.studioArgument(args, 5));
+    const releaseGeneration = this.studioPositiveInteger(this.studioArgument(args, 5));
+    const releasePhase = this.studioArgument(args, 6);
+    const expectedJobId = this.studioArgument(args, 7);
+    const expectedJobVersion = this.studioPositiveInteger(this.studioArgument(args, 8));
+    if (releasePhase !== "canary" && releasePhase !== "production") return false;
     if (this.studioString(leaseKey) !== token) return false;
-    const record = this.studioRecord(recordKey);
+    const record = this.studioRecordFailClosed(recordKey);
     if (!record || record.state !== "submitting") return false;
     record.stateVersion = this.studioStateVersion(record) + 1;
     record.updatedAtMs = now;
     switch (outcome) {
       case "accepted":
-        if (!encryptedReference || referenceTtl < 1) return false;
-        record.state = "submitted";
-        this.studioSet(referenceKey, encryptedReference, referenceTtl * 1_000);
+        if (!encryptedReference) return false;
+        // Mirror Redis PTTL inside the same finish transition. A local worker
+        // clock must never extend an encrypted provider reference beyond the
+        // source job payload's actual remaining lifetime.
+        const payload = this.getEntry(payloadKey);
+        const payloadTtl = !payload || payload.expiresAt === null
+          ? -1
+          : Math.max(0, payload.expiresAt - this.now());
+        if (payloadTtl < 1) {
+          record.state = "submission_unknown";
+          this.values.delete(referenceKey);
+          this.studioSetPersistentRecord(recordKey, record);
+          break;
+        }
+        const job = this.studioRecordFailClosed(jobKey);
+        const jobIsCurrent = Boolean(
+          job
+          && record.jobId === expectedJobId
+          && job.jobId === expectedJobId
+          && job.state === "executing"
+          && typeof job.stateVersion === "number"
+          && Number.isSafeInteger(job.stateVersion)
+          && job.stateVersion > 0
+          && job.stateVersion === expectedJobVersion,
+        );
+        const releaseIsCurrent = this.studioReleaseDispatchStatus(
+          record,
+          releaseFenceKey,
+          releaseGeneration,
+          releasePhase,
+        ) === 1;
+        record.state = jobIsCurrent && releaseIsCurrent ? "submitted" : "submission_unknown";
+        this.studioSet(referenceKey, encryptedReference, payloadTtl);
         this.studioSetPersistentRecord(recordKey, record);
         break;
       case "definitive_rejection":
@@ -1978,6 +2018,15 @@ export class MemoryRedis implements RedisLike {
     const raw = this.studioString(key);
     if (raw === null) return null;
     return this.studioRecordFromJson(raw);
+  }
+
+  /** Provider-side corruption must fail closed like Lua's guarded cjson decode. */
+  private studioRecordFailClosed(key: string): Record<string, unknown> | null {
+    try {
+      return this.studioRecord(key);
+    } catch {
+      return null;
+    }
   }
 
   private studioRecordFromJson(raw: string): Record<string, unknown> {

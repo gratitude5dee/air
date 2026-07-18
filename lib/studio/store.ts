@@ -729,8 +729,10 @@ export class StudioStore {
 
   /**
    * The encrypted admission snapshot has an absolute wall-clock deadline. A
-   * provider submit must leave a bounded window to persist its encrypted
-   * request reference without extending that privacy lifetime.
+ * provider submit must leave a bounded window to persist its encrypted
+ * request reference without extending that privacy lifetime. The final
+ * reference TTL is nevertheless always read from Redis atomically at commit;
+ * this local clock calculation is only an earlier fail-closed gate.
    */
   public jobPayloadRemainingMs(job: Pick<StudioJobRecord, "createdAtMs">): number {
     const expiresAtMs = job.createdAtMs + STUDIO_JOB_PAYLOAD_TTL_MS;
@@ -849,6 +851,7 @@ export class StudioStore {
   public async finishProviderSubmission(
     subrunId: string,
     leaseToken: string,
+    job: Pick<StudioJobRecord, "jobId" | "state" | "stateVersion">,
     outcome: StudioProviderSubmissionOutcome,
   ): Promise<StudioProviderSubrunRecord | null> {
     if (!isOpaqueStudioIdentifier(subrunId)) return null;
@@ -856,32 +859,32 @@ export class StudioStore {
       // A malformed "accepted" response cannot safely become a known
       // submission. Preserve the durable intent as unknown rather than
       // throwing and leaving a replay-shaped record behind.
-      return this.finishProviderSubmission(subrunId, leaseToken, { kind: "ambiguous" });
+      return this.finishProviderSubmission(subrunId, leaseToken, job, { kind: "ambiguous" });
     }
     const subrun = await this.getProviderSubrun(subrunId);
-    if (!subrun) return null;
-    const job = await this.getJob(subrun.jobId);
-    const referenceTtlSeconds = outcome.kind === "accepted" && job
-      ? Math.floor(this.jobPayloadRemainingMs(job) / 1_000)
-      : 0;
-    // Never create a fresh 24-hour provider-reference lifetime after an old
-    // job was accepted. If the original privacy deadline wins, retain no
-    // request ID and immediately record the physical call as ambiguous.
-    if (outcome.kind === "accepted" && referenceTtlSeconds < 1) {
-      return this.finishProviderSubmission(subrunId, leaseToken, { kind: "ambiguous" });
-    }
+    if (!subrun || subrun.jobId !== job.jobId) return null;
     const encryptedReference = outcome.kind === "accepted"
       ? this.cipher.encrypt({ providerRequestId: outcome.providerRequestId }, `provider-subrun:${subrunId}`)
       : undefined;
     const result = await this.redis.eval(FINISH_PROVIDER_SUBMISSION_LUA, {
-      keys: [this.providerSubrunKey(subrunId), this.providerSubrunReferenceKey(subrunId), this.providerSubrunLeaseKey(subrunId)],
+      keys: [
+        this.providerSubrunKey(subrunId),
+        this.providerSubrunReferenceKey(subrunId),
+        this.providerSubrunLeaseKey(subrunId),
+        this.jobPayloadKey(subrun.jobId),
+        this.jobKey(subrun.jobId),
+        this.releaseFenceKey(),
+      ],
       arguments: [
         leaseToken,
         outcome.kind,
         encryptedReference === undefined ? "" : JSON.stringify(encryptedReference),
         String(this.now()),
         String(TERMINAL_METADATA_TTL_SECONDS),
-        String(referenceTtlSeconds),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+        job.jobId,
+        String(job.stateVersion),
       ],
     });
     const record = parseStored<StudioProviderSubrunRecord>(typeof result === "string" ? result : null);
@@ -2009,22 +2012,73 @@ return response('ready')
 `;
 
 const FINISH_PROVIDER_SUBMISSION_LUA = `
--- AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V1
--- KEYS: provider subrun metadata, encrypted provider reference, short execution lease
+-- AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V2
+-- KEYS: provider subrun metadata, encrypted provider reference, short execution lease,
+--       encrypted job payload, job metadata, shared release fence
 -- ARGV: lease token, accepted|definitive_rejection|ambiguous, encrypted reference, now,
---       terminal metadata ttl, reference ttl
+--       terminal metadata ttl, release generation, release phase, expected job id,
+--       expected job state version
 if redis.call('GET', KEYS[3]) ~= ARGV[1] then return false end
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local ok, record = pcall(cjson.decode, raw)
 if not ok or type(record) ~= 'table' or record.state ~= 'submitting' then return false end
 if ARGV[2] == 'accepted' then
-  local referenceTtl = tonumber(ARGV[6])
-  if ARGV[3] == '' or not referenceTtl or referenceTtl < 1 or referenceTtl ~= math.floor(referenceTtl) then return false end
-  record.state = 'submitted'
+  if ARGV[3] == '' then return false end
+  -- The source payload's actual Redis TTL is the only privacy deadline that
+  -- matters here. Do not trust a worker clock or create a fresh 24-hour TTL.
+  local payloadTtl = redis.call('PTTL', KEYS[4])
   record.stateVersion = tonumber(record.stateVersion or 0) + 1
   record.updatedAtMs = tonumber(ARGV[4])
-  redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[6])
+  if not payloadTtl or payloadTtl < 1 then
+    record.state = 'submission_unknown'
+    redis.call('DEL', KEYS[2])
+    redis.call('SET', KEYS[1], cjson.encode(record))
+    redis.call('DEL', KEYS[3])
+    return cjson.encode(record)
+  end
+
+  local job = nil
+  local jobRaw = redis.call('GET', KEYS[5])
+  if jobRaw then
+    local decoded, parsed = pcall(cjson.decode, jobRaw)
+    if decoded and type(parsed) == 'table' then job = parsed end
+  end
+  local jobValid = job ~= nil
+    and job.jobId == ARGV[8]
+    and record.jobId == ARGV[8]
+    and job.state == 'executing'
+    and type(job.stateVersion) == 'number'
+    and job.stateVersion == math.floor(job.stateVersion)
+    and job.stateVersion == tonumber(ARGV[9])
+
+  local current = nil
+  local fenceRaw = redis.call('GET', KEYS[6])
+  if fenceRaw then
+    local decoded, fence = pcall(cjson.decode, fenceRaw)
+    if decoded and type(fence) == 'table' then current = fence end
+  end
+  local stamp = record.releaseStamp
+  local stampValid = type(stamp) == 'table'
+    and type(stamp.generation) == 'number' and stamp.generation >= 1
+    and stamp.generation == math.floor(stamp.generation)
+    and (stamp.phase == 'canary' or stamp.phase == 'production')
+    and stamp.generation == tonumber(ARGV[6]) and stamp.phase == ARGV[7]
+  local fenceValid = current ~= nil and current.schemaVersion == 1
+    and type(current.generation) == 'number' and current.generation >= 1
+    and current.generation == math.floor(current.generation)
+    and (current.phase == 'canary' or current.phase == 'production')
+    and current.generation == tonumber(ARGV[6]) and current.phase == ARGV[7]
+
+  -- Keep the provider reference only while the source payload is live. If a
+  -- post-begin cancellation or rollback won the race, retain that bounded
+  -- reference for reconciliation but never claim a clean submitted state.
+  redis.call('SET', KEYS[2], ARGV[3], 'PX', payloadTtl)
+  if jobValid and stampValid and fenceValid then
+    record.state = 'submitted'
+  else
+    record.state = 'submission_unknown'
+  end
   redis.call('SET', KEYS[1], cjson.encode(record))
 elseif ARGV[2] == 'definitive_rejection' then
   record.state = 'definitive_rejection'

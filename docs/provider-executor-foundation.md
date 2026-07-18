@@ -25,9 +25,10 @@ workflow/model snapshot, the executor:
    before this point prevents the call; a change after it must be reconciled,
    because Redis cannot atomically revoke a third-party request.
 4. Stores an accepted provider request ID only in a separately encrypted
-   reference record whose TTL is capped by the original hard-24-hour job
-   deadline. Work too near that deadline does not start; a late accepted
-   response becomes an unknown submission without retaining its request ID.
+   reference record whose TTL is copied from the source job payload's Redis
+   `PTTL` inside the same completion transaction. Work too near that deadline
+   does not start; a late accepted response becomes an unknown submission
+   without retaining its request ID.
 5. Converts a definitive rejection to a known terminal state. Any thrown,
    timed-out, lost-lease, or recovered-in-flight outcome becomes
    `submission_unknown` / job `reconciliation_required`; it is never blindly
@@ -37,8 +38,9 @@ The in-memory Redis test double mirrors both new Lua transitions. Current test
 coverage includes dark no-op behavior, intent-before-submit ordering, accepted
 idempotency, definitive rejection, ambiguous outcomes, a crash after intent,
 release rollback before submit, cancellation that wins before the pre-call
-boundary, capped provider-reference retention, and expired or expiring
-encrypted job snapshots.
+boundary, cancellation and rollback after durable intent, source-payload TTL
+loss at completion, capped provider-reference retention, and expired or
+expiring encrypted job snapshots.
 
 ## What is intentionally absent
 

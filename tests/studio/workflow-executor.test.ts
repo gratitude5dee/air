@@ -317,7 +317,7 @@ describe("Air provider submission executor", () => {
     const lease = await setup.store.acquireProviderSubrunLease(subrun.subrunId);
     if (!lease) throw new Error("expected late lease");
     await expect(setup.store.beginProviderSubmission(subrun.subrunId, lease.token, executing)).resolves.toMatchObject({ kind: "ready" });
-    await expect(setup.store.finishProviderSubmission(subrun.subrunId, lease.token, {
+    await expect(setup.store.finishProviderSubmission(subrun.subrunId, lease.token, executing, {
       kind: "accepted",
       providerRequestId: "expires-with-job",
     })).resolves.toMatchObject({ state: "submitted" });
@@ -337,5 +337,70 @@ describe("Air provider submission executor", () => {
     await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "snapshot_expiring" });
     expect(provider.submit).not.toHaveBeenCalled();
     await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "failed" });
+  });
+
+  it("uses the source payload's Redis TTL at commit and retains no late reference", async () => {
+    const setup = fixture();
+    const admitted = setup.job("provider-reference-redis-ttl");
+    await setup.admit(admitted);
+    await setup.arm();
+    const executing = await setup.store.transitionJob(admitted.jobId, "admitted", "executing");
+    if (!executing?.encryptedPayload) throw new Error("expected encrypted job payload");
+    const payload = setup.store.decryptJobPayload(executing);
+    if (!payload.execution) throw new Error("expected execution snapshot");
+    const subrun = await setup.store.ensureProviderSubrun(executing, payload.execution);
+    const lease = await setup.store.acquireProviderSubrunLease(subrun.subrunId);
+    if (!lease) throw new Error("expected lease");
+    await expect(setup.store.beginProviderSubmission(subrun.subrunId, lease.token, executing)).resolves.toMatchObject({ kind: "ready" });
+    await setup.redis.del(`${STUDIO_REDIS_PREFIX}:workflow-executor-test:job:payload:${admitted.jobId}`);
+
+    await expect(setup.store.finishProviderSubmission(subrun.subrunId, lease.token, executing, {
+      kind: "accepted",
+      providerRequestId: "source-payload-already-gone",
+    })).resolves.toMatchObject({ state: "submission_unknown" });
+    await expect(setup.store.getProviderSubrunReference(subrun.subrunId)).resolves.toBeNull();
+  });
+
+  it("reconciles a cancellation that wins after durable intent but before provider completion", async () => {
+    const provider = fakeProvider({ kind: "accepted", providerRequestId: "canceled-after-intent" });
+    const setup = fixture({ provider });
+    const admitted = setup.job("canceled-after-provider-intent");
+    const subrunId = deriveOpaqueId(IDENTITY_SECRET, "studio-provider-subrun", admitted.jobId);
+    provider.submit.mockImplementation(async () => {
+      await setup.store.transitionJob(admitted.jobId, "executing", "canceled");
+      return { kind: "accepted", providerRequestId: "canceled-after-intent" };
+    });
+    await setup.admit(admitted);
+    await setup.arm();
+
+    await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "reconciliation_required" });
+    await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "canceled" });
+    await expect(setup.store.getProviderSubrun(subrunId)).resolves.toMatchObject({ state: "submission_unknown" });
+    await expect(setup.store.getProviderSubrunReference(subrunId)).resolves.toBeNull();
+  });
+
+  it("reconciles a release rollback that wins after durable intent", async () => {
+    const provider = fakeProvider({ kind: "accepted", providerRequestId: "rolled-back-after-intent" });
+    const setup = fixture({ provider });
+    const admitted = setup.job("rollback-after-provider-intent");
+    const subrunId = deriveOpaqueId(IDENTITY_SECRET, "studio-provider-subrun", admitted.jobId);
+    const rollback = new StudioStore({
+      redis: setup.redis,
+      cipher: setup.cipher,
+      identityHashSecret: IDENTITY_SECRET,
+      prefix: `${STUDIO_REDIS_PREFIX}:workflow-executor-test`,
+      releaseStamp: { generation: 2, phase: "dark" },
+    });
+    provider.submit.mockImplementation(async () => {
+      expect(await rollback.advanceReleaseFence(1)).toEqual({ kind: "advanced" });
+      return { kind: "accepted", providerRequestId: "rolled-back-after-intent" };
+    });
+    await setup.admit(admitted);
+    await setup.arm();
+
+    await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "reconciliation_required" });
+    await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "reconciliation_required" });
+    await expect(setup.store.getProviderSubrun(subrunId)).resolves.toMatchObject({ state: "submission_unknown" });
+    await expect(setup.store.getProviderSubrunReference(subrunId)).resolves.toEqual({ providerRequestId: "rolled-back-after-intent" });
   });
 });

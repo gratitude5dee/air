@@ -142,20 +142,31 @@ async function completeProviderSubmission(
   }
 
   const providerOutcome = await submitOnce(runtime, job, payload, begin.subrun.submissionIntentId);
-  const committed = await runtime.store.finishProviderSubmission(subrunId, leaseToken, providerOutcome);
+  const committed = await runtime.store.finishProviderSubmission(subrunId, leaseToken, job, providerOutcome);
   // If the lease expired after the physical provider call, do not infer that
   // the call failed. A later worker will convert the surviving `submitting`
   // intent into `submission_unknown` instead of replaying it.
   if (!committed) return Object.freeze({ kind: "lease_lost" });
 
-  if (providerOutcome.kind === "accepted" && committed.state !== "submitted") {
-    await transitionIfLegal(runtime, job, "reconciliation_required");
-    return Object.freeze({ kind: "reconciliation_required" });
+  if (providerOutcome.kind === "accepted") {
+    // A cancellation or fence transition might win after the durable begin
+    // boundary. The finish Lua transition detects races that occur before its
+    // commit; this reread catches a change immediately after it. Neither case
+    // may be reported as an uncomplicated successful submission.
+    const current = await runtime.store.getJob(job.jobId);
+    if (
+      committed.state !== "submitted"
+      || !current
+      || current.state !== "executing"
+      || current.stateVersion !== job.stateVersion
+    ) {
+      await transitionIfLegal(runtime, job, "reconciliation_required");
+      return Object.freeze({ kind: "reconciliation_required" });
+    }
+    return Object.freeze({ kind: "submitted" });
   }
 
   switch (providerOutcome.kind) {
-    case "accepted":
-      return Object.freeze({ kind: "submitted" });
     case "definitive_rejection":
       await transitionIfLegal(runtime, job, "failed");
       return Object.freeze({ kind: "definitive_rejection" });

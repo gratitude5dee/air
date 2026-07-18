@@ -50,12 +50,14 @@ acknowledgements.
   foundation. It persists one encrypted admission snapshot and durable
   `reserved → submitting` intent at a final durable pre-call boundary, then
   fences that transition against the same shared release generation and current
-  `executing` job version. A rollback or cancellation that happens after this
-  Redis authorization cannot atomically revoke an external provider call and
-  must reconcile conservatively. It deliberately has no live adapter, catalog,
-  upload, polling, output, or recovery path, and no ingress/Cron path invokes
-  it. It would still be inaccurate to claim a production-ready provider
-  integration from this dark-only foundation.
+  `executing` job version. Its completion transition rechecks both values and
+  copies any encrypted provider reference from the source payload's Redis TTL.
+  A rollback or cancellation that happens after this Redis authorization cannot
+  atomically revoke an external provider call and must reconcile
+  conservatively. It deliberately has no live adapter, catalog, upload,
+  polling, output, or recovery path, and no ingress/Cron path invokes it. It
+  would still be inaccurate to claim a production-ready provider integration
+  from this dark-only foundation.
 
 ## Required before canary
 
