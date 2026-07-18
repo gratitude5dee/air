@@ -13,5 +13,16 @@
     "resolveJsonModule": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["agent/**/*.ts", "lib/**/*.ts", "tests/**/*.ts", "vitest.config.ts"]
+  "include": [
+    "api/**/*.ts",
+    "lib/crypto.ts",
+    "lib/redis.ts",
+    "lib/security.ts",
+    "lib/spectrum-webhook.ts",
+    "lib/studio/**/*.ts",
+    "tests/studio/**/*.ts",
+    "tests/unit/crypto.test.ts",
+    "tests/unit/redis-connection.test.ts",
+    "vitest.config.ts"
+  ]
 }

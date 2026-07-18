@@ -1,203 +1,178 @@
-import { access, readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 
-const summaryPath = resolve(".eve/agent-summary.json");
-const drainCron = "* * * * *";
+const ROOT = resolve(".");
+const DRAIN_CRON = "* * * * *";
+const EXPECTED_API_FILES = Object.freeze([
+  "api/healthz.ts",
+  "api/index.ts",
+  "api/internal/drain-inbox.ts",
+  "api/internal/readiness.ts",
+  "api/webhooks/imessage.ts",
+]);
+const EXPECTED_REWRITES = Object.freeze([
+  ["/", "/api"],
+  ["/healthz", "/api/healthz"],
+  ["/webhooks/imessage", "/api/webhooks/imessage"],
+  ["/internal/drain-inbox", "/api/internal/drain-inbox"],
+  ["/internal/readiness", "/api/internal/readiness"],
+]);
 
-/**
- * Eve's summary is the application-owned route registry. Keep it closed: the
- * Vercel Build Output contains framework plumbing (including the opaque cron
- * callback), but it must not gain another Air HTTP dispatch path.
- */
-const expectedChannels = [
-  { name: "ingress", method: "GET", urlPath: "/healthz" },
-  { name: "ingress", method: "POST", urlPath: "/webhooks/imessage" },
-  { name: "ingress", method: "POST", urlPath: "/internal/drain-inbox" },
-];
+/** Packages which would put the retired framework or an LLM runtime on Air's request path. */
+const FORBIDDEN_MODULE_SEGMENTS = new Set([
+  "eve",
+  "zap",
+  "ai",
+  "chat",
+  "openai",
+  "anthropic",
+  "langchain",
+]);
 
-function routeKey(route) {
-  return `${route?.name ?? "<unknown>"} ${route?.method ?? "<unknown>"} ${route?.urlPath ?? "<unknown>"}`;
-}
-
-function requiredArray(summary, field) {
-  const value = summary?.[field];
-  if (!Array.isArray(value)) {
-    throw new Error(`compiled Eve build is missing its ${field} manifest array`);
-  }
-  return value;
-}
-
-function verifyNoDeclarations(summary, field) {
-  const declarations = requiredArray(summary, field);
-  if (declarations.length !== 0) {
-    throw new Error(`compiled Eve build must not declare ${field}`);
-  }
-}
-
-function verifySchedules(summary) {
-  const schedules = requiredArray(summary, "schedules");
-  if (schedules.length !== 1) {
-    throw new Error("compiled Eve build must expose exactly one recovery schedule");
-  }
-  const schedule = schedules[0];
-  if (
-    schedule?.name !== "drain-inbox" ||
-    schedule?.logicalPath !== "schedules/drain-inbox.ts" ||
-    schedule?.cron !== drainCron
-  ) {
-    throw new Error(`compiled Eve recovery schedule must be drain-inbox at ${drainCron}`);
-  }
-}
-
-function verifyChannelSurface(summary) {
-  const channels = requiredArray(summary, "channels");
-  if (channels.length !== expectedChannels.length) {
-    throw new Error("compiled Eve build exposes an unexpected number of channel routes");
-  }
-
-  const expected = new Set(expectedChannels.map(routeKey));
-  const actualCounts = new Map();
-  for (const channel of channels) {
-    const key = routeKey(channel);
-    if (!expected.has(key)) {
-      throw new Error(`compiled Eve build exposes an unexpected channel route: ${key}`);
-    }
-    actualCounts.set(key, (actualCounts.get(key) ?? 0) + 1);
-  }
-  for (const route of expectedChannels) {
-    const key = routeKey(route);
-    if (actualCounts.get(key) !== 1) {
-      throw new Error(`compiled Eve build must register ${key} exactly once`);
-    }
-  }
-}
-
-async function verifyVercelFunctionDuration() {
-  if (!process.env.VERCEL) return;
-  const candidates = [
-    ".vercel/output/functions/__server.func/.vc-config.json",
-    // Eve uses this service-prefixed path only in co-deployed setups; accept
-    // it so the assertion remains valid if this project is later composed.
-    ".vercel/output/functions/eve/__server.func/.vc-config.json",
-  ];
-  let configPath;
-  for (const candidate of candidates) {
-    try {
-      await access(candidate);
-      configPath = candidate;
-      break;
-    } catch {
-      // Try the alternate Eve Build Output layout.
-    }
-  }
-  if (!configPath) throw new Error("Eve Vercel server function config is unavailable");
-  const config = JSON.parse(await readFile(configPath, "utf8"));
-  if (config?.maxDuration !== 60) {
-    throw new Error("Eve Vercel server function duration is not 60 seconds");
-  }
-  if (config?.runtime !== "nodejs24.x") {
-    throw new Error("Eve Vercel server function is not using the required Node.js 24 runtime");
-  }
-}
-
-async function resolveVercelServerEntry() {
-  const candidates = [
-    ".vercel/output/functions/__server.func/index.mjs",
-    // Keep this in lockstep with the co-deployed output layout accepted above.
-    ".vercel/output/functions/eve/__server.func/index.mjs",
-  ];
-  for (const candidate of candidates) {
-    try {
-      await access(candidate);
-      return resolve(candidate);
-    } catch {
-      // Try the alternate Eve Build Output layout.
-    }
-  }
-  throw new Error("Eve Vercel server function entry is unavailable");
-}
-
-/**
- * The Eve framework also declares GET / for its package-name-derived landing
- * page. Air deliberately registers a supported Nitro handler first; execute
- * the actual Vercel function to prove that the public route remains branded
- * and does not regress to the framework home page.
- */
-async function verifyVercelPublicStatusRoute() {
-  if (!process.env.VERCEL) return;
-  const entry = await resolveVercelServerEntry();
-  const module = await import(pathToFileURL(entry).href);
-  const handler = module?.default;
-  if (!handler || typeof handler.fetch !== "function") {
-    throw new Error("Eve Vercel server function does not expose a web fetch handler");
-  }
-  const response = await handler.fetch(new Request("https://air.invalid/"), {
-    waitUntil: () => undefined,
-  });
-  if (response.status !== 200 || !response.headers.get("content-type")?.includes("application/json")) {
-    throw new Error("public GET / route is not the Air status response");
-  }
-  const body = await response.json();
-  if (
-    !body ||
-    body.name !== "Air" ||
-    body.status !== "allowlisted iMessage Seedance video generation"
-  ) {
-    throw new Error("public GET / route is not branded as Air");
-  }
-}
-
-async function verifyVercelCron() {
-  if (!process.env.VERCEL) return;
-  let output;
+async function readJson(path) {
   try {
-    output = JSON.parse(await readFile(".vercel/output/config.json", "utf8"));
+    return JSON.parse(await readFile(resolve(ROOT, path), "utf8"));
+  } catch (error) {
+    throw new Error(`${path} is unavailable or invalid JSON: ${error instanceof Error ? error.message : "unknown error"}`);
+  }
+}
+
+async function collectTypeScriptFiles(path) {
+  let entries;
+  try {
+    entries = await readdir(resolve(ROOT, path), { withFileTypes: true });
   } catch {
-    throw new Error("Vercel Build Output config is unavailable or invalid");
+    throw new Error(`${path} is unavailable`);
   }
-  const crons = output?.crons;
-  if (!Array.isArray(crons) || crons.length !== 1) {
-    throw new Error("Vercel Build Output must expose exactly one cron job");
+  const files = [];
+  for (const entry of entries) {
+    const child = `${path}/${entry.name}`;
+    if (entry.isDirectory()) {
+      files.push(...await collectTypeScriptFiles(child));
+    } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+      files.push(child);
+    }
   }
-  const cron = crons[0];
-  if (
-    cron?.schedule !== drainCron ||
-    typeof cron?.path !== "string" ||
-    !cron.path.startsWith("/eve/v1/cron/")
-  ) {
-    throw new Error(`Vercel Build Output cron must be the Eve drain at ${drainCron}`);
+  return files.sort();
+}
+
+function verifyVercelConfiguration(config) {
+  if (config.installCommand !== "npm ci") {
+    throw new Error("vercel.json must use reproducible npm ci installation");
+  }
+  if (config.buildCommand !== "npm run build") {
+    throw new Error("vercel.json must use npm run build");
+  }
+  if (config?.functions?.["api/**/*.ts"]?.maxDuration !== 60) {
+    throw new Error("every API function must declare maxDuration 60");
+  }
+  if (!Array.isArray(config.crons) || config.crons.length !== 1) {
+    throw new Error("vercel.json must declare exactly one recovery cron");
+  }
+  const cron = config.crons[0];
+  if (cron?.path !== "/internal/drain-inbox" || cron?.schedule !== DRAIN_CRON) {
+    throw new Error(`the recovery cron must be /internal/drain-inbox at ${DRAIN_CRON}`);
+  }
+  if (!Array.isArray(config.rewrites) || config.rewrites.length !== EXPECTED_REWRITES.length) {
+    throw new Error("vercel.json must expose exactly the Air route rewrites");
+  }
+  for (const [index, [source, destination]] of EXPECTED_REWRITES.entries()) {
+    const rewrite = config.rewrites[index];
+    if (rewrite?.source !== source || rewrite?.destination !== destination) {
+      throw new Error(`rewrite ${index + 1} must map ${source} to ${destination}`);
+    }
+  }
+}
+
+function moduleSpecifiers(source) {
+  const specifiers = [];
+  const staticImport = /\b(?:import|export)\s+(?:type\s+)?(?:[\w*$\s,{}]+?\s+from\s+)?["']([^"']+)["']/gu;
+  const dynamicImport = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/gu;
+  for (const pattern of [staticImport, dynamicImport]) {
+    let match;
+    while ((match = pattern.exec(source)) !== null) {
+      const specifier = match[1];
+      if (specifier !== undefined) specifiers.push(specifier);
+    }
+  }
+  return specifiers;
+}
+
+function isForbiddenSpecifier(specifier) {
+  const normalized = specifier.toLowerCase().replace(/^node:/u, "node/");
+  return normalized
+    .split(/[\\/@._-]+/u)
+    .some((segment) => FORBIDDEN_MODULE_SEGMENTS.has(segment));
+}
+
+function verifyNoRetiredRuntimeDependencies(packageJson) {
+  const dependencies = {
+    ...(packageJson.dependencies ?? {}),
+    ...(packageJson.devDependencies ?? {}),
+    ...(packageJson.optionalDependencies ?? {}),
+  };
+  for (const name of Object.keys(dependencies)) {
+    if (isForbiddenSpecifier(name)) {
+      throw new Error(`package.json retains forbidden runtime dependency ${name}`);
+    }
+  }
+}
+
+async function verifyRouteSources() {
+  const actualApiFiles = await collectTypeScriptFiles("api");
+  if (actualApiFiles.length !== EXPECTED_API_FILES.length || actualApiFiles.some((file, index) => file !== EXPECTED_API_FILES[index])) {
+    throw new Error("API surface differs from the approved five Air route files");
+  }
+
+  const sourceFiles = [...actualApiFiles, ...await collectTypeScriptFiles("lib/studio")];
+  for (const file of sourceFiles) {
+    const source = await readFile(resolve(ROOT, file), "utf8");
+    for (const specifier of moduleSpecifiers(source)) {
+      if (isForbiddenSpecifier(specifier)) {
+        throw new Error(`${file} imports forbidden runtime module ${specifier}`);
+      }
+    }
+    // Studio handlers process encrypted-but-sensitive user content. Logging
+    // from this request path is prohibited until a separately reviewed,
+    // redacting telemetry boundary exists.
+    if (/\bconsole\.(?:log|info|warn|error|debug|trace)\s*\(/u.test(source)) {
+      throw new Error(`${file} contains an unsafe request-path console logger`);
+    }
+  }
+
+  const webhookSource = await readFile(resolve(ROOT, "api/webhooks/imessage.ts"), "utf8");
+  if (!webhookSource.includes("handleStudioIMessageWebhook")) {
+    throw new Error("the public webhook must use the signed Studio webhook handler");
+  }
+  const drainSource = await readFile(resolve(ROOT, "api/internal/drain-inbox.ts"), "utf8");
+  if (!drainSource.includes("handleStudioDrain")) {
+    throw new Error("the cron route must use the Studio authorization handler");
+  }
+}
+
+async function verifyTypeScriptSurface() {
+  const tsconfig = await readJson("tsconfig.json");
+  const includes = Array.isArray(tsconfig.include) ? tsconfig.include : [];
+  if (!includes.includes("api/**/*.ts") || !includes.includes("lib/studio/**/*.ts")) {
+    throw new Error("tsconfig must typecheck the Vercel API shell and Studio modules");
+  }
+  if (includes.some((entry) => typeof entry === "string" && entry.split("/").includes("agent"))) {
+    throw new Error("tsconfig must not compile retired agent runtime sources");
   }
 }
 
 async function main() {
-  let summary;
-  try {
-    summary = JSON.parse(await readFile(summaryPath, "utf8"));
-  } catch {
-    throw new Error("Eve build summary is unavailable or invalid");
-  }
-  const tools = requiredArray(summary, "tools");
-
-  const toolNames = tools.map((tool) => tool?.name).filter((name) => typeof name === "string");
-  if (toolNames.length !== 0) {
-    throw new Error("compiled Eve build must not expose model tools");
-  }
-
-  verifyNoDeclarations(summary, "skills");
-  verifyNoDeclarations(summary, "connections");
-  verifyNoDeclarations(summary, "subagents");
-  verifySchedules(summary);
-  verifyChannelSurface(summary);
-
-  await verifyVercelFunctionDuration();
-  await verifyVercelCron();
-  await verifyVercelPublicStatusRoute();
-
-  process.stdout.write("Eve build surface verified.\n");
+  const [vercel, packageJson] = await Promise.all([
+    readJson("vercel.json"),
+    readJson("package.json"),
+  ]);
+  verifyVercelConfiguration(vercel);
+  verifyNoRetiredRuntimeDependencies(packageJson);
+  await Promise.all([verifyRouteSources(), verifyTypeScriptSurface()]);
+  process.stdout.write("Air Studio Vercel surface verified.\n");
 }
 
 void main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : "Eve build verification failed"}\n`);
+  process.stderr.write(`${error instanceof Error ? error.message : "Air Studio build verification failed"}\n`);
   process.exitCode = 1;
 });

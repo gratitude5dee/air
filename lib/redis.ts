@@ -1110,7 +1110,376 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_RATE_LIMIT_V1")) {
       return this.evalRateLimit(options.keys, options.arguments);
     }
+    if (script.includes("AIR_STUDIO_ADMIT_JOB_V2")) {
+      return this.evalStudioAdmitJob(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_PERSIST_INBOX_V2")) {
+      return this.evalStudioPersistInbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_PERSIST_OUTBOX_V2")) {
+      return this.evalStudioPersistOutbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_CLAIM_INBOX_V2")) {
+      return this.evalStudioClaimInbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_FINISH_INBOX_V2")) {
+      return this.evalStudioFinishInbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_RETRY_INBOX_V2")) {
+      return this.evalStudioRetryInbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_CLAIM_OUTBOX_V2")) {
+      return this.evalStudioClaimOutbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_FINISH_OUTBOX_V2")) {
+      return this.evalStudioFinishOutbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V2")) {
+      return this.evalStudioReconcileExpiredOutbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_TRANSITION_JOB_V2")) {
+      return this.evalStudioTransitionJob(options.keys, options.arguments);
+    }
     throw new Error("MemoryRedis does not implement this Lua script");
+  }
+
+  /** Deterministic mirrors for the Air v2 studio Lua primitives. */
+  private evalStudioPersistInbox(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 2, 4);
+    const recordKey = this.studioKey(keys, 0);
+    const readyKey = this.studioKey(keys, 1);
+    const record = this.studioArgument(args, 0);
+    const ttl = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const score = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+    const member = this.studioArgument(args, 3);
+    this.assertStringOrMissing(recordKey);
+    this.assertZSetOrMissing(readyKey);
+    if (this.getEntry(recordKey)) return 0;
+    this.values.set(recordKey, { kind: "string", value: record, expiresAt: this.now() + ttl * 1_000 });
+    this.getZSet(readyKey, true).value.set(member, score);
+    return 1;
+  }
+
+  private evalStudioPersistOutbox(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 3, 5);
+    const recordKey = this.studioKey(keys, 0);
+    const readyKey = this.studioKey(keys, 1);
+    const laneKey = this.studioKey(keys, 2);
+    const record = this.studioArgument(args, 0);
+    const ttl = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const score = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+    const member = this.studioArgument(args, 3);
+    const sequence = this.studioNonnegativeInteger(this.studioArgument(args, 4));
+    this.assertStringOrMissing(recordKey);
+    this.assertZSetOrMissing(readyKey);
+    this.assertZSetOrMissing(laneKey);
+    if (this.getEntry(recordKey)) return 0;
+    const existingSequence = [...(this.getZSet(laneKey, false)?.value.entries() ?? [])]
+      .some(([, scoreAtSequence]) => scoreAtSequence === sequence);
+    if (existingSequence) return -1;
+    this.values.set(recordKey, { kind: "string", value: record, expiresAt: this.now() + ttl * 1_000 });
+    this.getZSet(readyKey, true).value.set(member, score);
+    this.getZSet(laneKey, true).value.set(member, sequence);
+    return 1;
+  }
+
+  private evalStudioAdmitJob(keys: readonly string[], args: readonly string[]): readonly [string, string?] {
+    this.assertStudioArity(keys, args, 4, 8);
+    const activeKey = this.studioKey(keys, 0);
+    const userCountKey = this.studioKey(keys, 1);
+    const spendKey = this.studioKey(keys, 2);
+    const jobKey = this.studioKey(keys, 3);
+    const jobId = this.studioArgument(args, 0);
+    const serializedJob = this.studioArgument(args, 1);
+    const dailyTtl = this.studioPositiveInteger(this.studioArgument(args, 2));
+    const jobTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+    const userLimit = this.studioPositiveInteger(this.studioArgument(args, 4));
+    const spendCap = this.studioNonnegativeInteger(this.studioArgument(args, 5));
+    const cost = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+    const activeTtl = this.studioPositiveInteger(this.studioArgument(args, 7));
+    this.assertStringOrMissing(activeKey);
+    this.assertStringOrMissing(userCountKey);
+    this.assertStringOrMissing(spendKey);
+    this.assertStringOrMissing(jobKey);
+
+    const existing = this.studioString(jobKey);
+    if (existing !== null) return ["existing", existing];
+    if (this.studioString(activeKey) !== null) return ["active_job"];
+    const userCount = this.studioCounter(userCountKey);
+    if (userCount >= userLimit) return ["user_limit"];
+    const spend = this.studioCounter(spendKey);
+    if (spend + cost > spendCap) return ["daily_cap"];
+
+    const now = this.now();
+    this.values.set(activeKey, { kind: "string", value: jobId, expiresAt: now + activeTtl * 1_000 });
+    this.values.set(userCountKey, { kind: "string", value: String(userCount + 1), expiresAt: now + dailyTtl * 1_000 });
+    this.values.set(spendKey, { kind: "string", value: String(spend + cost), expiresAt: now + dailyTtl * 1_000 });
+    this.values.set(jobKey, { kind: "string", value: serializedJob, expiresAt: now + jobTtl * 1_000 });
+    return ["admitted"];
+  }
+
+  private evalStudioClaimInbox(keys: readonly string[], args: readonly string[]): string | false {
+    this.assertStudioArity(keys, args, 3, 5);
+    const recordKey = this.studioKey(keys, 0);
+    const leaseKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const token = this.studioArgument(args, 0);
+    const leaseTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+    const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+    const member = this.studioArgument(args, 4);
+    const record = this.studioRecord(recordKey);
+    if (!record || (record.state !== "received" && record.state !== "claimed")) return false;
+    if (this.studioString(leaseKey) !== null) return false;
+    this.studioSet(leaseKey, token, leaseTtl);
+    record.state = "claimed";
+    record.stateVersion = this.studioStateVersion(record) + 1;
+    this.studioSetRecord(recordKey, record, recordTtl);
+    this.getZSet(readyKey, true).value.set(member, now + leaseTtl);
+    return JSON.stringify(record);
+  }
+
+  private evalStudioFinishInbox(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 3, 5);
+    const recordKey = this.studioKey(keys, 0);
+    const leaseKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const token = this.studioArgument(args, 0);
+    const nextState = this.studioArgument(args, 1);
+    const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+    const member = this.studioArgument(args, 4);
+    if (nextState !== "processed" && nextState !== "maintenance_rejected" && nextState !== "failed") return 0;
+    if (this.studioString(leaseKey) !== token) return 0;
+    const record = this.studioRecord(recordKey);
+    if (!record || record.state !== "claimed") return 0;
+    record.state = nextState;
+    record.stateVersion = this.studioStateVersion(record) + 1;
+    this.studioSetRecord(recordKey, record, recordTtl);
+    this.studioRemoveMember(readyKey, member);
+    this.values.delete(leaseKey);
+    return 1;
+  }
+
+  private evalStudioRetryInbox(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 3, 5);
+    const recordKey = this.studioKey(keys, 0);
+    const leaseKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const token = this.studioArgument(args, 0);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
+    const retryAfter = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+    const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+    const member = this.studioArgument(args, 4);
+    if (this.studioString(leaseKey) !== token) return 0;
+    const record = this.studioRecord(recordKey);
+    if (!record || record.state !== "claimed") return 0;
+    record.state = "received";
+    record.stateVersion = this.studioStateVersion(record) + 1;
+    this.studioSetRecord(recordKey, record, recordTtl);
+    this.getZSet(readyKey, true).value.set(member, now + retryAfter);
+    this.values.delete(leaseKey);
+    return 1;
+  }
+
+  private evalStudioClaimOutbox(keys: readonly string[], args: readonly string[]): string | false {
+    this.assertStudioArity(keys, args, 4, 6);
+    const recordKey = this.studioKey(keys, 0);
+    const leaseKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const laneKey = this.studioKey(keys, 3);
+    const token = this.studioArgument(args, 0);
+    const leaseTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+    const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+    const member = this.studioArgument(args, 4);
+    const maxAttempts = this.studioPositiveInteger(this.studioArgument(args, 5));
+    const record = this.studioRecord(recordKey);
+    if (!record || (record.state !== "intent" && record.state !== "retryable_failure")) return false;
+    const laneHead = [...(this.getZSet(laneKey, false)?.value.entries() ?? [])]
+      .sort(([firstMember, firstSequence], [secondMember, secondSequence]) =>
+        firstSequence === secondSequence ? firstMember.localeCompare(secondMember) : firstSequence - secondSequence,
+      )[0];
+    if (!laneHead || laneHead[0] !== member) return false;
+    const attempts = this.studioAttempts(record);
+    if (record.state === "retryable_failure" && attempts >= maxAttempts) {
+      record.state = "failed";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.studioRemoveMember(readyKey, member);
+      this.studioRemoveMember(laneKey, member);
+      return false;
+    }
+    if (this.studioString(leaseKey) !== null) return false;
+    this.studioSet(leaseKey, token, leaseTtl);
+    record.state = "sending";
+    record.attempts = attempts + 1;
+    record.stateVersion = this.studioStateVersion(record) + 1;
+    record.updatedAtMs = now;
+    this.studioSetRecord(recordKey, record, recordTtl);
+    this.getZSet(readyKey, true).value.set(member, now + leaseTtl);
+    return JSON.stringify(record);
+  }
+
+  private evalStudioFinishOutbox(keys: readonly string[], args: readonly string[]): string | false {
+    this.assertStudioArity(keys, args, 4, 7);
+    const recordKey = this.studioKey(keys, 0);
+    const leaseKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const laneKey = this.studioKey(keys, 3);
+    const token = this.studioArgument(args, 0);
+    let nextState = this.studioArgument(args, 1);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+    const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+    const member = this.studioArgument(args, 4);
+    const maxAttempts = this.studioPositiveInteger(this.studioArgument(args, 5));
+    const backoff = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+    if (nextState !== "sent" && nextState !== "retryable_failure" && nextState !== "failed" && nextState !== "send_unknown") return false;
+    if (this.studioString(leaseKey) !== token) return false;
+    const record = this.studioRecord(recordKey);
+    if (!record || record.state !== "sending") return false;
+    const attempts = this.studioAttempts(record);
+    if (nextState === "retryable_failure" && attempts >= maxAttempts) nextState = "failed";
+    record.state = nextState;
+    record.stateVersion = this.studioStateVersion(record) + 1;
+    record.updatedAtMs = now;
+    this.studioSetRecord(recordKey, record, recordTtl);
+    this.values.delete(leaseKey);
+    if (nextState === "retryable_failure") {
+      this.getZSet(readyKey, true).value.set(member, now + attempts * backoff);
+    } else {
+      this.studioRemoveMember(readyKey, member);
+      if (nextState !== "send_unknown") this.studioRemoveMember(laneKey, member);
+    }
+    return JSON.stringify(record);
+  }
+
+  private evalStudioReconcileExpiredOutbox(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 4, 3);
+    const recordKey = this.studioKey(keys, 0);
+    const leaseKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 0));
+    const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const member = this.studioArgument(args, 2);
+    if (this.studioString(leaseKey) !== null) return 0;
+    const record = this.studioRecord(recordKey);
+    if (!record || record.state !== "sending") return 0;
+    record.state = "send_unknown";
+    record.stateVersion = this.studioStateVersion(record) + 1;
+    record.updatedAtMs = now;
+    this.studioSetRecord(recordKey, record, recordTtl);
+    this.studioRemoveMember(readyKey, member);
+    return 1;
+  }
+
+  private evalStudioTransitionJob(keys: readonly string[], args: readonly string[]): string | false {
+    this.assertStudioArity(keys, args, 2, 7);
+    const jobKey = this.studioKey(keys, 0);
+    const activeKey = this.studioKey(keys, 1);
+    const from = this.studioArgument(args, 0);
+    const expectedVersion = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const to = this.studioArgument(args, 2);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+    const ttl = this.studioPositiveInteger(this.studioArgument(args, 4));
+    const jobId = this.studioArgument(args, 5);
+    const terminal = this.studioArgument(args, 6);
+    const record = this.studioRecord(jobKey);
+    if (!record || record.state !== from || this.studioStateVersion(record) !== expectedVersion) return false;
+    record.state = to;
+    record.stateVersion = expectedVersion + 1;
+    record.updatedAtMs = now;
+    this.studioSetRecord(jobKey, record, ttl);
+    if (terminal === "1" && this.studioString(activeKey) === jobId) this.values.delete(activeKey);
+    return JSON.stringify(record);
+  }
+
+  private assertStudioArity(keys: readonly string[], args: readonly string[], keyCount: number, argCount: number): void {
+    if (keys.length !== keyCount || args.length !== argCount) throw new Error("invalid studio Lua arguments");
+  }
+
+  private studioKey(keys: readonly string[], index: number): string {
+    const value = keys[index];
+    if (!value) throw new Error("invalid studio Redis key");
+    return value;
+  }
+
+  private studioArgument(args: readonly string[], index: number): string {
+    const value = args[index];
+    if (value === undefined) throw new Error("invalid studio Lua argument");
+    return value;
+  }
+
+  private studioPositiveInteger(value: string): number {
+    if (!isCanonicalPositiveInteger(value)) throw new Error("invalid studio integer");
+    const number = Number(value);
+    if (!Number.isSafeInteger(number)) throw new Error("invalid studio integer");
+    return number;
+  }
+
+  private studioNonnegativeInteger(value: string): number {
+    if (!isCanonicalNonnegativeInteger(value)) throw new Error("invalid studio integer");
+    const number = Number(value);
+    if (!Number.isSafeInteger(number)) throw new Error("invalid studio integer");
+    return number;
+  }
+
+  private studioString(key: string): string | null {
+    const entry = this.getEntry(key);
+    if (!entry) return null;
+    if (entry.kind !== "string") throw new Error("Redis key has the wrong type");
+    return entry.value;
+  }
+
+  private studioCounter(key: string): number {
+    const raw = this.studioString(key);
+    if (raw === null) return 0;
+    return this.studioNonnegativeInteger(raw);
+  }
+
+  private studioRecord(key: string): Record<string, unknown> | null {
+    const raw = this.studioString(key);
+    if (raw === null) return null;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid studio record");
+      return parsed as Record<string, unknown>;
+    } catch {
+      throw new Error("invalid studio record");
+    }
+  }
+
+  private studioSet(key: string, value: string, ttlMs: number): void {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 1) throw new Error("invalid studio expiry");
+    this.assertStringOrMissing(key);
+    this.values.set(key, { kind: "string", value, expiresAt: this.now() + ttlMs });
+  }
+
+  private studioSetRecord(key: string, record: Record<string, unknown>, ttlSeconds: number): void {
+    this.studioSet(key, JSON.stringify(record), ttlSeconds * 1_000);
+  }
+
+  private studioStateVersion(record: Record<string, unknown>): number {
+    const version = record.stateVersion;
+    if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) {
+      throw new Error("invalid studio record version");
+    }
+    return version;
+  }
+
+  private studioAttempts(record: Record<string, unknown>): number {
+    const attempts = record.attempts;
+    if (typeof attempts !== "number" || !Number.isSafeInteger(attempts) || attempts < 0) {
+      throw new Error("invalid studio outbox attempts");
+    }
+    return attempts;
+  }
+
+  private studioRemoveMember(key: string, member: string): void {
+    const entry = this.getZSet(key, false);
+    if (!entry) return;
+    entry.value.delete(member);
+    if (entry.value.size === 0) this.values.delete(key);
   }
 
   /** Mirrors the narrow atomic create primitive used by Air's Zap video jobs. */

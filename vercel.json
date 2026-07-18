@@ -1,4 +1,20 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "installCommand": "npm ci --legacy-peer-deps"
+  "installCommand": "npm ci",
+  "buildCommand": "npm run build",
+  "functions": {
+    "api/**/*.ts": {
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    { "source": "/", "destination": "/api" },
+    { "source": "/healthz", "destination": "/api/healthz" },
+    { "source": "/webhooks/imessage", "destination": "/api/webhooks/imessage" },
+    { "source": "/internal/drain-inbox", "destination": "/api/internal/drain-inbox" },
+    { "source": "/internal/readiness", "destination": "/api/internal/readiness" }
+  ],
+  "crons": [
+    { "path": "/internal/drain-inbox", "schedule": "* * * * *" }
+  ]
 }

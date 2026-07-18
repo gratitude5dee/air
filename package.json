@@ -8,32 +8,23 @@
     "npm": ">=10"
   },
   "scripts": {
-    "postinstall": "node scripts/patch-eve-logging.mjs",
-    "build": "node scripts/patch-eve-logging.mjs && eve build && npm run verify:build",
-    "dev": "eve dev --no-ui",
-    "start": "eve start",
+    "build": "npm run typecheck && npm run verify:build",
+    "dev": "vercel dev",
+    "start": "vercel dev",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm test",
-    "ops:send-unknown": "node scripts/report-send-unknown.mjs",
     "verify:build": "node scripts/verify-build.mjs"
   },
   "dependencies": {
-    "@photon-ai/chat-adapter-imessage": "3.0.1",
-    "@spectrum-ts/core": "^10.0.0",
-    "@spectrum-ts/imessage": "^10.0.0",
     "@upstash/redis": "1.38.0",
-    "ai": "7.0.28",
-    "chat": "4.34.0",
-    "eve": "0.24.3",
-    "heic-convert": "^2.1.0",
     "redis": "5.11.0",
     "zod": "4.4.3"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "typescript": "7.0.2",
+    "typescript": "^6.0.3",
     "vitest": "4.1.10"
   }
 }
