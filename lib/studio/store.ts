@@ -1277,7 +1277,10 @@ const JOB_TRANSITIONS: Readonly<Record<StudioJobState, readonly StudioJobState[]
   delivering: ["delivered", "failed", "reconciliation_required"],
   delivered: [],
   failed: [],
-  canceled: [],
+  // A provider may have accepted just as cancellation won the shared-state
+  // race. Escalate only to a no-retry audit state; this never restores the
+  // scrubbed payload, active-job marker, or delivery eligibility.
+  canceled: ["reconciliation_required"],
   maintenance_rejected: [],
   reconciliation_required: ["executing", "delivering", "delivered", "failed", "canceled"],
 });

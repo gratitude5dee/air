@@ -54,7 +54,9 @@ acknowledgements.
   copies any encrypted provider reference from the source payload's Redis TTL.
   A rollback or cancellation that happens after this Redis authorization cannot
   atomically revoke an external provider call and must reconcile
-  conservatively. It deliberately has no live adapter, catalog, upload,
+  conservatively; a raced cancellation may escalate only to a no-retry audit
+  state and never restores the scrubbed payload or delivery eligibility. It
+  deliberately has no live adapter, catalog, upload,
   polling, output, or recovery path, and no ingress/Cron path invokes it. It
   would still be inaccurate to claim a production-ready provider integration
   from this dark-only foundation.

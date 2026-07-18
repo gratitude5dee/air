@@ -374,9 +374,31 @@ describe("Air provider submission executor", () => {
     await setup.arm();
 
     await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "reconciliation_required" });
-    await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "canceled" });
+    await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "reconciliation_required" });
     await expect(setup.store.getProviderSubrun(subrunId)).resolves.toMatchObject({ state: "submission_unknown" });
     await expect(setup.store.getProviderSubrunReference(subrunId)).resolves.toBeNull();
+  });
+
+  it("escalates a cancellation observed after provider completion into durable reconciliation", async () => {
+    const provider = fakeProvider({ kind: "accepted", providerRequestId: "canceled-after-finish" });
+    const setup = fixture({ provider });
+    const admitted = setup.job("canceled-after-provider-finish");
+    const subrunId = deriveOpaqueId(IDENTITY_SECRET, "studio-provider-subrun", admitted.jobId);
+    const finish = setup.store.finishProviderSubmission.bind(setup.store);
+    vi.spyOn(setup.store, "finishProviderSubmission").mockImplementation(async (subrunIdArg, leaseToken, job, outcome) => {
+      const committed = await finish(subrunIdArg, leaseToken, job, outcome);
+      await setup.store.transitionJob(admitted.jobId, "executing", "canceled");
+      return committed;
+    });
+    await setup.admit(admitted);
+    await setup.arm();
+
+    await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "reconciliation_required" });
+    const reconciled = await setup.store.getJob(admitted.jobId);
+    expect(reconciled).toMatchObject({ state: "reconciliation_required" });
+    expect(reconciled?.encryptedPayload).toBeUndefined();
+    await expect(setup.store.getProviderSubrun(subrunId)).resolves.toMatchObject({ state: "submitted" });
+    await expect(setup.store.getProviderSubrunReference(subrunId)).resolves.toEqual({ providerRequestId: "canceled-after-finish" });
   });
 
   it("reconciles a release rollback that wins after durable intent", async () => {

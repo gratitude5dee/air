@@ -32,15 +32,17 @@ workflow/model snapshot, the executor:
 5. Converts a definitive rejection to a known terminal state. Any thrown,
    timed-out, lost-lease, or recovered-in-flight outcome becomes
    `submission_unknown` / job `reconciliation_required`; it is never blindly
-   resubmitted.
+   resubmitted. A cancellation that races a provider acceptance can escalate
+   from `canceled` to this audit-only state, but never restores its scrubbed
+   payload, active-job marker, or delivery eligibility.
 
 The in-memory Redis test double mirrors both new Lua transitions. Current test
 coverage includes dark no-op behavior, intent-before-submit ordering, accepted
 idempotency, definitive rejection, ambiguous outcomes, a crash after intent,
 release rollback before submit, cancellation that wins before the pre-call
 boundary, cancellation and rollback after durable intent, source-payload TTL
-loss at completion, capped provider-reference retention, and expired or
-expiring encrypted job snapshots.
+loss at completion, cancellation observed after provider completion, capped
+provider-reference retention, and expired or expiring encrypted job snapshots.
 
 ## What is intentionally absent
 
