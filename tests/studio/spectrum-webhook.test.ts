@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   decodeWebhookJson,
+  hasActionableInboundContent,
   MAX_WEBHOOK_BODY_BYTES,
   normalizeSpectrumWebhook,
   readRawBodyLimited,
@@ -81,6 +82,23 @@ describe("Spectrum webhook core guards", () => {
     (contradictory.space as { type: string }).type = "group";
     expect(() => normalizeSpectrumWebhook({ payload: contradictory, projectId: "project", webhookId: "delivery" }))
       .toThrow(WebhookInputError);
+  });
+
+  it("distinguishes actionable normalized content from message-shaped non-content events", () => {
+    const reaction = payload();
+    (reaction.message as { content: unknown }).content = { type: "reaction", emoji: "👍" };
+    const normalizedReaction = normalizeSpectrumWebhook({ payload: reaction, projectId: "project", webhookId: "reaction" });
+    expect(normalizedReaction).not.toBeNull();
+    expect(hasActionableInboundContent(normalizedReaction!)).toBe(false);
+
+    const repliedAttachment = payload();
+    (repliedAttachment.message as { content: unknown }).content = {
+      type: "reply",
+      content: { type: "attachment", id: "reply-attachment", mimeType: "image/jpeg", size: 321 },
+    };
+    const normalizedReply = normalizeSpectrumWebhook({ payload: repliedAttachment, projectId: "project", webhookId: "reply" });
+    expect(normalizedReply).not.toBeNull();
+    expect(hasActionableInboundContent(normalizedReply!)).toBe(true);
   });
 
   it("decodes only valid JSON after raw verification", () => {

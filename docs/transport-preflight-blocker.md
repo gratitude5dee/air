@@ -1,41 +1,42 @@
-# iMessage transport preflight — blocked for review
+# iMessage transport preflight — delivery-only evidence
 
-This is a deliberate stop record required by the Fable v2.1 Section 8.2
-transport preflight. It does not authorize a real line, SDK install, webhook
-change, or iMessage send.
+This record constrains Air's first real-line test. It does **not** authorize
+image/video generation, a provider call, attachment delivery, or any paid
+operation.
 
-## Observed at `76c53992fddd4c606dc53a6c038415f0ce027ce8`
+## Reviewed implementation
 
-- The current direct-studio manifest contains only Redis and validation
-  dependencies; it does not include a Spectrum/Photon iMessage SDK or the
-  withdrawn legacy `@photon-ai/chat-adapter-imessage` package.
-- `StudioRuntime` intentionally constructs `UnverifiedPhotonTransport`. Its
-  physical send, tapback, attachment-fetch, and reply operations fail closed.
-- The branch retains encrypted `chatGuid`, sending line, and attachment GUID
-  references, but has no SDK-proven way to rehydrate a space/message, fetch
-  bytes, start/stop typing, resolve a native reply, send a local Buffer, or
-  prove shared-pool pacing/idempotency behavior.
-- No Photon credential, iMessage webhook, or real device was contacted during
-  this inspection.
+- `lib/studio/photon-transport.ts` uses the direct Photon iMessage client,
+  rather than the retired Chat adapter or Spectrum's high-level `space.send`.
+- The encrypted inbound `chatGuid` and sending line select the exact cloud
+  client. Each outbound text receives Air's durable outbox ID as
+  `clientMessageId`.
+- Client-side automatic retry and generated idempotency are disabled. A
+  rejected physical send is retained as `send_unknown` and is never replayed
+  automatically. Token/client lookup failure before an RPC is the only
+  retryable transport result.
+- The narrow `@photon-ai/advanced-imessage` build exception is limited to this
+  file. It is a direct iMessage transport primitive, not an LLM or Chat
+  runtime. The generic no-Chat/no-LLM guard remains in force everywhere else.
+- Process-wide OTLP exporters and non-silent `LOG_LEVEL` fail startup before a
+  Photon module is dynamically imported. No inbound SDK subscription or
+  handler is initialized; Air's signed webhook remains authoritative.
+- Attachment upload/fetch, tapbacks, native reply delivery, and all media
+  paths fail closed.
 
-## Why implementation stops here
+## Required real-line evidence before claiming success
 
-The legacy production baseline previously declared Spectrum 10 packages and a
-withdrawn adapter, while the direct-studio branch has neither. That is a
-material mismatch with the Fable transport assumption. Inventing a replacement
-API from memory would risk duplicate sends, incorrect attachment semantics, or
-an unsafe webhook path.
+1. Deploy the delivery-only configuration with provider/job switches false,
+   zero spend caps, and no GMI credential.
+2. Confirm protected readiness is healthy only after the shared release fence
+   has been explicitly advanced.
+3. Point the existing Photon project webhook at
+   `https://air.wzrd.tech/webhooks/imessage` with the matching signing secret.
+4. The owner sends `/help` from the existing allowlisted number. Automation
+   does not send the test message.
+5. Record only coarse outcome evidence: signed receipt accepted, Cron/current
+   drain processed it, and one text reply arrived. Do not retain message
+   bodies, phone numbers, webhook payloads, or secrets in this repository.
 
-## Required next evidence
-
-1. The owner must identify or approve the exact current Photon/Spectrum SDK
-   package and version to inspect locally.
-2. An offline adapter conformance spike must freeze the actual API surface for
-   space/message rehydration, typing deadlines, reply fallback, GUID fetch,
-   Buffer/stream delivery, tapback semantics, idempotency, and size/pacing
-   limits.
-3. A separately approved, bounded real-line/iPhone test must prove those facts
-   before `transport.verified` or `AIR_DELIVERY_ENABLED` can ever be true.
-
-Until then, the dark transport is intentional and all physical delivery
-remains disabled.
+If any send is ambiguous, stop automatic delivery and reconcile the opaque
+outbox state before another attempt.

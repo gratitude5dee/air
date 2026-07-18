@@ -1,86 +1,80 @@
-# Air dark-deployment runbook
+# Air delivery-only iMessage release runbook
 
-This runbook is deliberately narrow. It prepares a dark preview in the
-existing Vercel project; it does not authorize an iMessage webhook change,
-provider call, iMessage delivery, canary, production promotion, or creation
-of infrastructure.
+This procedure makes `air.wzrd.tech` available for one allowlisted, text-only
+iMessage smoke test. It does not authorize image/video generation, provider
+submission/recovery, uploads, polling, artifact delivery, or any paid action.
+The owner sends the test text; release automation never sends an iMessage.
 
-## Before deployment
+## Preconditions
 
-1. Work from the dedicated Git branch and confirm the project remains the
-   existing Vercel project named `air`.
-2. Run `npm ci`, `npm run typecheck`, `npm test`, and `npm run build`.
-3. Configure only the existing Redis and Photon secrets needed for an
-   encrypted, signed dark shell. Keep `GMI_API_KEY` absent.
-4. Set all release switches explicitly to `false`, set
-   `AIR_RELEASE_PHASE=dark`, and set `AIR_RELEASE_GENERATION=0`. Set
-   `AIR_MODEL_REGISTRY_VERSION=2.1.0`; leave `AIR_RELEASE_FENCE_SECRET` absent
-   unless a separately approved operator fence exercise is in scope.
-5. Do not set an upstream Photon/Spectrum webhook URL. The webhook endpoint
-   exists for a later signed-fixture test but must not receive real traffic in
-   this phase.
+1. Work from the existing Vercel project named `air`; do not create a new
+   project or replace the existing Redis/Photon resources.
+2. Run `npm ci`, `npm run typecheck`, `npm test`, and `npm run build` from the
+   exact revision being deployed.
+3. Configure the existing signed-ingress and privacy fields in Vercel:
+   `IMESSAGE_PROJECT_ID`, `IMESSAGE_PROJECT_SECRET`,
+   `IMESSAGE_WEBHOOK_SECRET`, Redis credentials, `AIR_ID_HASH_SECRET`,
+   `AIR_QUEUE_ENCRYPTION_KEY`, `AIR_ALLOWED_SENDER_HASHES`, `CRON_SECRET`, and
+   `AIR_MODEL_REGISTRY_VERSION=2.1.0`.
+4. Use this exact effective side-effect policy:
 
-## Preview verification
+   ```text
+   AIR_RELEASE_PHASE=production
+   AIR_RELEASE_GENERATION=1
+   AIR_RELEASE_FENCE_SECRET=<independent operator secret>
+   AIR_ACCEPT_NEW_JOBS=false
+   AIR_ALLOW_PROVIDER_SUBMIT=false
+   AIR_ALLOW_PROVIDER_RECOVERY=false
+   AIR_DELIVERY_ENABLED=true
+   AIR_JOB_SPEND_CAP_USD=0
+   AIR_DAILY_SPEND_CAP_USD=0
+   AIR_CANARY_TOTAL_CAP_USD=0
+   AIR_CANARY_FAL_CAP_USD=0
+   ```
 
-Deploy a preview from the existing Vercel project. Check only non-billable
-surfaces:
+   Keep `GMI_API_KEY` absent. Do not enable a model or alter the zero-model
+   registry.
+5. Confirm `LOG_LEVEL` is unset or `silent`; do not configure OTLP exporters.
+   The runtime fails closed if either could emit sensitive Photon metadata.
 
-- `GET /` returns the minimal Air status with `cache-control: no-store`.
-- `GET /healthz` returns `{ "ok": true, "version": "2" }`.
-- An unauthenticated request to `/internal/drain-inbox` or
-  `/internal/readiness` returns `401` without a body containing configuration
-  details. Readiness is GET-only; drain also accepts POST for manual recovery.
-- `POST /internal/release-fence` is not part of preview verification. It
-  requires its own bearer secret and a strict `If-Match` compare-and-swap
-  generation; an unauthenticated POST returns `401`, while a GET is
-  deliberately `405 Allow: POST`. Do not arm or advance it during this dark
-  preview.
-- An authorized request to `/internal/readiness` shows `transport_unverified`
-  and `no_enabled_models`; that is the expected dark state. With Redis
-  configured, preview readiness reports `redis: "reachable"` and
-  `cron: "not_scheduled"`: Vercel only runs configured Cron jobs on a
-  production deployment.
-- A successful authenticated `GET /internal/drain-inbox` records a
-  environment-scoped Redis heartbeat after the drain completes. Manual `POST`
-  recovery never updates it. On production, readiness distinguishes a missing
-  or invalid marker from `cron: "stale"` after three missed minute beats; a
-  bearer-authenticated GET is still not a substitute for verifying Vercel's
-  scheduler behavior in deployment logs.
+## Deploy and arm
 
-Do not use an actual GMI key, make a model catalog call, or send an iMessage
-while doing these checks. A signed webhook fixture is a later gate and must use
-non-production credentials and a deliberate owner approval.
+1. Deploy the verified revision to the existing production Vercel project and
+   verify `/healthz` at `https://air.wzrd.tech` reports Air Studio version 2.
+2. Check protected `/internal/readiness`. Before the shared fence is advanced,
+   a send path must not be treated as live.
+3. Explicitly create/advance the shared fence through
+   `POST /internal/release-fence`, authenticated with
+   `AIR_RELEASE_FENCE_SECRET` and literal `If-Match: -1` for generation 1.
+   A deployment or Cron invocation never arms the fence by itself.
+4. Wait for Vercel's production minute Cron, then verify protected readiness
+   reports a fresh Cron heartbeat, verified transport, zero enabled models,
+   and no provider problem.
+5. In the Photon dashboard, set the existing project's signed webhook target
+   to `https://air.wzrd.tech/webhooks/imessage` with the existing matching
+   signing secret. The Photon CLI has no webhook-management command.
 
-## Rollback
+## Owner smoke test
 
-The dark shell has no provider or delivery side effects. If the preview is
-unhealthy, leave it unpromoted and return traffic to the currently promoted
-deployment. Do not delete Redis records or alter the existing iMessage project
-as a rollback shortcut.
+From the existing allowlisted iMessage number, send `/help` to Air. Confirm
+one text response arrives. This may take one Cron interval after the signed
+webhook receipt is accepted. Do not send an image, video, attachment, or a
+generation command during this release.
 
-## Canary and production prerequisites
+## Stop and rollback
 
-Do not change the release phase or kill switches until separate Fable approval
-records a bounded budget and all of the following evidence:
+- If readiness is unhealthy, the webhook signature is invalid, a send becomes
+  `send_unknown`, or any unexpected provider activity is observed, stop the
+  smoke test. Do not resend automatically.
+- Disable delivery with a new higher release generation and explicit shared
+  fence transition before restoring the prior Vercel deployment/alias. A
+  stale worker must never deliver an older generation's outbox item.
+- Do not delete Redis records, rotate secrets blindly, or create a replacement
+  Photon/Vercel project as a rollback shortcut.
 
-1. An authenticated GMI catalog/detail snapshot validates the exact selected
-   model, request schema, input hosting rule, output contract, and current
-   price.
-2. The registry contains only that verified enabled model and an exact default;
-   the version is committed and matches `AIR_MODEL_REGISTRY_VERSION`.
-3. Provider fixture tests prove that `429`, `5xx`, timeout, malformed success,
-   and ambiguous delivery never resubmit automatically.
-4. A real-line Photon transport spike proves sending, attachment fetch, reply
-   threading, typing, and explicit `send_unknown` handling on an allowlisted
-   iPhone.
-5. A limited canary has explicit per-job, daily, and total caps with an
-   approved budget identifier. Production requires another explicit approval.
-6. An authenticated shared Redis release-generation fence is deployed and
-   operated with a written rollback procedure. The current implementation
-   stamps every Studio outbox intent and rejects an older generation at
-   creation, claim, and final dispatch; no deployment or Cron run advances the
-   fence automatically. The provider executor must implement the equivalent
-   per-intent fence before it can be enabled, and the complete procedure must
-   pass a bounded real-line rollback drill. A per-conversation pending fence is
-   not a substitute for this global protection of onboarding, help, status,
-   and maintenance responses.
+## Future provider work remains prohibited
+
+Any later image/video capability requires a separate explicit approval,
+authenticated catalog/schema/pricing evidence, a bounded budget, provider
+release fencing, and a real-media delivery review. None of those gates are
+part of this text-only release.

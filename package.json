@@ -18,6 +18,8 @@
     "verify:build": "node scripts/verify-build.mjs"
   },
   "dependencies": {
+    "@photon-ai/advanced-imessage": "1.0.0",
+    "@spectrum-ts/core": "10.0.0",
     "@upstash/redis": "1.38.0",
     "redis": "5.11.0",
     "zod": "4.4.3"

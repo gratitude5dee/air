@@ -93,6 +93,13 @@ export function loadStudioEnvironment(source: EnvironmentSource = process.env): 
 
   const redisUrl = optional(source.REDIS_URL);
   if (redisUrl !== undefined) validateRedisUrl(redisUrl);
+  // The REST pair is an additive path to the existing durable store, not an
+  // instruction to silently replace a configured TCP resource.  Upstash uses
+  // the same database hostname for its REST and TLS endpoints; anything else
+  // is ambiguous and could split receipts, fences, and spend ledgers.
+  if (restUrl !== undefined && redisUrl !== undefined && !sameRedisResourceHost(restUrl, redisUrl)) {
+    throw new Error("UPSTASH_REDIS_REST_URL and REDIS_URL must target the same Redis resource");
+  }
   const storageTransport: StorageTransport = restUrl !== undefined
     ? "rest"
     : redisUrl !== undefined
@@ -342,6 +349,31 @@ function validateRedisUrl(value: string): void {
   if ((url.protocol !== "redis:" && url.protocol !== "rediss:") || !url.hostname || url.username) {
     throw new Error("REDIS_URL is invalid");
   }
+}
+
+/**
+ * This conservative proof intentionally accepts only a shared normalized
+ * hostname.  A custom alias or different host may still reach the same data,
+ * but Air cannot establish that safely from configuration alone, so it fails
+ * closed instead of selecting one durable control plane by accident.
+ */
+function sameRedisResourceHost(restUrl: string, redisUrl: string): boolean {
+  const rest = new URL(restUrl);
+  const tcp = new URL(redisUrl);
+  return normalizedHostname(rest.hostname) === normalizedHostname(tcp.hostname)
+    // A REST base and a TCP logical DB selector have no portable equivalence
+    // proof. Accept only the root database form rather than silently splitting
+    // a shared host into separate Air control planes.
+    && normalizedRedisPath(rest.pathname) === "/"
+    && normalizedRedisPath(tcp.pathname) === "/";
+}
+
+function normalizedHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/\.$/u, "");
+}
+
+function normalizedRedisPath(pathname: string): string {
+  return pathname || "/";
 }
 
 function validatePublicBaseUrl(value: string): void {

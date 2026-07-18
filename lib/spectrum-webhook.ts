@@ -50,6 +50,16 @@ export type NormalizedIMessageEnvelope = {
   readonly receivedAt: number;
 };
 
+/**
+ * Only normalized text or attachment content is actionable for Air.  Spectrum
+ * delivers reactions, typing, membership, and other message-shaped events
+ * through the same signed event family; none may become an encrypted receipt
+ * or trigger onboarding merely because their outer event is `messages`.
+ */
+export function hasActionableInboundContent(envelope: Pick<NormalizedIMessageEnvelope, "text" | "attachments">): boolean {
+  return envelope.text !== null || envelope.attachments.length > 0;
+}
+
 const nonEmptyString = z.string().trim().min(1).max(4_096);
 
 const webhookPayloadSchema = z.object({

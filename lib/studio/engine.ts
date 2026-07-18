@@ -64,7 +64,7 @@ const HELP_TEXT = [
 
 const ONBOARDING_BUBBLES = Object.freeze([
   "Hey — I’m Air by WZRD ⚡ Your image + video studio in iMessage.",
-  "Create with /imagine, /animate, /edit-image, or /edit-video. Try: /imagine a chrome hummingbird at sunrise. Settings: /model-settings • Help: /help. This dark deployment accepts no work; any later approved provider path will disclose its media-retention terms.",
+  "Create with /imagine, /animate, /edit-image, or /edit-video. Try: /imagine a chrome hummingbird at sunrise. Settings: /model-settings • Help: /help. Generation is currently unavailable while Air completes provider review; any later approved path will disclose its media-retention terms.",
 ] as const);
 
 type StoredModeSettings = {
@@ -268,6 +268,16 @@ async function processInbox(runtime: StudioRuntime, record: StudioInboxRecord): 
   // receipt cancels any older intent and prevents a stale active-phase worker
   // from recreating it after this receipt has completed.
   if (!canAcceptStudioJobs(runtime.environment)) {
+    // `/cancel` has one exception: when a pre-submission job is active it
+    // targets that job and must leave an unrelated pending media reference
+    // untouched. Do this before the rollback maintenance fence can clear it.
+    if (envelope.text !== null && envelope.attachments.length === 0) {
+      const parsed = parseStudioCommand(envelope.text);
+      if (parsed.kind === "command" && parsed.command.kind === "cancel") {
+        const activeJob = await runtime.store.getActiveJob(record.senderHash);
+        if (activeJob) return handleCancelCommand(runtime, record, envelope, activeJob);
+      }
+    }
     const pendingFence = await runtime.store.blockPendingForMaintenance(record);
     if (pendingFence.kind === "canceled") {
       await enqueueResponse(
@@ -430,31 +440,22 @@ async function handleCommand(
       await enqueueResponse(runtime, record, envelope, "privacy", privacyText());
       return "processed";
     case "status":
-      await enqueueResponse(
-        runtime,
-        record,
-        envelope,
-        "status",
-        "No active or recent jobs are available in this dark deployment. Use /help for the command reference.",
-      );
-      return "processed";
+      {
+        const activeJob = await runtime.store.getActiveJob(record.senderHash);
+        const text = activeJob
+          ? activeJobStatusText(activeJob)
+          : "No active or recent jobs are available in this deployment. Use /help for the command reference.";
+        await enqueueResponse(
+          runtime,
+          record,
+          envelope,
+          "status",
+          text,
+        );
+        return "processed";
+      }
     case "cancel": {
-      // The dark pre-fence above has already made this same receipt the
-      // newest maintenance tombstone. Do not report that a truthful cancel is
-      // stale simply because a dark deployment has no live pending state.
-      if (!canAcceptStudioJobs(runtime.environment)) {
-        await enqueueResponse(runtime, record, envelope, "cancel-none-maintenance", "There is no pending request to cancel.");
-        return "maintenance_rejected";
-      }
-      const canceled = await runtime.store.clearPending(record);
-      if (canceled.kind === "canceled") {
-        await enqueueResponse(runtime, record, envelope, "cancel-pending", "Canceled the pending request. No generation was submitted.");
-      } else if (canceled.kind === "stale") {
-        await enqueueResponse(runtime, record, envelope, "cancel-stale", "That cancellation command is no longer current. Send /cancel again to cancel the latest pending request.");
-      } else {
-        await enqueueResponse(runtime, record, envelope, "cancel-none", "There is no pending request to cancel.");
-      }
-      return "processed";
+      return handleCancelCommand(runtime, record, envelope);
     }
     case "models":
       await enqueueResponse(
@@ -470,6 +471,71 @@ async function handleCommand(
     case "create":
       return handleCreation(runtime, record, envelope, settings, attachment, command.mode, command.prompt);
   }
+}
+
+/**
+ * Cancels a durable job only before the executor wins `admitted → executing`.
+ * The store commits the terminal transition and the cancellation outbox intent
+ * together. Once execution has started, reporting a confirmed cancellation
+ * would risk lying about a provider submission that may already exist.
+ */
+async function handleCancelCommand(
+  runtime: StudioRuntime,
+  record: StudioInboxRecord,
+  envelope: ReturnType<StudioRuntime["store"]["decryptInboxEnvelope"]>,
+  activeJobHint?: StudioJobRecord,
+): Promise<InboxDisposition> {
+  const cancellationOutboxId = stableRecordId(record.receiptId, "cancel-active-job");
+  const existingCancellation = await runtime.store.getOutbox(cancellationOutboxId);
+  if (
+    existingCancellation?.outboxId === cancellationOutboxId
+    && existingCancellation.lane === "request-response"
+    && existingCancellation.jobId !== undefined
+  ) return "processed";
+
+  let activeJob = activeJobHint ?? await runtime.store.getActiveJob(record.senderHash);
+  for (let attempt = 0; activeJob?.state === "admitted" && attempt < 2; attempt += 1) {
+    const canceled = await runtime.store.cancelAdmittedJobWithNotification({
+      job: activeJob,
+      notification: Object.freeze({
+        outboxId: cancellationOutboxId,
+        payload: responsePayload(envelope, "Canceled your queued request. No generation was submitted."),
+      }),
+    });
+    if (canceled === "canceled") return "processed";
+    if (canceled === "release_blocked" || canceled === "unavailable") {
+      await enqueueResponse(
+        runtime,
+        record,
+        envelope,
+        "cancel-active-unavailable",
+        "I couldn’t safely cancel that request. Send /status and try /cancel again in this conversation.",
+      );
+      return "processed";
+    }
+    activeJob = await runtime.store.getActiveJob(record.senderHash);
+  }
+
+  if (activeJob) {
+    await enqueueResponse(
+      runtime,
+      record,
+      envelope,
+      "cancel-active-started",
+      "Your request has already started, so I can’t confirm a cancellation. I’ll send a truthful update here when its outcome is known.",
+    );
+    return "processed";
+  }
+
+  const canceledPending = await runtime.store.clearPending(record);
+  if (canceledPending.kind === "canceled") {
+    await enqueueResponse(runtime, record, envelope, "cancel-pending", "Canceled the pending request. No generation was submitted.");
+  } else if (canceledPending.kind === "stale") {
+    await enqueueResponse(runtime, record, envelope, "cancel-stale", "That cancellation command is no longer current. Send /cancel again to cancel the latest pending request.");
+  } else {
+    await enqueueResponse(runtime, record, envelope, "cancel-none", "There is no pending request to cancel.");
+  }
+  return "processed";
 }
 
 async function handleCreation(
@@ -843,7 +909,7 @@ function modelsText(mode: StudioMode | null, registry: AirModelRegistry = AIR_MO
   const models = listEnabledModels(registry, mode);
   if (models.length === 0) {
     return mode === null
-      ? "No verified models are enabled in this dark deployment. Candidate names are not selectable until catalog, schema, price, and privacy review complete."
+      ? "No verified models are enabled in this deployment. Candidate names are not selectable until catalog, schema, price, and privacy review complete."
       : noModelText(mode);
   }
   return models.map((model) => `${model.slug} — ${model.displayName}`).join("\n");
@@ -912,8 +978,26 @@ function mediaKindFromAttachment(attachment: StudioAttachmentReference): "none" 
   return "none";
 }
 
+/** Never expose a provider ID, model ID, cost, or transport claim through `/status`. */
+function activeJobStatusText(job: StudioJobRecord): string {
+  switch (job.state) {
+    case "admitted":
+      return "Your request is queued. I’ll send it here when it’s ready.";
+    case "executing":
+      return "Your request is being generated. I’ll send it here when its outcome is known.";
+    case "ready":
+      return "Your result is ready and awaiting delivery.";
+    case "delivering":
+      return "Your result is being delivered.";
+    case "reconciliation_required":
+      return "Your request needs a manual safety check. Air will not submit or send it again automatically.";
+    default:
+      return "Your request is changing state. Send /status again shortly for a truthful update.";
+  }
+}
+
 function privacyText(): string {
-  return "Air is private and allowlist-only. In this dark deployment, Air keeps encrypted pending media references for up to 10 minutes and accepts no generation work. No provider model is enabled, so Air is not sending media to a generation provider. Any later approved path must disclose provider retention terms and limit Air-owned accepted-work references to 24 hours. Avoid sending sensitive media.";
+  return "Air is private and allowlist-only. This deployment accepts no generation work and is not sending media to a generation provider. Any later approved path must disclose provider retention terms and limit Air-owned accepted-work references to 24 hours. Avoid sending sensitive media.";
 }
 
 async function enqueueMaintenanceNotice(

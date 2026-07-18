@@ -72,10 +72,13 @@ export async function handleStudioReadiness(
 
   const enabledModels = listEnabledModels(AIR_MODEL_REGISTRY).length;
   const problems = [...studioReadinessProblems(environment, AIR_MODEL_REGISTRY_VERSION)];
-  // The only bundled transport intentionally fails closed until the required
-  // real-line Photon transport spike has passed.
-  problems.push("transport_unverified");
-  if (enabledModels === 0) problems.push("no_enabled_models");
+  // A delivery-only release is intentionally healthy with no provider or
+  // selectable model. Requiring either before its policy is enabled would
+  // misreport the safe, zero-provider iMessage smoke path as broken.
+  const providerWorkEnabled = canAcceptStudioJobs(environment)
+    || canSubmitStudioProvider(environment)
+    || canRecoverStudioProvider(environment);
+  if (canAcceptStudioJobs(environment) && enabledModels === 0) problems.push("no_enabled_models");
 
   let redis: "reachable" | "unreachable" | "unknown" = "unknown";
   let cron: "fresh" | "stale" | "missing" | "invalid" | "not_scheduled" | "unreachable" | "unknown" = "unknown";
@@ -94,7 +97,8 @@ export async function handleStudioReadiness(
     try {
       const freshness = await runtime.store.getCronFreshness(environment.deploymentMode);
       redis = "reachable";
-      if (!runtime.provider?.verified) problems.push("provider_unprovisioned");
+      if (!runtime.transport.verified) problems.push("transport_unverified");
+      if (providerWorkEnabled && !runtime.provider.verified) problems.push("provider_unprovisioned");
       // Vercel only schedules Cron jobs on production deployments. Preview and
       // development readiness still verify Redis but must not claim a missed
       // scheduled invocation.

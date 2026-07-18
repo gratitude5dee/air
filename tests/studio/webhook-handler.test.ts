@@ -53,6 +53,7 @@ function messagePayload(overrides: {
   readonly senderId?: string;
   readonly messageId?: string;
   readonly text?: string;
+  readonly content?: unknown;
 } = {}): Record<string, unknown> {
   const space = {
     id: overrides.chatGuid ?? "iMessage;-;+14155550123",
@@ -67,7 +68,7 @@ function messagePayload(overrides: {
       direction: overrides.direction ?? "inbound",
       sender: { id: overrides.senderId ?? senderId },
       space,
-      content: { type: "text", text: overrides.text ?? "Make a rain-soaked cyberpunk alley." },
+      content: overrides.content ?? { type: "text", text: overrides.text ?? "Make a rain-soaked cyberpunk alley." },
     },
   };
 }
@@ -177,6 +178,25 @@ describe("Air iMessage webhook", () => {
 
     for (const request of requests) {
       expect((await handleStudioIMessageWebhook(request, { getRuntime })).status).toBe(200);
+    }
+    expect(getRuntime).not.toHaveBeenCalled();
+  });
+
+  it("ignores signed reaction, typing, membership, and empty message-shaped events before storage", async () => {
+    configureEnvironment();
+    const getRuntime = vi.fn(async () => runtimeWith(async () => ({ created: true, record: {} })));
+    const payloads = [
+      messagePayload({ content: { type: "reaction", emoji: "👍" }, messageId: "reaction-001" }),
+      messagePayload({ content: { type: "typing", state: "started" }, messageId: "typing-001" }),
+      messagePayload({ content: { type: "membership", action: "joined" }, messageId: "membership-001" }),
+      messagePayload({ content: { type: "group", items: [] }, messageId: "empty-group-001" }),
+    ];
+
+    for (const [index, payload] of payloads.entries()) {
+      expect((await handleStudioIMessageWebhook(
+        signedRequest(payload, { webhookId: `non-actionable-${index}` }),
+        { getRuntime },
+      )).status).toBe(200);
     }
     expect(getRuntime).not.toHaveBeenCalled();
   });

@@ -1,11 +1,11 @@
 # Air
 
 Air is a private, allowlisted image-and-video studio operated entirely through
-iMessage. This revision is a **dark deployment**: the source contains the
-durable signed-ingress and Vercel recovery path, but the currently evidenced
-preview has no protected configuration and cannot accept authenticated iMessage
-traffic. It accepts no paid work, submits to no provider, and sends no
-iMessages until the separately approved canary and real-device gates pass.
+iMessage. The source supports a narrowly scoped **delivery-only iMessage
+smoke release**: allowlisted users can receive bounded text help/status
+responses, while all image/video generation and every provider action remain
+disabled. The currently promoted production alias is still the legacy build
+until this direct-studio release is deployed and verified.
 
 There is no Eve, Zap, chat adapter, or LLM runtime in the Air request path.
 When enabled in a later approved release, Air will use the direct GMI Request
@@ -35,8 +35,12 @@ Queue boundary; it does not delegate generation to another application.
 - The release starts with every side-effect switch explicitly `false`. Missing
   switches also fail closed.
 - Provider ambiguity and iMessage delivery ambiguity are never retried
-  blindly. The bundled Photon transport is deliberately unverified and cannot
-  send until the approved real-line transport spike is complete.
+  blindly. The direct Photon transport supplies the durable outbox ID as the
+  provider `clientMessageId`, disables client retry, and turns a failed send
+  RPC into `send_unknown` for reconciliation rather than replaying it.
+- Direct transport is text-only. Attachment upload/fetch, tapbacks, reply
+  dispatch, media generation, provider submission, provider polling, and
+  provider recovery all remain disabled.
 
 ```mermaid
 flowchart LR
@@ -74,10 +78,10 @@ and creation commands cannot reserve spend or call a provider.
 
 The intended existing Vercel project is `air` at `air.wzrd.tech`. A build-only
 preview with no protected configuration defaults to the dark, all-false policy
-and can verify only the public shell. Any preview that is expected to exercise
-protected readiness must use the explicit dark settings below. Do not promote
-it, attach or update an iMessage webhook, create infrastructure, or send a
-provider request as part of this dark deployment.
+and can verify only the public shell. The production smoke release may enable
+only `AIR_DELIVERY_ENABLED`; it must leave every provider and paid-generation
+switch false, keep the registry at zero enabled models, and never set a GMI
+credential as part of this rollout.
 
 ## Configuration
 
@@ -100,6 +104,11 @@ AIR_MODEL_REGISTRY_VERSION=2.1.0
 Keep `GMI_API_KEY` absent for the dark deployment. The key is only relevant
 after a separate Fable approval authorizes an authenticated catalog/schema
 verification and a limited canary.
+
+For the approved delivery-only smoke release, use a positive production
+generation and an independent `AIR_RELEASE_FENCE_SECRET`, keep all three
+provider/job switches `false`, set `AIR_DELIVERY_ENABLED=true`, and retain all
+spend caps at zero. The full procedure is in [RUNBOOK.md](RUNBOOK.md).
 
 ## Release fence
 

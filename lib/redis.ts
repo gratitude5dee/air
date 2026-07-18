@@ -1188,6 +1188,9 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_TRANSITION_JOB_V5")) {
       return this.evalStudioTransitionJob(options.keys, options.arguments);
     }
+    if (script.includes("AIR_STUDIO_CANCEL_ADMITTED_JOB_WITH_NOTIFICATION_V1")) {
+      return this.evalStudioCancelAdmittedJobWithNotification(options.keys, options.arguments);
+    }
     if (script.includes("AIR_STUDIO_RESCHEDULE_CLAIMED_JOB_V1")) {
       return this.evalStudioRescheduleClaimedJob(options.keys, options.arguments);
     }
@@ -2121,6 +2124,100 @@ export class MemoryRedis implements RedisLike {
       this.studioSetPersistentRecord(jobKey, record);
     }
     return JSON.stringify(record);
+  }
+
+  /** Exact in-memory mirror of the atomic admitted-job cancellation primitive. */
+  private evalStudioCancelAdmittedJobWithNotification(keys: readonly string[], args: readonly string[]): number {
+    try {
+      this.assertStudioArity(keys, args, 9, 13);
+      const activeKey = this.studioKey(keys, 0);
+      const jobKey = this.studioKey(keys, 1);
+      const jobPayloadKey = this.studioKey(keys, 2);
+      const readyJobKey = this.studioKey(keys, 3);
+      const outboxKey = this.studioKey(keys, 4);
+      const outboxPayloadKey = this.studioKey(keys, 5);
+      const readyOutboxKey = this.studioKey(keys, 6);
+      const outboxLaneKey = this.studioKey(keys, 7);
+      const releaseFenceKey = this.studioKey(keys, 8);
+      const jobId = this.studioArgument(args, 0);
+      const senderHash = this.studioArgument(args, 1);
+      const expectedJobVersion = this.studioPositiveInteger(this.studioArgument(args, 2));
+      const serializedOutbox = this.studioArgument(args, 3);
+      const serializedOutboxPayload = this.studioArgument(args, 4);
+      const outboxPayloadTtl = this.studioPositiveInteger(this.studioArgument(args, 5));
+      const outboxDueAt = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+      const outboxId = this.studioArgument(args, 7);
+      const outboxSequence = this.studioNonnegativeInteger(this.studioArgument(args, 8));
+      const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 9));
+      const releasePhase = this.studioArgument(args, 10);
+      const now = this.studioNonnegativeInteger(this.studioArgument(args, 11));
+      const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 12));
+      this.assertStringOrMissing(activeKey);
+      this.assertStringOrMissing(jobKey);
+      this.assertStringOrMissing(jobPayloadKey);
+      this.assertStringOrMissing(outboxKey);
+      this.assertStringOrMissing(outboxPayloadKey);
+      this.assertZSetOrMissing(readyJobKey);
+      this.assertZSetOrMissing(readyOutboxKey);
+      this.assertZSetOrMissing(outboxLaneKey);
+
+      const existing = this.getEntry(outboxKey);
+      if (existing) {
+        const record = this.studioRecordFailClosed(outboxKey);
+        return record
+          && record.outboxId === outboxId
+          && record.jobId === jobId
+          && record.senderHash === senderHash
+          && record.lane === "request-response"
+          ? 2
+          : -2;
+      }
+
+      if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") return -1;
+      const outbox = this.studioRecordFromJson(serializedOutbox);
+      if (
+        outbox.outboxId !== outboxId
+        || outbox.jobId !== jobId
+        || outbox.senderHash !== senderHash
+        || outbox.lane !== "request-response"
+        || outbox.state !== "intent"
+        || this.studioStateVersion(outbox) !== 1
+        || outbox.sequence !== outboxSequence
+      ) return -2;
+      if (
+        this.studioReleasePersistenceStatus(outbox, releaseFenceKey, releaseGeneration, releasePhase) !== 1
+      ) return -1;
+
+      if (this.studioString(activeKey) !== jobId) return 0;
+      const job = this.studioRecordFailClosed(jobKey);
+      if (
+        !job
+        || job.jobId !== jobId
+        || job.senderHash !== senderHash
+        || job.state !== "admitted"
+        || this.studioStateVersion(job) !== expectedJobVersion
+      ) return 0;
+      if (this.getEntry(outboxPayloadKey)) return -2;
+      const laneHasSequence = [...(this.getZSet(outboxLaneKey, false)?.value.entries() ?? [])]
+        .some(([, score]) => score === outboxSequence);
+      if (laneHasSequence) return -2;
+
+      job.state = "canceled";
+      job.stateVersion = expectedJobVersion + 1;
+      job.updatedAtMs = now;
+      delete job.encryptedPayload;
+      this.studioSetRecord(jobKey, job, terminalTtl);
+      this.values.delete(jobPayloadKey);
+      if (this.studioString(activeKey) === jobId) this.values.delete(activeKey);
+      this.studioRemoveMember(readyJobKey, jobId);
+      this.studioSetPersistentRecord(outboxKey, outbox);
+      this.studioSet(outboxPayloadKey, serializedOutboxPayload, outboxPayloadTtl * 1_000);
+      this.getZSet(readyOutboxKey, true).value.set(outboxId, outboxDueAt);
+      this.getZSet(outboxLaneKey, true).value.set(outboxId, outboxSequence);
+      return 1;
+    } catch {
+      return -2;
+    }
   }
 
   private evalStudioRescheduleClaimedJob(keys: readonly string[], args: readonly string[]): number {

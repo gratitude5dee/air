@@ -619,4 +619,64 @@ describe("Air studio dark engine", () => {
     ]);
     expect(observedInitialEffects.every((record) => record.state === "intent" && record.attempts === 0)).toBe(true);
   });
+
+  it("reports and atomically cancels an admitted job before provider submission without clearing saved media", async () => {
+    const provider = {
+      verified: true,
+      submit: vi.fn(async () => Object.freeze({ kind: "accepted" as const, providerRequestId: "should-not-submit" })),
+    } satisfies StudioProviderPort;
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      allowProviderSubmit: true,
+      provider,
+      registry: reviewedImagineRegistry(),
+      perJobCents: 100,
+      dailyCents: 100,
+    });
+    await armFixtureReleaseFence(fixture);
+    await persistInbound(fixture, "cancelable-create-001", "/imagine an illuminated paper kite");
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    const active = await fixture.store.getActiveJob(fixture.senderHash);
+    if (!active) throw new Error("expected an admitted active job");
+
+    const createOutbox = vi.spyOn(fixture.store, "createOutbox");
+    await persistInbound(fixture, "status-active-001", "/status");
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    expect(createOutbox).toHaveBeenLastCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({ text: "Your request is queued. I’ll send it here when it’s ready." }),
+    }));
+
+    const pendingSource = await terminalPendingSource(fixture, "pending-media-before-cancel");
+    await fixture.store.putPending(pendingSource, {
+      schemaVersion: 1,
+      kind: "media",
+      attachment: { id: "saved-before-cancel", mimeType: "image/png", sizeBytes: 42 },
+      createdAtMs: pendingSource.receivedAtMs,
+    });
+    await persistInbound(fixture, "cancel-active-001", "/cancel");
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+
+    await expect(fixture.store.getJob(active.jobId)).resolves.toMatchObject({ state: "canceled" });
+    await expect(fixture.store.getActiveJob(fixture.senderHash)).resolves.toBeNull();
+    await expect(fixture.store.getPending(fixture.senderHash, fixture.threadHash)).resolves.toMatchObject({
+      kind: "media",
+      attachment: { id: "saved-before-cancel" },
+    });
+    await expect(drainStudioJobs(fixture.runtime)).resolves.toBe(0);
+    expect(provider.submit).not.toHaveBeenCalled();
+
+    const readyOutboxIds = await fixture.redis.zRangeByScore(
+      `${STUDIO_REDIS_PREFIX}:outbox:ready`,
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    const readyPayloads = await Promise.all(readyOutboxIds.map(async (outboxId) => {
+      const outbox = await fixture.store.getOutbox(outboxId);
+      return outbox ? fixture.store.decryptOutboxPayload(outbox) : undefined;
+    }));
+    expect(readyPayloads).toContainEqual(expect.objectContaining({
+      text: "Canceled your queued request. No generation was submitted.",
+    }));
+  });
 });

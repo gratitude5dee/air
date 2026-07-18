@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createSenderIdentity, hashThreadIdentifier, isSenderAllowed } from "../security.js";
 import {
   decodeWebhookJson,
+  hasActionableInboundContent,
   normalizeSpectrumWebhook,
   readRawBodyLimited,
   SPECTRUM_SIGNATURE_HEADER,
@@ -90,6 +91,7 @@ export async function handleStudioIMessageWebhook(
     || normalized.spaceType !== "dm"
     || !normalized.senderId
     || !normalized.phone
+    || !hasActionableInboundContent(normalized)
   ) {
     return new Response(null, { status: 200 });
   }

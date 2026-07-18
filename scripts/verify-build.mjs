@@ -30,6 +30,11 @@ const FORBIDDEN_MODULE_SEGMENTS = new Set([
   "anthropic",
   "langchain",
 ]);
+// This exact provider client is an audited transport primitive, not an LLM or
+// Chat runtime. It is needed because its `clientMessageId` parameter carries
+// Air's durable outbox idempotency key to Photon. Do not broaden this exception
+// to arbitrary `@photon-ai/*` packages or subpaths.
+const APPROVED_DIRECT_TRANSPORT_MODULE = "@photon-ai/advanced-imessage";
 
 async function readJson(path) {
   try {
@@ -102,6 +107,7 @@ function moduleSpecifiers(source) {
 
 function isForbiddenSpecifier(specifier) {
   const normalized = specifier.toLowerCase().replace(/^node:/u, "node/");
+  if (normalized === APPROVED_DIRECT_TRANSPORT_MODULE) return false;
   return normalized
     .split(/[\\/@._-]+/u)
     .some((segment) => FORBIDDEN_MODULE_SEGMENTS.has(segment));
@@ -130,6 +136,9 @@ async function verifyRouteSources() {
   for (const file of sourceFiles) {
     const source = await readFile(resolve(ROOT, file), "utf8");
     for (const specifier of moduleSpecifiers(source)) {
+      if (specifier === APPROVED_DIRECT_TRANSPORT_MODULE && file !== "lib/studio/photon-transport.ts") {
+        throw new Error(`${file} imports the direct iMessage transport outside its approved boundary`);
+      }
       if (isForbiddenSpecifier(specifier)) {
         throw new Error(`${file} imports forbidden runtime module ${specifier}`);
       }

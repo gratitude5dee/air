@@ -1063,6 +1063,86 @@ describe("Air v2 studio durable store", () => {
     await scheduled?.lease.release();
   });
 
+  it("atomically cancels an admitted job with one same-thread notification and no schedulable work", async () => {
+    const { redis, store, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const candidate = job(cipher, senderHash, threadHash, "cancel-admitted-job", now());
+    await expect(store.admitJob({
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+    })).resolves.toMatchObject({ admitted: true });
+    const active = await store.getActiveJob(senderHash);
+    if (!active) throw new Error("expected active admitted job");
+    const notification = {
+      outboxId: "cancel-admitted-notice",
+      payload: {
+        kind: "text" as const,
+        text: "Canceled your queued request. No generation was submitted.",
+        thread: {
+          chatGuid: "iMessage;-;+14155550199",
+          sendingLine: "+14155550000",
+          replyTargetId: "cancel-command-guid",
+        },
+      },
+    };
+
+    await expect(store.cancelAdmittedJobWithNotification({ job: active, notification })).resolves.toBe("canceled");
+    await expect(store.getJob(candidate.jobId)).resolves.toMatchObject({ state: "canceled" });
+    await expect(store.getActiveJob(senderHash)).resolves.toBeNull();
+    await expect(store.claimNextJob()).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:job:payload:${candidate.jobId}`)).resolves.toBeNull();
+    const outbox = await store.getOutbox(notification.outboxId);
+    expect(outbox).toMatchObject({
+      jobId: candidate.jobId,
+      lane: "request-response",
+      state: "intent",
+      attempts: 0,
+    });
+    expect(store.decryptOutboxPayload(outbox!)).toMatchObject({ text: notification.payload.text });
+
+    // A worker crash before the inbox receipt is terminal may replay the same
+    // cancellation. The pre-existing atomic notice is the idempotent proof;
+    // it must not create another bubble or affect a later job.
+    await expect(store.cancelAdmittedJobWithNotification({ job: active, notification })).resolves.toBe("canceled");
+    expect(await redis.zCard(`${prefix}:outbox:ready`)).toBe(1);
+  });
+
+  it("refuses a cancellation notice routed outside the encrypted job conversation", async () => {
+    const { redis, store, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const candidate = job(cipher, senderHash, threadHash, "cancel-cross-thread-job", now());
+    await store.admitJob({
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+    });
+    const active = await store.getActiveJob(senderHash);
+    if (!active) throw new Error("expected active admitted job");
+
+    await expect(store.cancelAdmittedJobWithNotification({
+      job: active,
+      notification: {
+        outboxId: "cancel-cross-thread-notice",
+        payload: {
+          kind: "text",
+          text: "Canceled your queued request.",
+          thread: {
+            chatGuid: "iMessage;-;+14155550998",
+            sendingLine: "+14155550000",
+            replyTargetId: "cancel-command-guid",
+          },
+        },
+      },
+    })).resolves.toBe("unavailable");
+    await expect(store.getJob(candidate.jobId)).resolves.toMatchObject({ state: "admitted" });
+    await expect(redis.get(`${prefix}:outbox:cancel-cross-thread-notice`)).resolves.toBeNull();
+  });
+
   it("orders an initial Like before its acknowledgement and lets an ambiguous Like release the text", async () => {
     const { store, cipher, now } = fixture();
     const { senderHash, threadHash } = identities();

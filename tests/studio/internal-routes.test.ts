@@ -60,6 +60,14 @@ function releaseFenceRequest(ifMatch: string | undefined, method = "POST", token
   return new Request("https://air.example.test/internal/release-fence", { method, headers });
 }
 
+function readinessRuntime(freshness: "fresh" | "stale" | "missing" | "invalid") {
+  return {
+    store: { getCronFreshness: vi.fn(async () => freshness) },
+    transport: { verified: false },
+    provider: { verified: false },
+  } as unknown as StudioRuntime;
+}
+
 describe("Studio Vercel internal routes", () => {
   it("does not create a runtime or run a drain for an unauthenticated request", async () => {
     const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
@@ -176,7 +184,11 @@ describe("Studio Vercel internal routes", () => {
     const getCronFreshness = vi.fn(async (_scope: string) => "missing" as const);
     const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
       loadEnvironment: darkEnvironment,
-      getRuntime: vi.fn(async () => ({ store: { getCronFreshness } }) as unknown as StudioRuntime),
+      getRuntime: vi.fn(async () => ({
+        store: { getCronFreshness },
+        transport: { verified: false },
+        provider: { verified: false },
+      }) as unknown as StudioRuntime),
     });
 
     expect(response.status).toBe(503);
@@ -199,7 +211,7 @@ describe("Studio Vercel internal routes", () => {
       },
       redis: "reachable",
       cron: "not_scheduled",
-      problems: expect.arrayContaining(["transport_unverified", "no_enabled_models"]),
+      problems: expect.arrayContaining(["transport_unverified"]),
     }));
     expect(getCronFreshness).toHaveBeenCalledWith("preview");
   });
@@ -216,9 +228,7 @@ describe("Studio Vercel internal routes", () => {
     };
     const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
       loadEnvironment: () => environment,
-      getRuntime: async () => ({
-        store: { getCronFreshness: vi.fn(async () => "fresh" as const) },
-      }) as unknown as StudioRuntime,
+      getRuntime: async () => readinessRuntime("fresh"),
     });
 
     await expect(response.json()).resolves.toEqual(expect.objectContaining({
@@ -232,13 +242,46 @@ describe("Studio Vercel internal routes", () => {
     }));
   });
 
+  it("reports a production delivery-only release as ready without enabling a model or provider", async () => {
+    const environment: StudioEnvironment = {
+      ...darkEnvironment(),
+      deploymentMode: "production",
+      releasePhase: "production",
+      releaseGeneration: 1,
+      releaseFenceSecret: "release-fence-secret",
+      policy: {
+        acceptNewJobs: false,
+        allowProviderSubmit: false,
+        allowProviderRecovery: false,
+        deliveryEnabled: true,
+      },
+      policyExplicit: true,
+    };
+    const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+      loadEnvironment: () => environment,
+      getRuntime: async () => ({
+        store: { getCronFreshness: vi.fn(async () => "fresh" as const) },
+        transport: { verified: true },
+        provider: { verified: false },
+      }) as unknown as StudioRuntime,
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+      ok: true,
+      enabledModels: 0,
+      redis: "reachable",
+      cron: "fresh",
+      effectiveSideEffects: environment.policy,
+      problems: [],
+    }));
+  });
+
   it("reports a stale production Cron heartbeat without exposing its timestamp", async () => {
     const environment = { ...darkEnvironment(), deploymentMode: "production" as const };
     const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
       loadEnvironment: () => environment,
-      getRuntime: async () => ({
-        store: { getCronFreshness: vi.fn(async () => "stale" as const) },
-      }) as unknown as StudioRuntime,
+      getRuntime: async () => readinessRuntime("stale"),
     });
 
     expect(response.status).toBe(503);
@@ -257,9 +300,7 @@ describe("Studio Vercel internal routes", () => {
     ] as const) {
       const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
         loadEnvironment: () => environment,
-        getRuntime: async () => ({
-          store: { getCronFreshness: vi.fn(async () => freshness) },
-        }) as unknown as StudioRuntime,
+        getRuntime: async () => readinessRuntime(freshness),
       });
 
       expect(response.status).toBe(503);

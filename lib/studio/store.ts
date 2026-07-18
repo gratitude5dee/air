@@ -423,6 +423,24 @@ export type AdmissionResult =
       readonly reason: "active_job" | "user_limit" | "per_job_cap" | "daily_cap" | "release_blocked" | "storage_error";
     };
 
+/**
+ * A pre-submission cancellation is one atomic state transition plus one
+ * durable user-notice intent.  `not_admitted` is deliberately distinct from
+ * a storage error: the executor may have crossed its own submit boundary, so
+ * the caller must re-read and describe that state truthfully rather than
+ * pretending the request was canceled.
+ */
+export type StudioAdmittedJobCancellationResult =
+  | "canceled"
+  | "not_admitted"
+  | "release_blocked"
+  | "unavailable";
+
+export interface CancelAdmittedJobWithNotificationInput {
+  readonly job: Pick<StudioJobRecord, "jobId" | "senderHash" | "state" | "stateVersion" | "encryptedPayload">;
+  readonly notification: StudioInitialJobNotification;
+}
+
 export interface StudioStoreOptions {
   readonly redis: RedisLike;
   readonly cipher: QueueCipher;
@@ -1044,6 +1062,20 @@ export class StudioStore {
   }
 
   /**
+   * Returns only the caller-owned, nonterminal active job selected by the
+   * admission fence.  The pointer is intentionally not trusted on its own:
+   * a corrupt or stale value must never expose another sender's record or
+   * become a reason to mutate Redis from a read-only status request.
+   */
+  public async getActiveJob(senderHash: SenderHash): Promise<StudioJobRecord | null> {
+    const jobId = await this.redis.get(this.activeJobKey(senderHash));
+    if (!isSafeRecordString(jobId, 160)) return null;
+    const job = await this.getJob(jobId);
+    if (!job || job.senderHash !== senderHash || isTerminalJobState(job.state)) return null;
+    return job;
+  }
+
+  /**
    * Claims one due admitted/executing job from the durable recovery index.
    * The queue head is only a scheduling hint: a separate token lease prevents
    * two serverless invocations from advancing the same job concurrently.
@@ -1155,6 +1187,76 @@ export class StudioStore {
     const next = parseStored<StudioJobRecord>(typeof result === "string" ? result : null);
     if (!next) return null;
     return this.hydrateJobPayload(next);
+  }
+
+  /**
+   * Cancels only an `admitted` job.  The job payload, active marker, scheduler
+   * entry, and cancellation notice commit together, so a crash cannot leave a
+   * user-visible cancellation without stopping the pre-submit work (or stop
+   * it silently without a durable notification intent).
+   */
+  public async cancelAdmittedJobWithNotification(
+    input: CancelAdmittedJobWithNotificationInput,
+  ): Promise<StudioAdmittedJobCancellationResult> {
+    if (
+      input.job.state !== "admitted"
+      || !isSafeRecordString(input.job.jobId, 160)
+      || !isPositiveSafeInteger(input.job.stateVersion)
+      || !isSafeRecordString(input.notification.outboxId, 160)
+      || !isValidInitialJobNotification(input.notification, "text")
+    ) return "unavailable";
+
+    let jobPayload: StudioJobPayload;
+    try {
+      jobPayload = this.decryptJobPayload(input.job as StudioJobRecord);
+    } catch {
+      return "unavailable";
+    }
+    // `/cancel` is allowed to reply to its own triggering bubble, but it must
+    // stay on the job's original chat and sending line. A same-sender command
+    // from another conversation must never reroute or cancel paid work.
+    if (!isCancellationNotificationBoundToJob(input.notification, jobPayload)) return "unavailable";
+
+    const notification = this.buildOutboxRecord({
+      outboxId: input.notification.outboxId,
+      jobId: input.job.jobId,
+      senderHash: input.job.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: input.notification.payload,
+    });
+    const result = await this.redis.eval(CANCEL_ADMITTED_JOB_WITH_NOTIFICATION_LUA, {
+      keys: [
+        this.activeJobKey(input.job.senderHash),
+        this.jobKey(input.job.jobId),
+        this.jobPayloadKey(input.job.jobId),
+        this.readyJobKey(),
+        this.outboxKey(notification.outboxId),
+        this.outboxPayloadKey(notification.outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(notification),
+        this.releaseFenceKey(),
+      ],
+      arguments: [
+        input.job.jobId,
+        input.job.senderHash,
+        String(input.job.stateVersion),
+        JSON.stringify(outboxMetadata(notification)),
+        JSON.stringify(requiredOutboxPayload(notification)),
+        String(OUTBOX_PAYLOAD_TTL_SECONDS),
+        String(notification.dueAtMs),
+        notification.outboxId,
+        String(notification.sequence),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+      ],
+    });
+    if (result === 1 || result === "1" || result === 2 || result === "2") return "canceled";
+    if (result === 0 || result === "0") return "not_admitted";
+    if (result === -1 || result === "-1") return "release_blocked";
+    return "unavailable";
   }
 
   /**
@@ -2951,6 +3053,84 @@ end
 return cjson.encode(record)
 `;
 
+const CANCEL_ADMITTED_JOB_WITH_NOTIFICATION_LUA = `
+-- AIR_STUDIO_CANCEL_ADMITTED_JOB_WITH_NOTIFICATION_V1
+-- KEYS: active sender fence, job metadata, encrypted job payload, job-ready index,
+--       cancellation outbox metadata, encrypted outbox payload, outbox-ready index,
+--       cancellation lane index, shared release fence
+-- ARGV: expected job id, expected sender hash, expected job version, outbox metadata,
+--       encrypted outbox payload, payload ttl, outbox due time, outbox id, sequence,
+--       release generation, release phase, now, terminal metadata ttl
+local existingOutboxRaw = redis.call('GET', KEYS[5])
+if existingOutboxRaw then
+  local existingOk, existing = pcall(cjson.decode, existingOutboxRaw)
+  if existingOk and type(existing) == 'table'
+    and existing.outboxId == ARGV[8]
+    and existing.jobId == ARGV[1]
+    and existing.senderHash == ARGV[2]
+    and existing.lane == 'request-response' then
+    -- A recovered inbox may replay after the job transition committed but
+    -- before its receipt was marked terminal. The original atomic notice is
+    -- sufficient; never cancel a newer job or create another bubble.
+    return 2
+  end
+  return -2
+end
+
+local outboxOk, outbox = pcall(cjson.decode, ARGV[4])
+if not outboxOk or type(outbox) ~= 'table'
+  or outbox.outboxId ~= ARGV[8]
+  or outbox.jobId ~= ARGV[1]
+  or outbox.senderHash ~= ARGV[2]
+  or outbox.lane ~= 'request-response'
+  or outbox.state ~= 'intent'
+  or tonumber(outbox.stateVersion) ~= 1
+  or tonumber(outbox.sequence) ~= tonumber(ARGV[9]) then return -2 end
+local stamp = outbox.releaseStamp
+if type(stamp) ~= 'table'
+  or type(stamp.generation) ~= 'number' or stamp.generation < 0
+  or stamp.generation ~= math.floor(stamp.generation)
+  or stamp.generation ~= tonumber(ARGV[10]) or stamp.phase ~= ARGV[11] then return -1 end
+local fenceRaw = redis.call('GET', KEYS[9])
+if fenceRaw then
+  local fenceOk, fence = pcall(cjson.decode, fenceRaw)
+  if not fenceOk or type(fence) ~= 'table'
+    or type(fence.generation) ~= 'number' or fence.generation < 0
+    or fence.generation ~= math.floor(fence.generation)
+    or (fence.phase ~= 'dark' and fence.phase ~= 'canary' and fence.phase ~= 'production') then return -1 end
+  if fence.generation ~= tonumber(ARGV[10]) or fence.phase ~= ARGV[11] then return -1 end
+elseif ARGV[11] ~= 'dark' then
+  return -1
+end
+
+local active = redis.call('GET', KEYS[1])
+if active ~= ARGV[1] then return 0 end
+local jobRaw = redis.call('GET', KEYS[2])
+if not jobRaw then return 0 end
+local jobOk, job = pcall(cjson.decode, jobRaw)
+if not jobOk or type(job) ~= 'table'
+  or job.jobId ~= ARGV[1]
+  or job.senderHash ~= ARGV[2]
+  or job.state ~= 'admitted'
+  or tonumber(job.stateVersion) ~= tonumber(ARGV[3]) then return 0 end
+if redis.call('EXISTS', KEYS[6]) == 1 then return -2 end
+if #redis.call('ZRANGEBYSCORE', KEYS[8], ARGV[9], ARGV[9], 'LIMIT', 0, 1) > 0 then return -2 end
+
+job.state = 'canceled'
+job.stateVersion = tonumber(job.stateVersion) + 1
+job.updatedAtMs = tonumber(ARGV[12])
+job.encryptedPayload = nil
+redis.call('SET', KEYS[2], cjson.encode(job), 'EX', ARGV[13])
+redis.call('DEL', KEYS[3])
+if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
+redis.call('ZREM', KEYS[4], ARGV[1])
+redis.call('SET', KEYS[5], ARGV[4])
+redis.call('SET', KEYS[6], ARGV[5], 'EX', ARGV[6])
+redis.call('ZADD', KEYS[7], tonumber(ARGV[7]), ARGV[8])
+redis.call('ZADD', KEYS[8], tonumber(ARGV[9]), ARGV[8])
+return 1
+`;
+
 const RESCHEDULE_CLAIMED_JOB_LUA = `
 -- AIR_STUDIO_RESCHEDULE_CLAIMED_JOB_V1
 -- KEYS: job metadata, short worker lease, durable job-ready index
@@ -3547,6 +3727,22 @@ function isInitialNotificationBoundToJob(
     || thread.replyTargetId !== jobPayload.replyTargetId
   ) return false;
   return expectedKind === "text" || message.targetMessageId === jobPayload.replyTargetId;
+}
+
+/**
+ * A cancellation replies to its own command bubble, so its reply target is
+ * intentionally different from the creation message. The chat and concrete
+ * sending line are still immutable job-routing facts.
+ */
+function isCancellationNotificationBoundToJob(
+  notification: unknown,
+  jobPayload: StudioJobPayload,
+): boolean {
+  if (!isValidInitialJobNotification(notification, "text")) return false;
+  const message = (notification as { readonly payload: StudioOutboxPayload }).payload;
+  return message.kind === "text"
+    && message.thread.chatGuid === jobPayload.chatGuid
+    && message.thread.sendingLine === jobPayload.sendingLine;
 }
 
 function isValidReleaseStamp(value: unknown): value is StudioReleaseStamp {

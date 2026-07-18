@@ -9,7 +9,7 @@ describe("Air public runtime surface", () => {
     expect(response.headers.get("cache-control")).toBe("no-store");
     await expect(response.json()).resolves.toEqual({
       name: "Air",
-      status: "allowlisted iMessage image and video generation",
+      status: "private allowlisted iMessage studio",
     });
   });
 
