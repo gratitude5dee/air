@@ -18,6 +18,7 @@ import {
   listEnabledModels,
   resolveDefaultModel,
   resolveEnabledModel,
+  type AirModelRegistry,
   type StudioModel,
 } from "./model-registry.js";
 import {
@@ -33,7 +34,11 @@ import type {
   StudioOutboxPayload,
   StudioOutboxRecord,
   PendingWriteGuard,
+  StudioJobRecord,
+  StudioExecutionSnapshot,
 } from "./store.js";
+import { createStudioJob, isJobQueueEligibleState } from "./store.js";
+import { executeStudioProviderSubrun } from "./workflow-executor.js";
 import { getStudioWorkflow, isSinglePaidStepWorkflow } from "./workflows.js";
 
 const ONBOARDING_VERSION = 1;
@@ -41,6 +46,10 @@ const DEFAULT_OUTPUT_COUNT: StudioOutputCount = 1;
 const DEFAULT_VIDEO_DURATION_SECONDS: StudioVideoDurationSeconds = 5;
 const MAX_INBOX_PER_DRAIN = 12;
 const MAX_OUTBOX_PER_DRAIN = 16;
+/** Keep one Cron invocation bounded even with many recoverable jobs. */
+const MAX_JOBS_PER_DRAIN = 8;
+/** Accepted provider work is revisited slowly until observation is implemented. */
+const JOB_RECHECK_DELAY_MS = 60_000;
 const TYPING_DWELL_MS = 300;
 const MEDIA_FIRST_CORRECTION_DELAY_MS = 500;
 
@@ -107,6 +116,7 @@ export interface StudioDrainStats {
  */
 export async function drainStudio(runtime: StudioRuntime): Promise<void> {
   await drainStudioWithStats(runtime);
+  await drainStudioJobs(runtime);
 }
 
 export async function drainStudioWithStats(runtime: StudioRuntime): Promise<StudioDrainStats> {
@@ -133,6 +143,58 @@ export async function drainStudioWithStats(runtime: StudioRuntime): Promise<Stud
   }
 
   return Object.freeze({ inbox, outbox: await drainStudioOutbox(runtime) });
+}
+
+/**
+ * Advances durable admitted/executing jobs. Owning the job lease only grants
+ * bounded scheduling work; the provider-subrun lease and its Lua commit stay
+ * the final authority immediately before a provider side effect.
+ *
+ * The default runtime cannot enter this loop: both the release policy and a
+ * reviewed provider adapter must be explicitly active first.
+ */
+export async function drainStudioJobs(runtime: StudioRuntime): Promise<number> {
+  if (!canSubmitStudioProvider(runtime.environment) || !runtime.provider.verified) return 0;
+
+  let advanced = 0;
+  for (let index = 0; index < MAX_JOBS_PER_DRAIN; index += 1) {
+    const claim = await runtime.store.claimNextJob();
+    if (!claim) break;
+    advanced += 1;
+
+    try {
+      await executeStudioProviderSubrun(runtime, claim.record.jobId);
+      await rescheduleCurrentJob(runtime, claim.record, claim.lease.token);
+    } catch {
+      // An internal fault before a physical provider-call outcome is not a
+      // reason to terminalize paid work. Leave the durable queue entry in
+      // place and best-effort delay its freshly read state; a lost CAS/lease
+      // is recovered later without reopening the physical submit boundary.
+      try {
+        await rescheduleCurrentJob(runtime, claim.record, claim.lease.token);
+      } catch {
+        // The existing ready entry and expiring lease remain recovery-safe.
+      }
+    } finally {
+      await claim.lease.release();
+    }
+  }
+  return advanced;
+}
+
+async function rescheduleCurrentJob(
+  runtime: StudioRuntime,
+  claimed: StudioJobRecord,
+  leaseToken: string,
+): Promise<void> {
+  // Provider submission and terminal transitions change state/version, so a
+  // stale pre-execution record must never decide queue ownership afterward.
+  const current = await runtime.store.getJob(claimed.jobId);
+  if (!current || !isJobQueueEligibleState(current.state)) {
+    await runtime.store.removeJobFromQueue(claimed.jobId);
+    return;
+  }
+  await runtime.store.rescheduleClaimedJob(current, leaseToken, JOB_RECHECK_DELAY_MS);
 }
 
 /**
@@ -395,7 +457,13 @@ async function handleCommand(
       return "processed";
     }
     case "models":
-      await enqueueResponse(runtime, record, envelope, `models-${command.mode ?? "all"}`, modelsText(command.mode));
+      await enqueueResponse(
+        runtime,
+        record,
+        envelope,
+        `models-${command.mode ?? "all"}`,
+        modelsText(command.mode, studioRegistry(runtime)),
+      );
       return "processed";
     case "model-settings":
       return handleModelSettings(runtime, record, envelope, settings, command);
@@ -421,7 +489,8 @@ async function handleCreation(
     return "maintenance_rejected";
   }
 
-  const selection = selectedModel(settings, mode);
+  const registry = studioRegistry(runtime);
+  const selection = selectedModel(settings, mode, registry);
   if (!selection.model) {
     await enqueueResponse(runtime, record, envelope, `missing-model-${mode}`, noModelText(mode));
     return "processed";
@@ -442,11 +511,30 @@ async function handleCreation(
     return "processed";
   }
 
+  // Attachment bytes are still deliberately outside this admission slice:
+  // before accepting them, the provider adapter needs a reviewed fetch/upload
+  // implementation with MIME/size validation and retention evidence. Never
+  // reserve paid work that we cannot submit exactly once.
+  if (attachment !== undefined) {
+    await enqueueResponse(
+      runtime,
+      record,
+      envelope,
+      `media-input-not-enabled-${mode}`,
+      "Media-backed generation is not enabled in this deployment. No generation was submitted.",
+    );
+    return "processed";
+  }
+
   // The committed workflow declaration protects future registry changes from
-  // accidentally introducing a multi-step paid plan. This build intentionally
-  // does not contain an enabled execution adapter: GMI catalog evidence,
-  // numeric spend authority, and real transport evidence are still absent.
-  if (!isSinglePaidStepWorkflow(getStudioWorkflow(mode)) || !canSubmitStudioProvider(runtime.environment)) {
+  // accidentally introducing a multi-step paid plan. The deployed runtime
+  // keeps this false through both the dark policy and the unprovisioned
+  // provider port; a reviewed adapter must be injected explicitly.
+  if (
+    !isSinglePaidStepWorkflow(getStudioWorkflow(mode))
+    || !canSubmitStudioProvider(runtime.environment)
+    || !runtime.provider.verified
+  ) {
     await enqueueResponse(
       runtime,
       record,
@@ -457,17 +545,101 @@ async function handleCreation(
     return "processed";
   }
 
-  // Defence in depth: a future configuration cannot admit paid work merely by
-  // toggling an environment variable. The direct execution adapter is enabled
-  // only by a reviewed registry/runtime change after the separate Fable gate.
-  await enqueueResponse(
-    runtime,
-    record,
-    envelope,
-    `execution-not-provisioned-${mode}`,
-    "Air’s verified execution adapter is not provisioned yet. No generation was submitted.",
-  );
-  return "processed";
+  const workflow = getStudioWorkflow(mode);
+  const outputCount = settings.modes[mode].outputCount;
+  const releaseStamp = Object.freeze({
+    generation: runtime.environment.releaseGeneration,
+    phase: runtime.environment.releasePhase,
+  } as const);
+  const execution: StudioExecutionSnapshot = Object.freeze({
+    schemaVersion: 1,
+    workflow: Object.freeze({
+      workflowId: workflow.workflowId,
+      workflowVersion: workflow.version,
+      stepId: "provider-generation",
+    }),
+    model: Object.freeze({
+      slug: selection.model.slug,
+      provider: selection.model.provider,
+      providerModelId: selection.model.providerModelId,
+    }),
+    output: Object.freeze({
+      count: outputCount,
+      ...(durationSeconds === null ? {} : { durationSeconds }),
+    }),
+    releaseStamp,
+  });
+  const admittedJob = createStudioJob({
+    jobId: stableJobId(record.receiptId),
+    senderHash: record.senderHash,
+    threadHash: record.threadHash,
+    mode,
+    modelSlug: selection.model.slug,
+    provider: selection.model.provider,
+    outputCount,
+    ...(durationSeconds === null ? {} : { durationSeconds }),
+    reservedCents: compatibility.maximumQuotedCost.maximumQuotedCostCents,
+    releaseStamp,
+    payload: Object.freeze({
+      prompt,
+      chatGuid: envelope.chatGuid,
+      sendingLine: envelope.sendingLine,
+      ...(envelope.replyTargetId === undefined ? {} : { replyTargetId: envelope.replyTargetId }),
+      execution,
+    }),
+    cipher: runtime.cipher,
+    now: record.receivedAtMs,
+  });
+  const acknowledgementText = "✨ Working my magic — I’ll send it here when it’s ready.";
+  const acknowledgement = Object.freeze({
+    outboxId: stableRecordId(record.receiptId, "job-acknowledgement"),
+    payload: responsePayload(envelope, acknowledgementText),
+  });
+  const tapback = envelope.replyTargetId === undefined
+    ? undefined
+    : Object.freeze({
+      outboxId: stableRecordId(record.receiptId, "job-tapback"),
+      payload: Object.freeze({
+        kind: "tapback" as const,
+        thread: Object.freeze({
+          chatGuid: envelope.chatGuid,
+          sendingLine: envelope.sendingLine,
+          replyTargetId: envelope.replyTargetId,
+        }),
+        targetMessageId: envelope.replyTargetId,
+      }),
+    });
+  const admission = await runtime.store.admitJobWithInitialNotifications({
+    job: admittedJob,
+    activeJobLimit: runtime.environment.activeJobLimit,
+    dailyUserJobLimit: runtime.environment.dailyUserJobLimit,
+    perJobCapCents: runtime.environment.spendCaps.perJobCents,
+    dailySpendCapCents: runtime.environment.spendCaps.dailyCents,
+    acknowledgement,
+    ...(tapback === undefined ? {} : { tapback }),
+  });
+  if (admission.admitted) return "processed";
+  switch (admission.reason) {
+    case "active_job":
+      await enqueueResponse(runtime, record, envelope, `active-job-${mode}`, "You already have a request in progress. I’ll send it here when it’s ready.");
+      return "processed";
+    case "user_limit":
+      await enqueueResponse(runtime, record, envelope, `user-limit-${mode}`, "You’ve reached today’s request limit. No generation was submitted.");
+      return "processed";
+    case "per_job_cap":
+    case "daily_cap":
+      await enqueueResponse(runtime, record, envelope, `spend-cap-${mode}`, "This request exceeds the current studio spend limit. No generation was submitted.");
+      return "processed";
+    case "release_blocked":
+      // A fence change means this worker is stale. Creating a second generic
+      // response could cross the same rollback boundary, so leave no effect.
+      return "maintenance_rejected";
+    case "storage_error":
+      // Preserve the encrypted receipt and let its bounded lease recovery
+      // retry the atomic boundary. A partial acknowledgement/job bundle is
+      // impossible, so a transient store failure cannot spend or send.
+      throw new Error("studio_atomic_admission_unavailable");
+  }
 }
 
 async function handleModelSettings(
@@ -478,26 +650,32 @@ async function handleModelSettings(
   command: Extract<StudioCommand, { readonly kind: "model-settings" }>,
 ): Promise<InboxDisposition> {
   if (command.action === "show-all") {
-    await enqueueResponse(runtime, record, envelope, "settings-all", allSettingsText(settings));
+    await enqueueResponse(runtime, record, envelope, "settings-all", allSettingsText(settings, studioRegistry(runtime)));
     return "processed";
   }
   if (command.action === "show-mode") {
-    await enqueueResponse(runtime, record, envelope, `settings-${command.mode}`, modeSettingsText(settings, command.mode));
+    await enqueueResponse(
+      runtime,
+      record,
+      envelope,
+      `settings-${command.mode}`,
+      modeSettingsText(settings, command.mode, studioRegistry(runtime)),
+    );
     return "processed";
   }
   if (command.action === "reset") {
     const next = resetSettings(settings, command.target);
     await runtime.store.putSettings(record.senderHash, next);
     const message = command.target === "all"
-      ? "Reset all model settings to the committed defaults. " + allSettingsText(next)
-      : `Reset ${command.target} to its committed default. ${modeSettingsText(next, command.target)}`;
+      ? "Reset all model settings to the committed defaults. " + allSettingsText(next, studioRegistry(runtime))
+      : `Reset ${command.target} to its committed default. ${modeSettingsText(next, command.target, studioRegistry(runtime))}`;
     await enqueueResponse(runtime, record, envelope, `settings-reset-${command.target}`, message);
     return "processed";
   }
 
   const current = settings.modes[command.mode];
   if (command.action === "select-model") {
-    const resolved = resolveEnabledModel(AIR_MODEL_REGISTRY, command.mode, command.modelSlug);
+    const resolved = resolveEnabledModel(studioRegistry(runtime), command.mode, command.modelSlug);
     if (!resolved.ok) {
       await enqueueResponse(runtime, record, envelope, `settings-model-${command.mode}`, noModelText(command.mode));
       return "processed";
@@ -514,11 +692,17 @@ async function handleModelSettings(
     }
     const next = replaceModeSettings(settings, command.mode, Object.freeze({ ...current, modelSlug: resolved.model.slug }));
     await runtime.store.putSettings(record.senderHash, next);
-    await enqueueResponse(runtime, record, envelope, `settings-model-saved-${command.mode}`, `Selected ${resolved.model.displayName}. ${modeSettingsText(next, command.mode)}`);
+    await enqueueResponse(
+      runtime,
+      record,
+      envelope,
+      `settings-model-saved-${command.mode}`,
+      `Selected ${resolved.model.displayName}. ${modeSettingsText(next, command.mode, studioRegistry(runtime))}`,
+    );
     return "processed";
   }
 
-  const selected = selectedModel(settings, command.mode).model;
+  const selected = selectedModel(settings, command.mode, studioRegistry(runtime)).model;
   if (!selected) {
     await enqueueResponse(runtime, record, envelope, `settings-no-model-${command.mode}`, noModelText(command.mode));
     return "processed";
@@ -631,13 +815,21 @@ function replaceModeSettings(settings: StudioUserSettings, mode: StudioMode, nex
   return Object.freeze({ ...settings, modes: Object.freeze({ ...settings.modes, [mode]: next }) });
 }
 
-function selectedModel(settings: StudioUserSettings, mode: StudioMode): { readonly model?: StudioModel | undefined } {
+function studioRegistry(runtime: StudioRuntime): AirModelRegistry {
+  return runtime.registry ?? AIR_MODEL_REGISTRY;
+}
+
+function selectedModel(
+  settings: StudioUserSettings,
+  mode: StudioMode,
+  registry: AirModelRegistry = AIR_MODEL_REGISTRY,
+): { readonly model?: StudioModel | undefined } {
   const explicit = settings.modes[mode].modelSlug;
   if (explicit !== undefined) {
-    const resolved = resolveEnabledModel(AIR_MODEL_REGISTRY, mode, explicit);
+    const resolved = resolveEnabledModel(registry, mode, explicit);
     return resolved.ok ? { model: resolved.model } : {};
   }
-  const fallback = resolveDefaultModel(AIR_MODEL_REGISTRY, mode);
+  const fallback = resolveDefaultModel(registry, mode);
   return fallback.ok ? { model: fallback.model } : {};
 }
 
@@ -647,8 +839,8 @@ function modelSupportsStoredValues(model: StudioModel, settings: StoredModeSetti
   return settings.durationSeconds !== undefined && model.output.supportedDurationSeconds.includes(settings.durationSeconds);
 }
 
-function modelsText(mode: StudioMode | null): string {
-  const models = listEnabledModels(AIR_MODEL_REGISTRY, mode);
+function modelsText(mode: StudioMode | null, registry: AirModelRegistry = AIR_MODEL_REGISTRY): string {
+  const models = listEnabledModels(registry, mode);
   if (models.length === 0) {
     return mode === null
       ? "No verified models are enabled in this dark deployment. Candidate names are not selectable until catalog, schema, price, and privacy review complete."
@@ -661,21 +853,25 @@ function noModelText(mode: StudioMode): string {
   return `No verified ${mode} model is enabled yet. /models lists only reviewed models; Air will not substitute a different model.`;
 }
 
-function allSettingsText(settings: StudioUserSettings): string {
+function allSettingsText(settings: StudioUserSettings, registry: AirModelRegistry = AIR_MODEL_REGISTRY): string {
   return (["imagine", "animate", "edit-image", "edit-video"] as const)
-    .map((mode) => modeSettingsText(settings, mode))
+    .map((mode) => modeSettingsText(settings, mode, registry))
     .join("\n");
 }
 
-function modeSettingsText(settings: StudioUserSettings, mode: StudioMode): string {
+function modeSettingsText(
+  settings: StudioUserSettings,
+  mode: StudioMode,
+  registry: AirModelRegistry = AIR_MODEL_REGISTRY,
+): string {
   const values = settings.modes[mode];
-  const selected = selectedModel(settings, mode).model;
+  const selected = selectedModel(settings, mode, registry).model;
   const model = selected ? selected.displayName : "No verified model selected";
   const duration = mode === "animate" || mode === "edit-video"
     ? `, duration ${values.durationSeconds ?? DEFAULT_VIDEO_DURATION_SECONDS}s`
     : "";
   const aspectRatio = selected ? `, aspect ${selected.output.lockedAspectRatio}` : "";
-  const choices = listEnabledModels(AIR_MODEL_REGISTRY, mode);
+  const choices = listEnabledModels(registry, mode);
   const choiceText = choices.length > 0
     ? ` Models: ${choices.map((candidate) => candidate.slug).join(", ")}.`
     : " No verified models enabled.";
@@ -810,6 +1006,11 @@ function responsePayload(
 
 function stableRecordId(receiptId: string, purpose: string): string {
   return createHash("sha256").update(`air:v2:outbox:${receiptId}:${purpose}`, "utf8").digest("hex");
+}
+
+/** Separate opaque namespace so a job can never collide with an outbox ID. */
+function stableJobId(receiptId: string): string {
+  return createHash("sha256").update(`air:v2:job:${receiptId}`, "utf8").digest("hex");
 }
 
 async function dispatchOutboxEntry(

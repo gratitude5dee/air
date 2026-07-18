@@ -16,6 +16,7 @@ import {
   type StudioJobRecordWithPayload,
 } from "../../lib/studio/store.js";
 import { executeStudioProviderSubrun } from "../../lib/studio/workflow-executor.js";
+import { drainStudioJobs } from "../../lib/studio/engine.js";
 
 const IDENTITY_SECRET = "workflow-executor-test-identity-secret";
 const QUEUE_KEY = Buffer.alloc(32, 67).toString("base64");
@@ -101,6 +102,7 @@ function fixture(options: {
     output: { count: 1 },
     releaseStamp: { generation, phase },
   };
+  let armed = phase === "dark";
 
   function job(jobId: string): StudioJobRecordWithPayload {
     return createStudioJob({
@@ -112,6 +114,7 @@ function fixture(options: {
       provider: "gmi",
       outputCount: 1,
       reservedCents: 25,
+      releaseStamp: { generation, phase },
       payload: {
         prompt: "a private prompt that must remain encrypted",
         chatGuid: THREAD,
@@ -125,6 +128,7 @@ function fixture(options: {
   }
 
   async function admit(record: StudioJobRecordWithPayload): Promise<void> {
+    await arm();
     await expect(store.admitJob({
       job: record,
       activeJobLimit: 1,
@@ -135,7 +139,8 @@ function fixture(options: {
   }
 
   async function arm(): Promise<void> {
-    if (phase === "dark") return;
+    if (armed) return;
+    armed = true;
     const dark = new StudioStore({
       redis,
       cipher,
@@ -175,9 +180,40 @@ describe("Air provider submission executor", () => {
     const admitted = setup.job("dark-submission");
     await setup.admit(admitted);
 
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(0);
     await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "disabled" });
     expect(provider.submit).not.toHaveBeenCalled();
     await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "admitted" });
+  });
+
+  it("durably schedules admission through one submit and then a bounded recheck", async () => {
+    const provider = fakeProvider({ kind: "accepted", providerRequestId: "scheduled-request-001" });
+    const setup = fixture({ provider });
+    const admitted = setup.job("scheduled-submission");
+    await setup.admit(admitted);
+
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+    expect(provider.submit).toHaveBeenCalledTimes(1);
+    await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "executing" });
+
+    // A submitted provider request is revisited only after the durable
+    // recheck delay, and the submission boundary refuses a second call.
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(0);
+    setup.advance(60_000);
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+    expect(provider.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("removes definitive provider rejection from the durable scheduler", async () => {
+    const provider = fakeProvider({ kind: "definitive_rejection" });
+    const setup = fixture({ provider });
+    const admitted = setup.job("scheduler-definitive-rejection");
+    await setup.admit(admitted);
+
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+    await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "failed" });
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(0);
+    expect(provider.submit).toHaveBeenCalledTimes(1);
   });
 
   it("writes an intent before a fake provider accepts and never resubmits an accepted request", async () => {
@@ -242,7 +278,7 @@ describe("Air provider submission executor", () => {
     const subrunId = deriveOpaqueId(IDENTITY_SECRET, "studio-provider-subrun", admitted.jobId);
     await setup.admit(admitted);
     await setup.arm();
-    await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "reconciliation_required" });
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
 
     const unknownSubrun = await setup.store.getProviderSubrun(subrunId);
     const unknownJob = await setup.store.getJob(admitted.jobId);
@@ -268,6 +304,10 @@ describe("Air provider submission executor", () => {
     const rawAudit = await setup.redis.get(`${STUDIO_REDIS_PREFIX}:workflow-executor-test:reconciliation:audit:${attached.auditId}`);
     expect(rawAudit ?? "").not.toContain("verified-provider-request-123");
     expect(rawAudit ?? "").not.toContain("private prompt");
+
+    const resumed = await setup.store.claimNextJob();
+    expect(resumed?.record).toMatchObject({ jobId: admitted.jobId, state: "executing" });
+    await resumed?.lease.release();
 
     await expect(setup.store.attachProviderRequestForReconciliation({
       subrunId,
@@ -321,6 +361,7 @@ describe("Air provider submission executor", () => {
       reason: "provider_not_found",
       operatorHash: setup.store.operatorAuditHash("on-call-operator"),
     })).resolves.toEqual({ kind: "conflict" });
+    await expect(setup.store.claimNextJob()).resolves.toBeNull();
     expect(provider.submit).toHaveBeenCalledTimes(1);
   });
 

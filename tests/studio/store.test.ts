@@ -15,10 +15,12 @@ import {
   type StudioInboxRecord,
   type StudioJobRecord,
   type StudioJobRecordWithPayload,
+  type StudioReleaseStamp,
 } from "../../lib/studio/store.js";
 
 const identitySecret = "studio-store-test-identity";
 const queueKey = Buffer.alloc(32, 41).toString("base64");
+const darkReleaseStamp: StudioReleaseStamp = Object.freeze({ generation: 0, phase: "dark" });
 
 function fixture(start = Date.UTC(2026, 6, 18, 12, 0, 0)): {
   readonly redis: MemoryRedis;
@@ -90,6 +92,7 @@ function job(
   threadHash: ThreadHash,
   jobId: string,
   now: number,
+  releaseStamp: StudioReleaseStamp = darkReleaseStamp,
 ): StudioJobRecordWithPayload {
   return createStudioJob({
     jobId,
@@ -100,14 +103,77 @@ function job(
     provider: "gmi",
     outputCount: 1,
     reservedCents: 25,
+    releaseStamp,
     payload: {
       prompt: "a private prompt",
       chatGuid: "iMessage;-;+14155550199",
       sendingLine: "+14155550000",
       replyTargetId: "reply-target-guid",
+      execution: {
+        schemaVersion: 1,
+        workflow: {
+          workflowId: "air:imagine:v1",
+          workflowVersion: 1,
+          stepId: "provider-generation",
+        },
+        model: {
+          slug: "verified-model",
+          provider: "gmi",
+          providerModelId: "verified-provider-model",
+        },
+        output: { count: 1 },
+        releaseStamp,
+      },
     },
     cipher,
     now,
+  });
+}
+
+function initialNotifications(options: { readonly tapback?: boolean } = {}): {
+  readonly acknowledgement: {
+    readonly outboxId: string;
+    readonly payload: {
+      readonly kind: "text";
+      readonly text: string;
+      readonly thread: {
+        readonly chatGuid: string;
+        readonly sendingLine: string;
+        readonly replyTargetId: string;
+      };
+    };
+  };
+  readonly tapback?: {
+    readonly outboxId: string;
+    readonly payload: {
+      readonly kind: "tapback";
+      readonly targetMessageId: string;
+      readonly thread: {
+        readonly chatGuid: string;
+        readonly sendingLine: string;
+        readonly replyTargetId: string;
+      };
+    };
+  };
+} {
+  const thread = Object.freeze({
+    chatGuid: "iMessage;-;+14155550199",
+    sendingLine: "+14155550000",
+    replyTargetId: "reply-target-guid",
+  });
+  return Object.freeze({
+    acknowledgement: Object.freeze({
+      outboxId: "initial-job-ack",
+      payload: Object.freeze({ kind: "text" as const, text: "Working on it.", thread }),
+    }),
+    ...(options.tapback === true
+      ? {
+        tapback: Object.freeze({
+          outboxId: "initial-job-tapback",
+          payload: Object.freeze({ kind: "tapback" as const, targetMessageId: "reply-target-guid", thread }),
+        }),
+      }
+      : {}),
   });
 }
 
@@ -955,6 +1021,345 @@ describe("Air v2 studio durable store", () => {
       ...limits,
       perJobCapCents: 10,
     })).toEqual({ admitted: false, reason: "per_job_cap" });
+  });
+
+  it("atomically admits an iMessage job with its acknowledgement and optional tapback before scheduling", async () => {
+    const { redis, store, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const candidate = job(cipher, senderHash, threadHash, "initial-bundle-job", now());
+    const notifications = initialNotifications({ tapback: true });
+    const limits = {
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+    } as const;
+
+    await expect(store.admitJobWithInitialNotifications({
+      job: candidate,
+      ...limits,
+      ...notifications,
+    })).resolves.toMatchObject({
+      admitted: true,
+      job: {
+        jobId: candidate.jobId,
+        initialNotifications: {
+          acknowledgementOutboxId: notifications.acknowledgement.outboxId,
+          tapbackOutboxId: notifications.tapback?.outboxId,
+        },
+      },
+    });
+    const acknowledgement = await store.getOutbox(notifications.acknowledgement.outboxId);
+    const tapback = await store.getOutbox(notifications.tapback?.outboxId ?? "missing-tapback");
+    expect(acknowledgement).toMatchObject({
+      jobId: candidate.jobId,
+      lane: "job-acknowledgement",
+      state: "intent",
+    });
+    expect(tapback).toMatchObject({ jobId: candidate.jobId, lane: "tapback", state: "intent" });
+    expect(await redis.zCard(`${prefix}:outbox:ready`)).toBe(2);
+    const scheduled = await store.claimNextJob();
+    expect(scheduled?.record).toMatchObject({ jobId: candidate.jobId, state: "admitted" });
+    await scheduled?.lease.release();
+  });
+
+  it("orders an initial Like before its acknowledgement and lets an ambiguous Like release the text", async () => {
+    const { store, cipher, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const candidate = job(cipher, senderHash, threadHash, "initial-ordering-job", now());
+    const notifications = initialNotifications({ tapback: true });
+    await expect(store.admitJobWithInitialNotifications({
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      ...notifications,
+    })).resolves.toMatchObject({ admitted: true });
+
+    const tapback = await store.claimNextOutbox();
+    expect(tapback?.record).toMatchObject({
+      outboxId: notifications.tapback?.outboxId,
+      lane: "tapback",
+      sequence: 1,
+    });
+    if (!tapback) throw new Error("expected initial tapback claim");
+    await expect(store.finishOutbox(tapback.record.outboxId, tapback.leaseToken, "send_unknown")).resolves.toBe(true);
+
+    const acknowledgement = await store.claimNextOutbox();
+    expect(acknowledgement?.record).toMatchObject({
+      outboxId: notifications.acknowledgement.outboxId,
+      lane: "job-acknowledgement",
+      sequence: 2,
+    });
+    if (!acknowledgement) throw new Error("expected acknowledgement claim after tapback outcome");
+    await expect(store.finishOutbox(acknowledgement.record.outboxId, acknowledgement.leaseToken, "sent")).resolves.toBe(true);
+    await expect(store.getOutbox(tapback.record.outboxId)).resolves.toMatchObject({ state: "send_unknown" });
+  });
+
+  it("keeps an admitted initial-notification bundle idempotent after a release advance", async () => {
+    const { redis, store: darkStore, cipher, prefix, now, advance } = fixture();
+    const { senderHash, threadHash } = identities();
+    const candidate = job(cipher, senderHash, threadHash, "bundle-retry-job", now());
+    const notifications = initialNotifications({ tapback: true });
+    const limits = {
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+    } as const;
+    await expect(darkStore.admitJobWithInitialNotifications({
+      job: candidate,
+      ...limits,
+      ...notifications,
+    })).resolves.toMatchObject({ admitted: true });
+    advance(1_000);
+    const acknowledgementPayloadKey = `${prefix}:outbox:payload:${notifications.acknowledgement.outboxId}`;
+    const ttlBeforeRetry = await redis.pttl(acknowledgementPayloadKey);
+
+    expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    const activeStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: { generation: 1, phase: "canary" },
+    });
+    expect(await activeStore.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+
+    await expect(activeStore.admitJobWithInitialNotifications({
+      job: candidate,
+      ...limits,
+      ...notifications,
+    })).resolves.toMatchObject({ admitted: true, job: { jobId: candidate.jobId } });
+    expect(await redis.get(`${prefix}:rate:2026-07-18:${senderHash}`)).toBe("1");
+    expect(await redis.get(`${prefix}:spend:2026-07-18`)).toBe("25");
+    expect(await redis.pttl(acknowledgementPayloadKey)).toBe(ttlBeforeRetry);
+  });
+
+  it("does not create any part of an initial bundle when an active release fence is unarmed", async () => {
+    const { redis, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const activeStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: { generation: 1, phase: "canary" },
+    });
+    const candidate = job(cipher, senderHash, threadHash, "unarmed-initial-bundle", now(), { generation: 1, phase: "canary" });
+    const notifications = initialNotifications({ tapback: true });
+
+    await expect(activeStore.admitJobWithInitialNotifications({
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      ...notifications,
+    })).resolves.toEqual({ admitted: false, reason: "release_blocked" });
+    await expect(redis.get(`${prefix}:job:${candidate.jobId}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:job:payload:${candidate.jobId}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:outbox:${notifications.acknowledgement.outboxId}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:outbox:${notifications.tapback?.outboxId ?? "missing"}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:active:${senderHash}`)).resolves.toBeNull();
+  });
+
+  it("fails closed without a reservation when an initial notification record already exists", async () => {
+    const { redis, store, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const candidate = job(cipher, senderHash, threadHash, "orphan-notification-job", now());
+    const notifications = initialNotifications();
+    await redis.set(`${prefix}:outbox:${notifications.acknowledgement.outboxId}`, "orphan-metadata");
+
+    await expect(store.admitJobWithInitialNotifications({
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      ...notifications,
+    })).resolves.toEqual({ admitted: false, reason: "storage_error" });
+    await expect(redis.get(`${prefix}:job:${candidate.jobId}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:job:payload:${candidate.jobId}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:active:${senderHash}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:rate:2026-07-18:${senderHash}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:spend:2026-07-18`)).resolves.toBeNull();
+  });
+
+  it("refuses an acknowledgement or tapback routed outside the encrypted job conversation", async () => {
+    const { redis, store, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const candidate = job(cipher, senderHash, threadHash, "cross-thread-initial-bundle", now());
+    const notifications = initialNotifications({ tapback: true });
+    const crossThreadAcknowledgement = {
+      ...notifications.acknowledgement,
+      payload: {
+        ...notifications.acknowledgement.payload,
+        thread: {
+          ...notifications.acknowledgement.payload.thread,
+          chatGuid: "iMessage;-;+14155550998",
+        },
+      },
+    };
+
+    await expect(store.admitJobWithInitialNotifications({
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      acknowledgement: crossThreadAcknowledgement,
+      tapback: notifications.tapback,
+    })).resolves.toEqual({ admitted: false, reason: "storage_error" });
+    await expect(redis.get(`${prefix}:job:${candidate.jobId}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:outbox:${notifications.acknowledgement.outboxId}`)).resolves.toBeNull();
+  });
+
+  it("omits a tapback cleanly when the inbound message has no stable reply target", async () => {
+    const { redis, store, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const candidate = job(cipher, senderHash, threadHash, "ack-only-job", now());
+    const notifications = initialNotifications();
+    await expect(store.admitJobWithInitialNotifications({
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      ...notifications,
+    })).resolves.toMatchObject({ admitted: true });
+    expect(await redis.zCard(`${prefix}:outbox:ready`)).toBe(1);
+    await expect(store.getOutbox(notifications.acknowledgement.outboxId)).resolves.toMatchObject({
+      lane: "job-acknowledgement",
+    });
+  });
+
+  it("fences new active admissions but preserves an existing retry after a later release change", async () => {
+    const { redis, store: darkStore, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const activeStamp: StudioReleaseStamp = { generation: 1, phase: "canary" };
+    const activeStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: activeStamp,
+    });
+    const candidate = job(cipher, senderHash, threadHash, "active-fenced-job", now(), activeStamp);
+    const limits = {
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+    } as const;
+
+    await expect(activeStore.admitJob({ job: candidate, ...limits }))
+      .resolves.toEqual({ admitted: false, reason: "release_blocked" });
+    await expect(redis.get(`${prefix}:job:${candidate.jobId}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:rate:2026-07-18:${senderHash}`)).resolves.toBeNull();
+    await expect(redis.get(`${prefix}:spend:2026-07-18`)).resolves.toBeNull();
+
+    expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    expect(await activeStore.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+    await expect(activeStore.admitJob({ job: candidate, ...limits })).resolves.toMatchObject({ admitted: true });
+
+    const rollbackStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: { generation: 2, phase: "dark" },
+    });
+    expect(await rollbackStore.advanceReleaseFence(1)).toEqual({ kind: "advanced" });
+
+    // The original stable receipt/job ID wins before current-fence checks;
+    // replaying it must not consume a second reservation or strand the job.
+    await expect(rollbackStore.admitJob({ job: candidate, ...limits })).resolves.toMatchObject({
+      admitted: true,
+      job: { jobId: candidate.jobId },
+    });
+    await expect(redis.get(`${prefix}:rate:2026-07-18:${senderHash}`)).resolves.toBe("1");
+    await expect(redis.get(`${prefix}:spend:2026-07-18`)).resolves.toBe("25");
+    const claim = await rollbackStore.claimNextJob();
+    expect(claim?.record).toMatchObject({ jobId: candidate.jobId, state: "admitted" });
+    await claim?.lease.release();
+  });
+
+  it("claims only matching recoverable job records and fences rescheduling by state version", async () => {
+    const { redis, store, cipher, prefix, now, advance } = fixture();
+    const { senderHash, threadHash } = identities();
+    const limits = {
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+    } as const;
+    const legacy = job(cipher, senderHash, threadHash, "legacy-scheduled-job", now());
+    await expect(store.admitJob({ job: legacy, ...limits })).resolves.toMatchObject({ admitted: true });
+
+    const first = await store.claimNextJob();
+    if (!first) throw new Error("expected scheduled legacy job");
+    expect(first.record.jobId).toBe(legacy.jobId);
+    await expect(store.rescheduleClaimedJob(
+      { ...first.record, stateVersion: first.record.stateVersion + 1 },
+      first.lease.token,
+      1_000,
+    )).resolves.toBe("conflict");
+    await expect(store.rescheduleClaimedJob(first.record, first.lease.token, 1_000)).resolves.toBe("scheduled");
+    await first.lease.release();
+
+    advance(999);
+    await expect(store.claimNextJob()).resolves.toBeNull();
+    advance(1);
+    const resumed = await store.claimNextJob();
+    if (!resumed) throw new Error("expected rescheduled job");
+    await expect(store.transitionJob(legacy.jobId, "admitted", "executing")).resolves.toMatchObject({ state: "executing" });
+    await expect(store.transitionJob(legacy.jobId, "executing", "failed")).resolves.toMatchObject({ state: "failed" });
+    await resumed.lease.release();
+    await expect(store.claimNextJob()).resolves.toBeNull();
+
+    const corrupt = job(cipher, senderHash, threadHash, "corrupt-scheduled-job", now());
+    await expect(store.admitJob({ job: corrupt, ...limits })).resolves.toMatchObject({ admitted: true });
+    const corruptedMetadata = JSON.parse((await redis.get(`${prefix}:job:${corrupt.jobId}`)) ?? "{}") as StudioJobRecord;
+    await redis.set(`${prefix}:job:${corrupt.jobId}`, JSON.stringify({ ...corruptedMetadata, jobId: "wrong-job-id" }));
+    await expect(store.claimNextJob()).resolves.toBeNull();
+    await expect(redis.zCard(`${prefix}:job:ready`)).resolves.toBe(0);
+  });
+
+  it("uses distinct acknowledgement and result lanes for the same job", async () => {
+    const { store } = fixture();
+    const { senderHash } = identities();
+    const payload = {
+      kind: "text" as const,
+      text: "private job response",
+      thread: {
+        chatGuid: "iMessage;-;+14155550199",
+        sendingLine: "+14155550000",
+        replyTargetId: "reply-target-guid",
+      },
+    };
+
+    await expect(store.createOutbox({
+      outboxId: "job-ack-lane",
+      jobId: "same-job",
+      senderHash,
+      lane: "job-acknowledgement",
+      sequence: 1,
+      payload,
+    })).resolves.toMatchObject({ state: "intent" });
+    await expect(store.createOutbox({
+      outboxId: "job-result-lane",
+      jobId: "same-job",
+      senderHash,
+      lane: "job-result",
+      sequence: 1,
+      payload,
+    })).resolves.toMatchObject({ state: "intent" });
   });
 
   it("keeps unresolved job metadata durable while bounding its encrypted snapshot to 24 hours", async () => {

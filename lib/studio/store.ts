@@ -127,6 +127,17 @@ export interface StudioExecutionSnapshot {
   readonly releaseStamp: StudioReleaseStamp;
 }
 
+/**
+ * Immutable evidence that the two initial iMessage effects were created in
+ * the same admission transaction as this job. It contains only opaque IDs,
+ * never message content or addressing data.
+ */
+export interface StudioInitialNotificationManifest {
+  readonly schemaVersion: 1;
+  readonly acknowledgementOutboxId: string;
+  readonly tapbackOutboxId?: string | undefined;
+}
+
 export interface StudioJobRecord {
   readonly schemaVersion: 3;
   readonly jobId: string;
@@ -138,6 +149,19 @@ export interface StudioJobRecord {
   readonly outputCount: number;
   readonly durationSeconds?: number | undefined;
   readonly reservedCents: number;
+  /**
+   * Non-secret activation stamp duplicated from the encrypted execution
+   * snapshot so admission can reject a stale deployment before it reserves
+   * spend or publishes a recoverable job.
+   */
+  readonly releaseStamp: StudioReleaseStamp;
+  /**
+   * Present for jobs admitted through the iMessage creation path. A retry
+   * verifies this bundle before it may republish the job to the scheduler.
+   * Older recovery records intentionally lack it and cannot be mistaken for
+   * a newly accepted iMessage creation request.
+   */
+  readonly initialNotifications?: StudioInitialNotificationManifest | undefined;
   readonly state: StudioJobState;
   readonly stateVersion: number;
   readonly createdAtMs: number;
@@ -145,6 +169,19 @@ export interface StudioJobRecord {
   /** Hydrated only while its separately stored 24-hour payload remains available. */
   readonly encryptedPayload?: EncryptedPayload | undefined;
 }
+
+/**
+ * A short-lived worker ownership token for one durable job. This is distinct
+ * from the provider-subrun lease: owning a job makes it eligible for bounded
+ * recovery work, while the subrun lease remains the final pre-provider-call
+ * fence.
+ */
+export interface StudioJobClaim {
+  readonly record: StudioJobRecord;
+  readonly lease: RedisLease;
+}
+
+export type StudioJobRescheduleResult = "scheduled" | "removed" | "conflict";
 
 /** New job admission always needs an encrypted snapshot to publish atomically. */
 export type StudioJobRecordWithPayload = StudioJobRecord & {
@@ -381,7 +418,10 @@ type CreateStudioOutboxInput = Omit<StudioOutboxRecord,
 
 export type AdmissionResult =
   | { readonly admitted: true; readonly job: StudioJobRecord }
-  | { readonly admitted: false; readonly reason: "active_job" | "user_limit" | "per_job_cap" | "daily_cap" | "storage_error" };
+  | {
+      readonly admitted: false;
+      readonly reason: "active_job" | "user_limit" | "per_job_cap" | "daily_cap" | "release_blocked" | "storage_error";
+    };
 
 export interface StudioStoreOptions {
   readonly redis: RedisLike;
@@ -399,6 +439,23 @@ export interface AdmitStudioJobInput {
   readonly dailyUserJobLimit: number;
   readonly perJobCapCents: number;
   readonly dailySpendCapCents: number;
+}
+
+/**
+ * The two user-visible effects that must exist before a newly admitted job is
+ * eligible for provider submission. Their content stays encrypted in their
+ * own outbox payloads; this type carries it only until the atomic admission
+ * script persists it.
+ */
+export interface StudioInitialJobNotification {
+  readonly outboxId: string;
+  readonly payload: StudioOutboxPayload;
+}
+
+export interface AdmitStudioJobWithInitialNotificationsInput extends AdmitStudioJobInput {
+  readonly acknowledgement: StudioInitialJobNotification;
+  /** Best-effort like reaction when the inbound event has a stable target. */
+  readonly tapback?: StudioInitialJobNotification | undefined;
 }
 
 /**
@@ -424,6 +481,8 @@ const SETTINGS_TTL_SECONDS = 90 * 24 * 60 * 60;
 const PENDING_TTL_SECONDS = 10 * 60;
 const PENDING_TTL_MS = PENDING_TTL_SECONDS * 1_000;
 const LEASE_TTL_MS = 90_000;
+/** Scan a bounded set of due entries when a stale lease occupies the head. */
+const JOB_CLAIM_SCAN_LIMIT = 16;
 /**
  * A provider submit needs its full bounded lease plus a small persistence
  * margin before the immutable encrypted job payload expires.  This is a
@@ -754,18 +813,58 @@ export class StudioStore {
     if (!hasValidAdmissionBounds(input)) {
       return Object.freeze({ admitted: false, reason: "storage_error" });
     }
+    const now = this.now();
+    const jobKey = this.jobKey(input.job.jobId);
+
+    // A deterministic webhook retry must recover the original reservation
+    // even if a later release has changed the live fence or policy caps. Do
+    // not make the retry re-prove mutable admission policy. The sender/thread
+    // match prevents a guessed opaque job ID from exposing another scope.
+    const existing = parseStored<StudioJobRecord>(await this.redis.get(jobKey));
+    if (existing) {
+      if (
+        existing.jobId !== input.job.jobId
+        || existing.senderHash !== input.job.senderHash
+        || existing.threadHash !== input.job.threadHash
+      ) {
+        return Object.freeze({ admitted: false, reason: "storage_error" });
+      }
+      if (isJobQueueEligibleState(existing.state)) {
+        await this.redis.zAdd(this.readyJobKey(), [{ score: now, value: existing.jobId }]);
+      }
+      return Object.freeze({ admitted: true, job: await this.hydrateJobPayload(existing) });
+    }
+
+    if (!sameReleaseStamp(input.job.releaseStamp, this.releaseStamp)) {
+      return Object.freeze({ admitted: false, reason: "release_blocked" });
+    }
+    try {
+      const payload = this.decryptJobPayload(input.job);
+      if (!payload.execution || !isExecutionSnapshotForJob(payload.execution, input.job)) {
+        return Object.freeze({ admitted: false, reason: "storage_error" });
+      }
+    } catch {
+      return Object.freeze({ admitted: false, reason: "storage_error" });
+    }
     if (input.job.reservedCents > input.perJobCapCents) {
       return Object.freeze({ admitted: false, reason: "per_job_cap" });
     }
-    const day = utcDay(this.now());
+    const day = utcDay(now);
     const activeKey = this.activeJobKey(input.job.senderHash);
     const userCountKey = this.userDailyKey(input.job.senderHash, day);
     const dailySpendKey = this.dailySpendKey(day);
-    const jobKey = this.jobKey(input.job.jobId);
     const jobPayloadKey = this.jobPayloadKey(input.job.jobId);
-    const ttl = secondsToUtcMidnight(this.now());
+    const ttl = secondsToUtcMidnight(now);
     const result = await this.redis.eval(ADMIT_JOB_LUA, {
-      keys: [activeKey, userCountKey, dailySpendKey, jobKey, jobPayloadKey],
+      keys: [
+        activeKey,
+        userCountKey,
+        dailySpendKey,
+        jobKey,
+        jobPayloadKey,
+        this.readyJobKey(),
+        this.releaseFenceKey(),
+      ],
       arguments: [
         input.job.jobId,
         JSON.stringify(jobMetadata(input.job)),
@@ -775,6 +874,9 @@ export class StudioStore {
         String(input.dailyUserJobLimit),
         String(input.dailySpendCapCents),
         String(input.job.reservedCents),
+        String(now),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
       ],
     });
     const code = Array.isArray(result) ? result[0] : result;
@@ -786,7 +888,151 @@ export class StudioStore {
       }
       return Object.freeze({ admitted: true, job: await this.hydrateJobPayload(existing) });
     }
-    if (code === "active_job" || code === "user_limit" || code === "daily_cap") {
+    if (code === "active_job" || code === "user_limit" || code === "daily_cap" || code === "release_blocked") {
+      return Object.freeze({ admitted: false, reason: code });
+    }
+    return Object.freeze({ admitted: false, reason: "storage_error" });
+  }
+
+  /**
+   * The creation-path admission boundary. A job reservation, its encrypted
+   * snapshot, the durable scheduler entry, and the acknowledgement/tapback
+   * intents are committed by one Lua transaction. No worker can observe a
+   * newly ready job before those initial user-visible intents exist.
+   *
+   * `admitJob()` remains for legacy/reconciliation fixtures. New inbound
+   * creation code must use this method so it cannot crash between reservation
+   * and acknowledgement publication.
+   */
+  public async admitJobWithInitialNotifications(
+    input: AdmitStudioJobWithInitialNotificationsInput,
+  ): Promise<AdmissionResult> {
+    if (!hasValidAdmissionBounds(input)) {
+      return Object.freeze({ admitted: false, reason: "storage_error" });
+    }
+    if (!isValidInitialJobNotification(input.acknowledgement, "text")) {
+      return Object.freeze({ admitted: false, reason: "storage_error" });
+    }
+    if (input.tapback !== undefined && !isValidInitialJobNotification(input.tapback, "tapback")) {
+      return Object.freeze({ admitted: false, reason: "storage_error" });
+    }
+    if (input.tapback?.outboxId === input.acknowledgement.outboxId) {
+      return Object.freeze({ admitted: false, reason: "storage_error" });
+    }
+    let jobPayload: StudioJobPayload;
+    try {
+      const payload = this.decryptJobPayload(input.job);
+      if (!payload.execution || !isExecutionSnapshotForJob(payload.execution, input.job)) {
+        return Object.freeze({ admitted: false, reason: "storage_error" });
+      }
+      jobPayload = payload;
+    } catch {
+      return Object.freeze({ admitted: false, reason: "storage_error" });
+    }
+    // The caller may choose only the human-visible acknowledgement text. Its
+    // routing must be the exact encrypted job route; otherwise an internal
+    // misuse could acknowledge one conversation while charging another.
+    if (
+      !isInitialNotificationBoundToJob(input.acknowledgement, "text", jobPayload)
+      || (input.tapback !== undefined && !isInitialNotificationBoundToJob(input.tapback, "tapback", jobPayload))
+    ) {
+      return Object.freeze({ admitted: false, reason: "storage_error" });
+    }
+
+    const acknowledgement = this.buildOutboxRecord({
+      outboxId: input.acknowledgement.outboxId,
+      jobId: input.job.jobId,
+      senderHash: input.job.senderHash,
+      lane: "job-acknowledgement",
+      // A job-scoped tapback shares this lane at sequence one, so the text
+      // acknowledgement cannot physically cross it in another worker.
+      sequence: input.tapback === undefined ? 1 : 2,
+      payload: input.acknowledgement.payload,
+    });
+    const tapback = input.tapback === undefined
+      ? undefined
+      : this.buildOutboxRecord({
+        outboxId: input.tapback.outboxId,
+        jobId: input.job.jobId,
+        senderHash: input.job.senderHash,
+        lane: "tapback",
+        sequence: 1,
+        payload: input.tapback.payload,
+      });
+    const initialNotifications: StudioInitialNotificationManifest = Object.freeze({
+      schemaVersion: 1,
+      acknowledgementOutboxId: acknowledgement.outboxId,
+      ...(tapback === undefined ? {} : { tapbackOutboxId: tapback.outboxId }),
+    });
+    // The manifest is part of the durable job metadata, not caller-provided
+    // data. It binds retry-time validation to exactly the two intents this
+    // store transaction is about to create.
+    const job: StudioJobRecordWithPayload = Object.freeze({
+      ...input.job,
+      initialNotifications,
+    });
+    const now = this.now();
+    const ttl = secondsToUtcMidnight(now);
+    const day = utcDay(now);
+    const result = await this.redis.eval(ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_LUA, {
+      keys: [
+        this.activeJobKey(job.senderHash),
+        this.userDailyKey(job.senderHash, day),
+        this.dailySpendKey(day),
+        this.jobKey(job.jobId),
+        this.jobPayloadKey(job.jobId),
+        this.readyJobKey(),
+        this.releaseFenceKey(),
+        this.readyOutboxKey(),
+        this.outboxKey(acknowledgement.outboxId),
+        this.outboxPayloadKey(acknowledgement.outboxId),
+        this.outboxLaneKey(acknowledgement),
+        tapback === undefined ? this.unusedInitialAdmissionOutboxKey() : this.outboxKey(tapback.outboxId),
+        tapback === undefined ? this.unusedInitialAdmissionOutboxPayloadKey() : this.outboxPayloadKey(tapback.outboxId),
+        tapback === undefined ? this.unusedInitialAdmissionOutboxLaneKey() : this.outboxLaneKey(tapback),
+      ],
+      arguments: [
+        job.jobId,
+        JSON.stringify(jobMetadata(job)),
+        JSON.stringify(requiredJobPayload(job)),
+        String(ttl),
+        String(JOB_PAYLOAD_TTL_SECONDS),
+        String(input.dailyUserJobLimit),
+        String(input.dailySpendCapCents),
+        String(job.reservedCents),
+        String(now),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+        String(input.perJobCapCents),
+        JSON.stringify(outboxMetadata(acknowledgement)),
+        JSON.stringify(requiredOutboxPayload(acknowledgement)),
+        acknowledgement.outboxId,
+        String(acknowledgement.sequence),
+        String(acknowledgement.dueAtMs),
+        tapback === undefined ? "" : JSON.stringify(outboxMetadata(tapback)),
+        tapback === undefined ? "" : JSON.stringify(requiredOutboxPayload(tapback)),
+        tapback?.outboxId ?? "",
+        tapback === undefined ? "0" : String(tapback.sequence),
+        tapback === undefined ? "0" : String(tapback.dueAtMs),
+        tapback === undefined ? "0" : "1",
+        String(OUTBOX_PAYLOAD_TTL_SECONDS),
+      ],
+    });
+    const code = Array.isArray(result) ? result[0] : result;
+    if (code === "admitted") return Object.freeze({ admitted: true, job });
+    if (code === "existing") {
+      const existing = parseStored<StudioJobRecord>(Array.isArray(result) && typeof result[1] === "string" ? result[1] : null);
+      if (
+        !existing
+        || existing.jobId !== job.jobId
+        || existing.senderHash !== job.senderHash
+        || existing.threadHash !== job.threadHash
+      ) {
+        return Object.freeze({ admitted: false, reason: "storage_error" });
+      }
+      return Object.freeze({ admitted: true, job: await this.hydrateJobPayload(existing) });
+    }
+    if (code === "active_job" || code === "user_limit" || code === "daily_cap" || code === "per_job_cap" || code === "release_blocked") {
       return Object.freeze({ admitted: false, reason: code });
     }
     return Object.freeze({ admitted: false, reason: "storage_error" });
@@ -795,6 +1041,85 @@ export class StudioStore {
   public async getJob(jobId: string): Promise<StudioJobRecord | null> {
     const metadata = parseStored<StudioJobRecord>(await this.redis.get(this.jobKey(jobId)));
     return metadata ? this.hydrateJobPayload(metadata) : null;
+  }
+
+  /**
+   * Claims one due admitted/executing job from the durable recovery index.
+   * The queue head is only a scheduling hint: a separate token lease prevents
+   * two serverless invocations from advancing the same job concurrently.
+   */
+  public async claimNextJob(): Promise<StudioJobClaim | null> {
+    const candidates = await this.redis.zRangeByScore(
+      this.readyJobKey(),
+      Number.NEGATIVE_INFINITY,
+      this.now(),
+      { limit: JOB_CLAIM_SCAN_LIMIT },
+    );
+    for (const jobId of candidates) {
+      // Existing v2 jobs predate the opaque deterministic receipt IDs. Keep
+      // their bounded identifiers recoverable instead of stranding an already
+      // reserved job during the migration.
+      if (!isSafeRecordString(jobId, 160)) {
+        await this.redis.zRem(this.readyJobKey(), jobId);
+        continue;
+      }
+      const lease = await acquireRedisLease(this.redis, this.jobLeaseKey(jobId), {
+        now: this.now,
+        ttlMs: LEASE_TTL_MS,
+      });
+      if (!lease) continue;
+
+      let job: StudioJobRecord | null;
+      try {
+        job = await this.getJob(jobId);
+      } catch {
+        job = null;
+      }
+      if (!job || job.jobId !== jobId || !isJobQueueEligibleState(job.state)) {
+        await this.redis.zRem(this.readyJobKey(), jobId);
+        await lease.release();
+        continue;
+      }
+      return Object.freeze({ record: job, lease });
+    }
+    return null;
+  }
+
+  /**
+   * Requeues a claimed nonterminal job under the same ownership token. A stale
+   * worker cannot reintroduce a terminal or newer-version job after a later
+   * transition has won.
+   */
+  public async rescheduleClaimedJob(
+    job: Pick<StudioJobRecord, "jobId" | "stateVersion">,
+    leaseToken: string,
+    delayMs: number,
+  ): Promise<StudioJobRescheduleResult> {
+    if (
+      !isSafeRecordString(job.jobId, 160)
+      || !isSafeRecordString(leaseToken, 256)
+      || !Number.isSafeInteger(job.stateVersion)
+      || job.stateVersion < 1
+      || !Number.isSafeInteger(delayMs)
+      || delayMs < 0
+      || delayMs > 24 * 60 * 60 * 1_000
+    ) return "conflict";
+    const now = this.now();
+    const dueAtMs = now + delayMs;
+    if (!Number.isSafeInteger(dueAtMs)) return "conflict";
+    const result = await this.redis.eval(RESCHEDULE_CLAIMED_JOB_LUA, {
+      keys: [this.jobKey(job.jobId), this.jobLeaseKey(job.jobId), this.readyJobKey()],
+      arguments: [leaseToken, String(job.stateVersion), String(now), String(dueAtMs), job.jobId],
+    });
+    if (result === 1 || result === "1") return "scheduled";
+    if (result === 2 || result === "2") return "removed";
+    return "conflict";
+  }
+
+  /** Removes a known terminal or reconciliation-only job from automatic work. */
+  public async removeJobFromQueue(jobId: string): Promise<void> {
+    if (!isSafeRecordString(jobId, 160)) return;
+    await this.redis.zRem(this.readyJobKey(), jobId);
   }
 
   public decryptJobPayload(job: StudioJobRecord): StudioJobPayload {
@@ -819,7 +1144,12 @@ export class StudioStore {
     const job = await this.getJob(jobId);
     if (!job || job.state !== from || !canTransitionJob(from, to)) return null;
     const result = await this.redis.eval(COMPARE_AND_TRANSITION_JOB_LUA, {
-      keys: [this.jobKey(jobId), this.jobPayloadKey(jobId), this.activeJobKey(job.senderHash)],
+      keys: [
+        this.jobKey(jobId),
+        this.jobPayloadKey(jobId),
+        this.activeJobKey(job.senderHash),
+        this.readyJobKey(),
+      ],
       arguments: [from, String(job.stateVersion), to, String(this.now()), String(TERMINAL_METADATA_TTL_SECONDS), job.jobId, isTerminalJobState(to) ? "1" : "0"],
     });
     const next = parseStored<StudioJobRecord>(typeof result === "string" ? result : null);
@@ -1034,6 +1364,7 @@ export class StudioStore {
         this.jobKey(subrun.jobId),
         this.jobPayloadKey(subrun.jobId),
         this.reconciliationAuditKey(audit.auditId),
+        this.readyJobKey(),
       ],
       arguments: [
         String(input.expectedSubrunVersion),
@@ -1082,6 +1413,7 @@ export class StudioStore {
         this.jobPayloadKey(subrun.jobId),
         this.activeJobKey(job.senderHash),
         this.reconciliationAuditKey(audit.auditId),
+        this.readyJobKey(),
       ],
       arguments: [
         String(input.expectedSubrunVersion),
@@ -1578,6 +1910,8 @@ export class StudioStore {
   private dailySpendKey(day: string): string { return `${this.prefix}:spend:${day}`; }
   private jobKey(jobId: string): string { return `${this.prefix}:job:${jobId}`; }
   private jobPayloadKey(jobId: string): string { return `${this.prefix}:job:payload:${jobId}`; }
+  private readyJobKey(): string { return `${this.prefix}:job:ready`; }
+  private jobLeaseKey(jobId: string): string { return `${this.prefix}:job:lease:${jobId}`; }
   private providerSubrunKey(subrunId: string): string { return `${this.prefix}:provider-subrun:${subrunId}`; }
   private providerSubrunReferenceKey(subrunId: string): string { return `${this.prefix}:provider-subrun:reference:${subrunId}`; }
   private providerSubrunLeaseKey(subrunId: string): string { return `${this.prefix}:provider-subrun:lease:${subrunId}`; }
@@ -1586,10 +1920,15 @@ export class StudioStore {
   private outboxPayloadKey(outboxId: string): string { return `${this.prefix}:outbox:payload:${outboxId}`; }
   private readyOutboxKey(): string { return `${this.prefix}:outbox:ready`; }
   private outboxLeaseKey(outboxId: string): string { return `${this.prefix}:outbox:lease:${outboxId}`; }
+  /** Fixed unused keys keep the optional initial-tapback Lua invocation bounded. */
+  private unusedInitialAdmissionOutboxKey(): string { return `${this.prefix}:outbox:initial-admission:unused`; }
+  private unusedInitialAdmissionOutboxPayloadKey(): string { return `${this.prefix}:outbox:payload:initial-admission:unused`; }
+  private unusedInitialAdmissionOutboxLaneKey(): string { return `${this.prefix}:outbox:lane:initial-admission:unused`; }
   /**
    * A lane is only shared where user-visible ordering is meaningful. Independent
-   * request/response and tapback effects must never block each other, while a
-   * job acknowledgement/result pair and onboarding bubbles remain serialized.
+   * request/response and generic tapback effects must never block each other.
+   * The one exception is a job's initial tapback + acknowledgement pair: they
+   * share a lane so Like → text remains ordered across serverless workers.
    */
   private outboxLaneKey(record: Pick<StudioOutboxRecord, "outboxId" | "senderHash" | "lane" | "laneIdentity" | "jobId">): string {
     const base = `${this.prefix}:outbox:lane:${record.senderHash}`;
@@ -1597,12 +1936,15 @@ export class StudioStore {
       case "onboarding":
         return `${base}:onboarding`;
       case "job-acknowledgement":
+        return `${base}:job-initial:${record.jobId ?? record.laneIdentity ?? record.outboxId}`;
       case "job-result":
-        return `${base}:job:${record.jobId ?? record.laneIdentity ?? record.outboxId}`;
+        return `${base}:job-result:${record.jobId ?? record.laneIdentity ?? record.outboxId}`;
       case "request-response":
         return `${base}:request:${record.laneIdentity ?? record.outboxId}`;
       case "tapback":
-        return `${base}:tapback:${record.laneIdentity ?? record.outboxId}`;
+        return record.jobId === undefined
+          ? `${base}:tapback:${record.laneIdentity ?? record.outboxId}`
+          : `${base}:job-initial:${record.jobId}`;
     }
   }
 }
@@ -1620,6 +1962,7 @@ export function createStudioJob(input: Omit<StudioJobRecord, "schemaVersion" | "
     outputCount: input.outputCount,
     ...(input.durationSeconds === undefined ? {} : { durationSeconds: input.durationSeconds }),
     reservedCents: input.reservedCents,
+    releaseStamp: normalizeReleaseStamp(input.releaseStamp),
     state: "admitted",
     stateVersion: 1,
     createdAtMs: now,
@@ -1634,6 +1977,11 @@ export function canTransitionJob(from: StudioJobState, to: StudioJobState): bool
 
 export function canTransitionOutbox(from: StudioOutboxState, to: StudioOutboxState): boolean {
   return (OUTBOX_TRANSITIONS[from] ?? []).includes(to);
+}
+
+/** Only these states may advance without an explicit operator reconciliation. */
+export function isJobQueueEligibleState(state: StudioJobState): boolean {
+  return state === "admitted" || state === "executing";
 }
 
 const JOB_TRANSITIONS: Readonly<Record<StudioJobState, readonly StudioJobState[]>> = Object.freeze({
@@ -1800,13 +2148,40 @@ return payload
 `;
 
 const ADMIT_JOB_LUA = `
--- AIR_STUDIO_ADMIT_JOB_V3
+-- AIR_STUDIO_ADMIT_JOB_V4
 -- KEYS: active sender fence, daily user count, daily spend, job metadata,
---       encrypted job payload
+--       encrypted job payload, durable job-ready index, release fence
 -- ARGV: job id, metadata, payload, daily ttl, payload ttl, user limit,
---       spend cap, reserved cents
+--       spend cap, reserved cents, now, release generation, release phase
 local existing = redis.call('GET', KEYS[4])
-if existing then return {'existing', existing} end
+-- A retry must preserve the original admission even if a later deployment has
+-- advanced the shared fence. The current fence governs only a new reservation.
+if existing then
+  local ok, record = pcall(cjson.decode, existing)
+  if ok and type(record) == 'table'
+    and (record.state == 'admitted' or record.state == 'executing') then
+    redis.call('ZADD', KEYS[6], tonumber(ARGV[9]), ARGV[1])
+  end
+  return {'existing', existing}
+end
+local metadata = cjson.decode(ARGV[2])
+local stamp = metadata.releaseStamp
+if type(stamp) ~= 'table'
+  or type(stamp.generation) ~= 'number' or stamp.generation < 0
+  or stamp.generation ~= math.floor(stamp.generation)
+  or stamp.generation ~= tonumber(ARGV[10])
+  or stamp.phase ~= ARGV[11] then return {'release_blocked'} end
+local fenceRaw = redis.call('GET', KEYS[7])
+if fenceRaw then
+  local ok, fence = pcall(cjson.decode, fenceRaw)
+  if not ok or type(fence) ~= 'table' or fence.schemaVersion ~= 1
+    or type(fence.generation) ~= 'number' or fence.generation < 0
+    or fence.generation ~= math.floor(fence.generation)
+    or (fence.phase ~= 'dark' and fence.phase ~= 'canary' and fence.phase ~= 'production') then return {'release_blocked'} end
+  if fence.generation ~= tonumber(ARGV[10]) or fence.phase ~= ARGV[11] then return {'release_blocked'} end
+elseif ARGV[11] ~= 'dark' then
+  return {'release_blocked'}
+end
 if redis.call('EXISTS', KEYS[5]) == 1 then return {'storage_error'} end
 local active = redis.call('GET', KEYS[1])
 if active then return {'active_job'} end
@@ -1825,6 +2200,274 @@ redis.call('SET', KEYS[3], tostring(spend + cost), 'EX', ARGV[4])
 -- refreshed beyond its hard 24-hour privacy deadline.
 redis.call('SET', KEYS[4], ARGV[2])
 redis.call('SET', KEYS[5], ARGV[3], 'EX', ARGV[5])
+redis.call('ZADD', KEYS[6], tonumber(ARGV[9]), ARGV[1])
+return {'admitted'}
+`;
+
+const ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_LUA = `
+-- AIR_STUDIO_ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_V1
+-- KEYS: active sender fence, daily user count, daily spend, job metadata,
+--       encrypted job payload, durable job-ready index, release fence,
+--       outbox-ready index, acknowledgement metadata/payload/lane,
+--       optional tapback metadata/payload/lane
+-- ARGV: job id, metadata, payload, daily ttl, job payload ttl, user limit,
+--       daily spend cap, reserved cents, now, release generation/phase,
+--       per-job cap, acknowledgement metadata/payload/id/sequence/due,
+--       optional tapback metadata/payload/id/sequence/due/flag, outbox ttl
+local function keyType(key)
+  local response = redis.call('TYPE', key)
+  return response and response.ok or ''
+end
+
+local function isStringOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'string'
+end
+
+local function isZsetOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'zset'
+end
+
+local function validStamp(stamp)
+  return type(stamp) == 'table'
+    and type(stamp.generation) == 'number'
+    and stamp.generation >= 0
+    and stamp.generation == math.floor(stamp.generation)
+    and (stamp.phase == 'dark' or stamp.phase == 'canary' or stamp.phase == 'production')
+    and (stamp.phase == 'dark' or stamp.generation >= 1)
+end
+
+local function sameStamp(left, right)
+  return validStamp(left) and validStamp(right)
+    and left.generation == right.generation and left.phase == right.phase
+end
+
+local function validNotificationManifest(manifest, acknowledgementId, tapbackId, hasTapback)
+  if type(manifest) ~= 'table' or manifest.schemaVersion ~= 1
+    or type(manifest.acknowledgementOutboxId) ~= 'string'
+    or manifest.acknowledgementOutboxId ~= acknowledgementId then return false end
+  if hasTapback then
+    return type(manifest.tapbackOutboxId) == 'string' and manifest.tapbackOutboxId == tapbackId
+  end
+  return manifest.tapbackOutboxId == nil
+end
+
+-- Existing acknowledgements may already be sent and have their encrypted
+-- payload scrubbed. Their immutable metadata is sufficient to prove the
+-- bundle was created before the job was allowed back onto the scheduler.
+local function validExistingOutbox(record, outboxId, jobId, senderHash, lane, stamp, sequence)
+  return type(record) == 'table'
+    and record.outboxId == outboxId
+    and record.jobId == jobId
+    and record.senderHash == senderHash
+    and record.lane == lane
+    and type(record.sequence) == 'number' and record.sequence == sequence
+    and sameStamp(record.releaseStamp, stamp)
+end
+
+local function validNewOutbox(record, outboxId, jobId, senderHash, lane, stamp, sequence, dueAt)
+  return validExistingOutbox(record, outboxId, jobId, senderHash, lane, stamp, sequence)
+    and record.state == 'intent'
+    and record.attempts == 0
+    and record.stateVersion == 1
+    and record.dueAtMs == dueAt
+end
+
+local function nonnegativeInteger(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+
+local function positiveInteger(value)
+  return nonnegativeInteger(value) and value >= 1
+end
+
+local jobId = ARGV[1]
+local okCandidate, candidate = pcall(cjson.decode, ARGV[2])
+if not okCandidate or type(candidate) ~= 'table'
+  or candidate.jobId ~= jobId
+  or type(candidate.senderHash) ~= 'string'
+  or type(candidate.threadHash) ~= 'string' then return {'storage_error'} end
+
+local hasTapback = ARGV[23] == '1'
+if not hasTapback and ARGV[23] ~= '0' then return {'storage_error'} end
+local expectedAcknowledgementSequence = hasTapback and 2 or 1
+local acknowledgementId = ARGV[15]
+local tapbackId = ARGV[20]
+
+-- The existing branch is deliberately before every release/cap/fence check:
+-- a deterministic webhook retry must recover its original reservation even
+-- after policy or deployment state has changed.
+if not isStringOrMissing(KEYS[4]) then return {'storage_error'} end
+local existing = redis.call('GET', KEYS[4])
+if existing then
+  local okExisting, existingRecord = pcall(cjson.decode, existing)
+  if not okExisting or type(existingRecord) ~= 'table'
+    or existingRecord.jobId ~= jobId
+    or existingRecord.senderHash ~= candidate.senderHash
+    or existingRecord.threadHash ~= candidate.threadHash
+    or not validStamp(existingRecord.releaseStamp)
+    or not validNotificationManifest(existingRecord.initialNotifications, acknowledgementId, tapbackId, hasTapback) then
+    return {'notification_incomplete'}
+  end
+  if not isStringOrMissing(KEYS[9])
+    or (hasTapback and not isStringOrMissing(KEYS[12])) then return {'notification_incomplete'} end
+  local acknowledgementRaw = redis.call('GET', KEYS[9])
+  local okAcknowledgement, acknowledgement = pcall(cjson.decode, acknowledgementRaw or '')
+  if not acknowledgementRaw or not okAcknowledgement
+    or not validExistingOutbox(
+      acknowledgement,
+      acknowledgementId,
+      jobId,
+      candidate.senderHash,
+      'job-acknowledgement',
+      existingRecord.releaseStamp,
+      expectedAcknowledgementSequence
+    ) then return {'notification_incomplete'} end
+  if hasTapback then
+    local tapbackRaw = redis.call('GET', KEYS[12])
+    local okTapback, tapback = pcall(cjson.decode, tapbackRaw or '')
+    if not tapbackRaw or not okTapback
+      or not validExistingOutbox(
+        tapback,
+        tapbackId,
+        jobId,
+        candidate.senderHash,
+        'tapback',
+        existingRecord.releaseStamp,
+        1
+      ) then return {'notification_incomplete'} end
+  end
+  if (existingRecord.state == 'admitted' or existingRecord.state == 'executing') then
+    if not isZsetOrMissing(KEYS[6]) then return {'notification_incomplete'} end
+    redis.call('ZADD', KEYS[6], tonumber(ARGV[9]), jobId)
+  end
+  return {'existing', existing}
+end
+
+local dailyTtl = tonumber(ARGV[4])
+local jobPayloadTtl = tonumber(ARGV[5])
+local userLimit = tonumber(ARGV[6])
+local dailySpendCap = tonumber(ARGV[7])
+local reservedCents = tonumber(ARGV[8])
+local now = tonumber(ARGV[9])
+local releaseGeneration = tonumber(ARGV[10])
+local perJobCap = tonumber(ARGV[12])
+local acknowledgementSequence = tonumber(ARGV[16])
+local acknowledgementDueAt = tonumber(ARGV[17])
+local tapbackSequence = tonumber(ARGV[21])
+local tapbackDueAt = tonumber(ARGV[22])
+local outboxPayloadTtl = tonumber(ARGV[24])
+if not positiveInteger(dailyTtl) or not positiveInteger(jobPayloadTtl)
+  or not positiveInteger(userLimit) or not nonnegativeInteger(dailySpendCap)
+  or not nonnegativeInteger(reservedCents) or not nonnegativeInteger(now)
+  or not nonnegativeInteger(releaseGeneration) or not nonnegativeInteger(perJobCap)
+  or acknowledgementSequence ~= expectedAcknowledgementSequence or not nonnegativeInteger(acknowledgementDueAt)
+  or (hasTapback and (tapbackSequence ~= 1 or not nonnegativeInteger(tapbackDueAt)))
+  or not positiveInteger(outboxPayloadTtl) then return {'storage_error'} end
+if ARGV[11] ~= 'dark' and ARGV[11] ~= 'canary' and ARGV[11] ~= 'production' then return {'release_blocked'} end
+if not validStamp(candidate.releaseStamp)
+  or candidate.releaseStamp.generation ~= releaseGeneration
+  or candidate.releaseStamp.phase ~= ARGV[11] then return {'release_blocked'} end
+
+-- Validate every participating record and index before the first mutation.
+if not isStringOrMissing(KEYS[1]) or not isStringOrMissing(KEYS[2])
+  or not isStringOrMissing(KEYS[3]) or not isStringOrMissing(KEYS[5])
+  or not isZsetOrMissing(KEYS[6]) or not isStringOrMissing(KEYS[7])
+  or not isZsetOrMissing(KEYS[8]) or not isStringOrMissing(KEYS[9])
+  or not isStringOrMissing(KEYS[10]) or not isZsetOrMissing(KEYS[11])
+  or (hasTapback and (
+    not isStringOrMissing(KEYS[12]) or not isStringOrMissing(KEYS[13]) or not isZsetOrMissing(KEYS[14])
+  )) then return {'storage_error'} end
+
+local fenceRaw = redis.call('GET', KEYS[7])
+if fenceRaw then
+  local okFence, fence = pcall(cjson.decode, fenceRaw)
+  if not okFence or type(fence) ~= 'table' or fence.schemaVersion ~= 1
+    or not validStamp(fence)
+    or fence.generation ~= releaseGeneration or fence.phase ~= ARGV[11] then return {'release_blocked'} end
+elseif ARGV[11] ~= 'dark' then
+  return {'release_blocked'}
+end
+-- A known release revocation wins over a cost response: this stale worker
+-- must not publish any user-visible effect while a rollback is in force.
+if reservedCents > perJobCap then return {'per_job_cap'} end
+
+local okPayload, encryptedJobPayload = pcall(cjson.decode, ARGV[3])
+local okAcknowledgement, acknowledgement = pcall(cjson.decode, ARGV[13])
+local okAcknowledgementPayload, acknowledgementPayload = pcall(cjson.decode, ARGV[14])
+if not okPayload or type(encryptedJobPayload) ~= 'table'
+  or not okAcknowledgement or type(acknowledgement) ~= 'table'
+  or not okAcknowledgementPayload or type(acknowledgementPayload) ~= 'table'
+  or not validNotificationManifest(candidate.initialNotifications, acknowledgementId, tapbackId, hasTapback)
+  or not validNewOutbox(
+    acknowledgement,
+    acknowledgementId,
+    jobId,
+    candidate.senderHash,
+    'job-acknowledgement',
+    candidate.releaseStamp,
+    acknowledgementSequence,
+    acknowledgementDueAt
+  ) then return {'storage_error'} end
+
+local tapback = nil
+if hasTapback then
+  local okTapback, parsedTapback = pcall(cjson.decode, ARGV[18])
+  local okTapbackPayload, parsedTapbackPayload = pcall(cjson.decode, ARGV[19])
+  if not okTapback or type(parsedTapback) ~= 'table'
+    or not okTapbackPayload or type(parsedTapbackPayload) ~= 'table'
+    or not validNewOutbox(
+      parsedTapback,
+      tapbackId,
+      jobId,
+      candidate.senderHash,
+      'tapback',
+      candidate.releaseStamp,
+      tapbackSequence,
+      tapbackDueAt
+    ) then return {'storage_error'} end
+  tapback = parsedTapback
+end
+
+if redis.call('EXISTS', KEYS[5]) == 1
+  or redis.call('EXISTS', KEYS[9]) == 1 or redis.call('EXISTS', KEYS[10]) == 1
+  or (hasTapback and (redis.call('EXISTS', KEYS[12]) == 1 or redis.call('EXISTS', KEYS[13]) == 1)) then
+  return {'storage_error'}
+end
+if redis.call('ZSCORE', KEYS[6], jobId) then return {'storage_error'} end
+if #redis.call('ZRANGEBYSCORE', KEYS[11], acknowledgementSequence, acknowledgementSequence, 'LIMIT', 0, 1) > 0 then
+  return {'storage_error'}
+end
+if hasTapback and #redis.call('ZRANGEBYSCORE', KEYS[14], tapbackSequence, tapbackSequence, 'LIMIT', 0, 1) > 0 then
+  return {'storage_error'}
+end
+
+local active = redis.call('GET', KEYS[1])
+if active then return {'active_job'} end
+local userCount = tonumber(redis.call('GET', KEYS[2]) or '0')
+local spend = tonumber(redis.call('GET', KEYS[3]) or '0')
+if not nonnegativeInteger(userCount) or not nonnegativeInteger(spend) then return {'storage_error'} end
+if userCount >= userLimit then return {'user_limit'} end
+if spend + reservedCents > dailySpendCap then return {'daily_cap'} end
+
+redis.call('SET', KEYS[1], jobId)
+redis.call('SET', KEYS[2], tostring(userCount + 1), 'EX', dailyTtl)
+redis.call('SET', KEYS[3], tostring(spend + reservedCents), 'EX', dailyTtl)
+redis.call('SET', KEYS[4], ARGV[2])
+redis.call('SET', KEYS[5], ARGV[3], 'EX', jobPayloadTtl)
+redis.call('SET', KEYS[9], ARGV[13])
+redis.call('SET', KEYS[10], ARGV[14], 'EX', outboxPayloadTtl)
+redis.call('ZADD', KEYS[8], acknowledgementDueAt, acknowledgementId)
+redis.call('ZADD', KEYS[11], acknowledgementSequence, acknowledgementId)
+if hasTapback then
+  redis.call('SET', KEYS[12], ARGV[18])
+  redis.call('SET', KEYS[13], ARGV[19], 'EX', outboxPayloadTtl)
+  redis.call('ZADD', KEYS[8], tapbackDueAt, tapbackId)
+  redis.call('ZADD', KEYS[14], tapbackSequence, tapbackId)
+end
+-- Publication is last: all user-visible durable intents exist first.
+redis.call('ZADD', KEYS[6], now, jobId)
 return {'admitted'}
 `;
 
@@ -2231,7 +2874,7 @@ return 1
 `;
 
 const FINISH_OUTBOX_LUA = `
--- AIR_STUDIO_FINISH_OUTBOX_V3
+-- AIR_STUDIO_FINISH_OUTBOX_V4
 if redis.call('GET', KEYS[3]) ~= ARGV[1] then return false end
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
@@ -2254,13 +2897,18 @@ if nextState == 'retryable_failure' then
   redis.call('ZADD', KEYS[4], tonumber(ARGV[3]) + (record.attempts * tonumber(ARGV[7])), ARGV[5])
 else
   redis.call('ZREM', KEYS[4], ARGV[5])
-  if nextState ~= 'send_unknown' then redis.call('ZREM', KEYS[5], ARGV[5]) end
+  -- A job's Like is deliberately best-effort. If its physical outcome is
+  -- unknown, retain that audit state but release the paired acknowledgement
+  -- behind it; otherwise a transient tapback outage could stall paid work.
+  if nextState ~= 'send_unknown' or (record.lane == 'tapback' and record.jobId ~= nil) then
+    redis.call('ZREM', KEYS[5], ARGV[5])
+  end
 end
 return cjson.encode(record)
 `;
 
 const RECONCILE_EXPIRED_OUTBOX_LUA = `
--- AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V3
+-- AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V4
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
 if redis.call('GET', KEYS[3]) then return 0 end
@@ -2271,13 +2919,17 @@ record.stateVersion = record.stateVersion + 1
 record.updatedAtMs = tonumber(ARGV[1])
 redis.call('SET', KEYS[1], cjson.encode(record))
 redis.call('ZREM', KEYS[4], ARGV[3])
--- Keep KEYS[5]'s lane head as a deliberate fail-closed pause.
+-- A crashed job-scoped Like is still an ambiguous physical effect, but it is
+-- best-effort rather than a reason to indefinitely block its acknowledgement.
+if record.lane == 'tapback' and record.jobId ~= nil then
+  redis.call('ZREM', KEYS[5], ARGV[3])
+end
 return 1
 `;
 
 const COMPARE_AND_TRANSITION_JOB_LUA = `
--- AIR_STUDIO_TRANSITION_JOB_V3
--- KEYS: job metadata, encrypted job payload, active sender fence
+-- AIR_STUDIO_TRANSITION_JOB_V5
+-- KEYS: job metadata, encrypted job payload, active sender fence, job-ready index
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local record = cjson.decode(raw)
@@ -2292,10 +2944,37 @@ if ARGV[7] == '1' then
   -- Never delete a newer job's active marker after an old job's terminal
   -- transition. The value is the fencing identity for this particular job.
   if redis.call('GET', KEYS[3]) == ARGV[6] then redis.call('DEL', KEYS[3]) end
+  redis.call('ZREM', KEYS[4], ARGV[6])
 else
   redis.call('SET', KEYS[1], cjson.encode(record))
 end
 return cjson.encode(record)
+`;
+
+const RESCHEDULE_CLAIMED_JOB_LUA = `
+-- AIR_STUDIO_RESCHEDULE_CLAIMED_JOB_V1
+-- KEYS: job metadata, short worker lease, durable job-ready index
+-- ARGV: lease token, expected state version, now, dueAt, job id
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+  redis.call('ZREM', KEYS[3], ARGV[5])
+  redis.call('DEL', KEYS[2])
+  return 2
+end
+local ok, record = pcall(cjson.decode, raw)
+if not ok or type(record) ~= 'table' or record.stateVersion ~= tonumber(ARGV[2]) then return 0 end
+if record.state ~= 'admitted' and record.state ~= 'executing' then
+  redis.call('ZREM', KEYS[3], ARGV[5])
+  redis.call('DEL', KEYS[2])
+  return 2
+end
+local now = tonumber(ARGV[3])
+local dueAt = tonumber(ARGV[4])
+if not now or not dueAt or dueAt < now then return 0 end
+redis.call('ZADD', KEYS[3], dueAt, ARGV[5])
+redis.call('DEL', KEYS[2])
+return 1
 `;
 
 const BEGIN_PROVIDER_SUBMISSION_LUA = `
@@ -2475,9 +3154,9 @@ return cjson.encode(record)
 `;
 
 const ATTACH_PROVIDER_REQUEST_RECONCILIATION_LUA = `
--- AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V1
+-- AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V2
 -- KEYS: subrun metadata, encrypted provider reference, execution lease, job metadata,
---       encrypted job payload, append-only audit record
+--       encrypted job payload, append-only audit record, durable job-ready index
 -- ARGV: expected subrun version, expected job version, expected subrun id,
 --       expected job id, encrypted provider reference, audit record, now
 local subrunRaw = redis.call('GET', KEYS[1])
@@ -2506,13 +3185,15 @@ redis.call('SET', KEYS[1], cjson.encode(subrun))
 redis.call('SET', KEYS[2], ARGV[5], 'PX', payloadTtl)
 redis.call('DEL', KEYS[3])
 redis.call('SET', KEYS[4], cjson.encode(job))
+redis.call('ZADD', KEYS[7], tonumber(ARGV[7]), ARGV[4])
 return 1
 `;
 
 const TERMINALIZE_PROVIDER_RECONCILIATION_LUA = `
--- AIR_STUDIO_TERMINALIZE_PROVIDER_RECONCILIATION_V1
+-- AIR_STUDIO_TERMINALIZE_PROVIDER_RECONCILIATION_V2
 -- KEYS: subrun metadata, encrypted provider reference, execution lease, job metadata,
---       encrypted job payload, active-job marker, append-only audit record
+--       encrypted job payload, active-job marker, append-only audit record,
+--       durable job-ready index
 -- ARGV: expected subrun version, expected job version, expected subrun id, expected job id,
 --       audit record, now, terminal metadata ttl
 local subrunRaw = redis.call('GET', KEYS[1])
@@ -2542,6 +3223,7 @@ redis.call('DEL', KEYS[3])
 redis.call('SET', KEYS[4], cjson.encode(job), 'EX', ARGV[7])
 redis.call('DEL', KEYS[5])
 if redis.call('GET', KEYS[6]) == ARGV[4] then redis.call('DEL', KEYS[6]) end
+redis.call('ZREM', KEYS[8], ARGV[4])
 return 1
 `;
 
@@ -2738,7 +3420,9 @@ function isExecutionSnapshotForJob(snapshot: StudioExecutionSnapshot, job: Studi
     && isSafeRecordString(snapshot.model.providerModelId, 512)
     && snapshot.output.count === job.outputCount
     && (snapshot.output.durationSeconds ?? undefined) === (job.durationSeconds ?? undefined)
-    && isValidReleaseStamp(snapshot.releaseStamp);
+    && isValidReleaseStamp(snapshot.releaseStamp)
+    && isValidReleaseStamp(job.releaseStamp)
+    && sameReleaseStamp(snapshot.releaseStamp, job.releaseStamp);
 }
 
 function isProviderSubrunRecord(value: unknown): value is StudioProviderSubrunRecord {
@@ -2811,6 +3495,60 @@ function isSafeRecordString(value: unknown, maximumLength: number): value is str
     && !/[\u0000\r\n]/u.test(value);
 }
 
+function isValidInitialJobNotification(
+  notification: unknown,
+  expectedKind: "text" | "tapback",
+): boolean {
+  if (!notification || typeof notification !== "object" || Array.isArray(notification)) return false;
+  const candidate = notification as { outboxId?: unknown; payload?: unknown };
+  if (!isSafeRecordString(candidate.outboxId, 160)) return false;
+  const payload = candidate.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const message = payload as {
+    kind?: unknown;
+    thread?: unknown;
+    text?: unknown;
+    targetMessageId?: unknown;
+  };
+  if (message.kind !== expectedKind) return false;
+  const thread = message.thread;
+  if (!thread || typeof thread !== "object" || Array.isArray(thread)) return false;
+  const destination = thread as { chatGuid?: unknown; sendingLine?: unknown; replyTargetId?: unknown };
+  if (
+    !isSafeRecordString(destination.chatGuid, 512)
+    || !isSafeRecordString(destination.sendingLine, 160)
+    || (destination.replyTargetId !== undefined && !isSafeRecordString(destination.replyTargetId, 512))
+  ) return false;
+  if (expectedKind === "text") {
+    return typeof message.text === "string"
+      && message.text.length > 0
+      && message.text.length <= 4_000
+      && !/[\u0000\r]/u.test(message.text);
+  }
+  return isSafeRecordString(message.targetMessageId, 512);
+}
+
+/**
+ * The request payload is encrypted with the job, while an outbox payload is
+ * encrypted independently. Verify their route fields before the atomic write
+ * so an internal caller cannot cross-wire acknowledgements between chats.
+ */
+function isInitialNotificationBoundToJob(
+  notification: unknown,
+  expectedKind: "text" | "tapback",
+  jobPayload: StudioJobPayload,
+): boolean {
+  if (!isValidInitialJobNotification(notification, expectedKind)) return false;
+  const message = (notification as { readonly payload: StudioOutboxPayload }).payload;
+  const thread = message.thread;
+  if (
+    thread.chatGuid !== jobPayload.chatGuid
+    || thread.sendingLine !== jobPayload.sendingLine
+    || thread.replyTargetId !== jobPayload.replyTargetId
+  ) return false;
+  return expectedKind === "text" || message.targetMessageId === jobPayload.replyTargetId;
+}
+
 function isValidReleaseStamp(value: unknown): value is StudioReleaseStamp {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const stamp = value as Partial<StudioReleaseStamp>;
@@ -2818,6 +3556,13 @@ function isValidReleaseStamp(value: unknown): value is StudioReleaseStamp {
     && (stamp.generation as number) >= 0
     && (stamp.phase === "dark" || stamp.phase === "canary" || stamp.phase === "production")
     && (stamp.phase === "dark" || (stamp.generation as number) >= 1);
+}
+
+function sameReleaseStamp(left: unknown, right: unknown): boolean {
+  return isValidReleaseStamp(left)
+    && isValidReleaseStamp(right)
+    && left.generation === right.generation
+    && left.phase === right.phase;
 }
 
 function outboxMetadata(record: StudioOutboxRecord): Omit<StudioOutboxRecord, "encryptedPayload"> {
@@ -2902,6 +3647,7 @@ function hasValidAdmissionBounds(input: AdmitStudioJobInput): boolean {
     && job.state === "admitted"
     && job.stateVersion === 1
     && Boolean(job.encryptedPayload)
+    && isValidReleaseStamp(job.releaseStamp)
     && isNonnegativeSafeInteger(job.reservedCents)
     && isPositiveSafeInteger(job.outputCount)
     && (job.durationSeconds === undefined || isPositiveSafeInteger(job.durationSeconds))

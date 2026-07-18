@@ -4,9 +4,10 @@ import { createQueueCipher } from "../../lib/crypto.js";
 import { MemoryRedis } from "../../lib/redis.js";
 import { hashSenderIdentifier, hashThreadIdentifier } from "../../lib/security.js";
 import type { StudioEnvironment, StudioReleasePhase } from "../../lib/studio/config.js";
-import { drainStudioOutbox, drainStudioWithStats } from "../../lib/studio/engine.js";
+import { drainStudioJobs, drainStudioOutbox, drainStudioWithStats } from "../../lib/studio/engine.js";
 import type { IMessageThreadReference, StudioIMessageTransport, TransportOutcome } from "../../lib/studio/imessage-transport.js";
-import { UnprovisionedStudioProvider } from "../../lib/studio/provider-port.js";
+import { validateModelRegistry, type AirModelRegistry } from "../../lib/studio/model-registry.js";
+import { UnprovisionedStudioProvider, type StudioProviderPort } from "../../lib/studio/provider-port.js";
 import { getStudioWorkflow, isSinglePaidStepWorkflow } from "../../lib/studio/workflows.js";
 import type { StudioRuntime } from "../../lib/studio/runtime.js";
 import {
@@ -29,6 +30,10 @@ function createDarkFixture(options: {
   readonly deliveryEnabled?: boolean;
   readonly releasePhase?: StudioReleasePhase;
   readonly transportVerified?: boolean;
+  readonly provider?: StudioProviderPort;
+  readonly registry?: AirModelRegistry;
+  readonly perJobCents?: number;
+  readonly dailyCents?: number;
 } = {}) {
   const now = 1_784_990_400_000;
   const cipher = createQueueCipher(Buffer.alloc(32, 23).toString("base64"));
@@ -95,8 +100,8 @@ function createDarkFixture(options: {
     },
     policyExplicit: true,
     spendCaps: {
-      perJobCents: 0,
-      dailyCents: 0,
+      perJobCents: options.perJobCents ?? 0,
+      dailyCents: options.dailyCents ?? 0,
       canaryTotalCents: 0,
       canaryFalCents: 0,
     },
@@ -106,7 +111,8 @@ function createDarkFixture(options: {
     cipher,
     store,
     transport,
-    provider: new UnprovisionedStudioProvider(),
+    provider: options.provider ?? new UnprovisionedStudioProvider(),
+    ...(options.registry === undefined ? {} : { registry: options.registry }),
     storageTransport: "rest",
     readiness: (_expectedRegistryVersion: string): readonly string[] => [],
     close: async (): Promise<void> => undefined,
@@ -125,6 +131,45 @@ async function armFixtureReleaseFence(fixture: ReturnType<typeof createDarkFixtu
   });
   expect(await baseline.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
   expect(await fixture.store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+}
+
+function reviewedImagineRegistry(): AirModelRegistry {
+  return validateModelRegistry({
+    schemaVersion: "air-model-registry/v1",
+    registryVersion: "2.1.0",
+    models: [{
+      displayName: "Reviewed GMI Imagine",
+      slug: "reviewed-gmi-imagine",
+      mode: "imagine",
+      provider: "gmi",
+      providerModelId: "reviewed-provider-image-model",
+      verification: {
+        verifiedAt: "2026-07-18T12:00:00Z",
+        catalogFingerprint: "catalog-fixture",
+        schemaFingerprint: "schema-fixture",
+      },
+      input: { prompt: "required", image: false, video: false, mediaOnly: false },
+      inputHosting: { mode: "data-uri" },
+      output: {
+        type: "image",
+        maximumOutputCount: 1,
+        supportedOutputCounts: [1],
+        supportedDurationSeconds: [],
+        lockedAspectRatio: "1:1",
+      },
+      requiredPayloadFields: [{ name: "prompt", declaredType: "string", required: true }],
+      pricing: {
+        source: "https://pricing.example.test/reviewed-gmi-imagine",
+        currency: "USD",
+        verifiedAt: "2026-07-18T12:00:00Z",
+        quotes: [{ count: 1, durationSeconds: null, maximumQuotedCostCents: 25 }],
+      },
+      polling: { requestTimeoutMs: 5_000, pollIntervalMs: 1_000, maxPollAttempts: 3, deadlineMs: 15_000 },
+      status: "enabled",
+      hostedPublicInputAcknowledged: false,
+    }],
+    defaults: { imagine: "reviewed-gmi-imagine" },
+  });
 }
 
 async function persistInbound(
@@ -529,5 +574,49 @@ describe("Air studio dark engine", () => {
     expect(admitJob).not.toHaveBeenCalled();
     expect(fixture.transport.sendText).not.toHaveBeenCalled();
     expect(fixture.transport.sendAttachment).not.toHaveBeenCalled();
+  });
+
+  it("persists an acknowledgement and tapback before the verified scheduler submits a text-only job", async () => {
+    let fixture: ReturnType<typeof createDarkFixture>;
+    let observedInitialEffects: readonly StudioOutboxRecord[] = [];
+    const provider = {
+      verified: true,
+      submit: vi.fn(async (input) => {
+        const readyIds = await fixture.redis.zRangeByScore(
+          `${STUDIO_REDIS_PREFIX}:outbox:ready`,
+          Number.NEGATIVE_INFINITY,
+          Number.POSITIVE_INFINITY,
+        );
+        const records = await Promise.all(readyIds.map((id) => fixture.store.getOutbox(id)));
+        observedInitialEffects = records.filter(
+          (record): record is StudioOutboxRecord => record !== null && record.jobId === input.job.jobId,
+        );
+        return Object.freeze({ kind: "accepted" as const, providerRequestId: "reviewed-fake-request" });
+      }),
+    } satisfies StudioProviderPort;
+    fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      allowProviderSubmit: true,
+      provider,
+      registry: reviewedImagineRegistry(),
+      perJobCents: 100,
+      dailyCents: 100,
+    });
+    await armFixtureReleaseFence(fixture);
+    const receiptId = await persistInbound(fixture, "active-direct-create-001", "/imagine a brushed-steel hummingbird");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "processed" });
+    expect(provider.submit).not.toHaveBeenCalled();
+
+    await expect(drainStudioJobs(fixture.runtime)).resolves.toBe(1);
+    expect(provider.submit).toHaveBeenCalledTimes(1);
+    expect(observedInitialEffects).toHaveLength(2);
+    expect(observedInitialEffects.map((record) => record.lane).sort()).toEqual([
+      "job-acknowledgement",
+      "tapback",
+    ]);
+    expect(observedInitialEffects.every((record) => record.state === "intent" && record.attempts === 0)).toBe(true);
   });
 });

@@ -1152,7 +1152,10 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_ADVANCE_RELEASE_FENCE_V1")) {
       return this.evalStudioAdvanceReleaseFence(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_ADMIT_JOB_V3")) {
+    if (script.includes("AIR_STUDIO_ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_V1")) {
+      return this.evalStudioAdmitJobWithInitialNotifications(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_ADMIT_JOB_V4")) {
       return this.evalStudioAdmitJob(options.keys, options.arguments);
     }
     if (script.includes("AIR_STUDIO_PERSIST_INBOX_V4")) {
@@ -1176,14 +1179,17 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_AUTHORIZE_OUTBOX_DELIVERY_V5")) {
       return this.evalStudioAuthorizeOutboxDelivery(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_FINISH_OUTBOX_V3")) {
+    if (script.includes("AIR_STUDIO_FINISH_OUTBOX_V4")) {
       return this.evalStudioFinishOutbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V3")) {
+    if (script.includes("AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V4")) {
       return this.evalStudioReconcileExpiredOutbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_TRANSITION_JOB_V3")) {
+    if (script.includes("AIR_STUDIO_TRANSITION_JOB_V5")) {
       return this.evalStudioTransitionJob(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_RESCHEDULE_CLAIMED_JOB_V1")) {
+      return this.evalStudioRescheduleClaimedJob(options.keys, options.arguments);
     }
     if (script.includes("AIR_STUDIO_BEGIN_PROVIDER_SUBMISSION_V2")) {
       return this.evalStudioBeginProviderSubmission(options.keys, options.arguments);
@@ -1191,10 +1197,10 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V2")) {
       return this.evalStudioFinishProviderSubmission(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V1")) {
+    if (script.includes("AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V2")) {
       return this.evalStudioAttachProviderRequestReconciliation(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_TERMINALIZE_PROVIDER_RECONCILIATION_V1")) {
+    if (script.includes("AIR_STUDIO_TERMINALIZE_PROVIDER_RECONCILIATION_V2")) {
       return this.evalStudioTerminalizeProviderReconciliation(options.keys, options.arguments);
     }
     if (script.includes("AIR_STUDIO_RESOLVE_OUTBOX_SEND_RECONCILIATION_V1")) {
@@ -1484,12 +1490,14 @@ export class MemoryRedis implements RedisLike {
   }
 
   private evalStudioAdmitJob(keys: readonly string[], args: readonly string[]): readonly [string, string?] {
-    this.assertStudioArity(keys, args, 5, 8);
+    this.assertStudioArity(keys, args, 7, 11);
     const activeKey = this.studioKey(keys, 0);
     const userCountKey = this.studioKey(keys, 1);
     const spendKey = this.studioKey(keys, 2);
     const jobKey = this.studioKey(keys, 3);
     const jobPayloadKey = this.studioKey(keys, 4);
+    const readyKey = this.studioKey(keys, 5);
+    const releaseFenceKey = this.studioKey(keys, 6);
     const jobId = this.studioArgument(args, 0);
     const serializedMetadata = this.studioArgument(args, 1);
     const serializedPayload = this.studioArgument(args, 2);
@@ -1498,14 +1506,39 @@ export class MemoryRedis implements RedisLike {
     const userLimit = this.studioPositiveInteger(this.studioArgument(args, 5));
     const spendCap = this.studioNonnegativeInteger(this.studioArgument(args, 6));
     const cost = this.studioNonnegativeInteger(this.studioArgument(args, 7));
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 8));
+    const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 9));
+    const releasePhase = this.studioArgument(args, 10);
     this.assertStringOrMissing(activeKey);
     this.assertStringOrMissing(userCountKey);
     this.assertStringOrMissing(spendKey);
     this.assertStringOrMissing(jobKey);
     this.assertStringOrMissing(jobPayloadKey);
+    this.assertZSetOrMissing(readyKey);
 
     const existing = this.studioString(jobKey);
-    if (existing !== null) return ["existing", existing];
+    if (existing !== null) {
+      const existingRecord = this.studioRecordFailClosed(jobKey);
+      if (existingRecord && (existingRecord.state === "admitted" || existingRecord.state === "executing")) {
+        this.getZSet(readyKey, true).value.set(jobId, now);
+      }
+      return ["existing", existing];
+    }
+
+    if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") {
+      return ["release_blocked"];
+    }
+
+    let metadata: Record<string, unknown>;
+    try {
+      metadata = this.studioRecordFromJson(serializedMetadata);
+    } catch {
+      return ["release_blocked"];
+    }
+    if (this.studioReleasePersistenceStatus(metadata, releaseFenceKey, releaseGeneration, releasePhase) !== 1) {
+      return ["release_blocked"];
+    }
+
     if (this.getEntry(jobPayloadKey)) return ["storage_error"];
     if (this.studioString(activeKey) !== null) return ["active_job"];
     const userCount = this.studioCounter(userCountKey);
@@ -1513,13 +1546,256 @@ export class MemoryRedis implements RedisLike {
     const spend = this.studioCounter(spendKey);
     if (spend + cost > spendCap) return ["daily_cap"];
 
-    const now = this.now();
     this.values.set(activeKey, { kind: "string", value: jobId, expiresAt: null });
-    this.values.set(userCountKey, { kind: "string", value: String(userCount + 1), expiresAt: now + dailyTtl * 1_000 });
-    this.values.set(spendKey, { kind: "string", value: String(spend + cost), expiresAt: now + dailyTtl * 1_000 });
+    this.values.set(userCountKey, { kind: "string", value: String(userCount + 1), expiresAt: this.now() + dailyTtl * 1_000 });
+    this.values.set(spendKey, { kind: "string", value: String(spend + cost), expiresAt: this.now() + dailyTtl * 1_000 });
     this.values.set(jobKey, { kind: "string", value: serializedMetadata, expiresAt: null });
-    this.values.set(jobPayloadKey, { kind: "string", value: serializedPayload, expiresAt: now + payloadTtl * 1_000 });
+    this.values.set(jobPayloadKey, { kind: "string", value: serializedPayload, expiresAt: this.now() + payloadTtl * 1_000 });
+    this.getZSet(readyKey, true).value.set(jobId, now);
     return ["admitted"];
+  }
+
+  /**
+   * In-memory mirror of the one-shot iMessage admission Lua transaction. Do
+   * not compose the individual job/outbox evaluators here: that would make
+   * tests accept a partial-write sequence that Redis never permits.
+   */
+  private evalStudioAdmitJobWithInitialNotifications(
+    keys: readonly string[],
+    args: readonly string[],
+  ): readonly [string, string?] {
+    try {
+      this.assertStudioArity(keys, args, 14, 24);
+      const activeKey = this.studioKey(keys, 0);
+      const userCountKey = this.studioKey(keys, 1);
+      const spendKey = this.studioKey(keys, 2);
+      const jobKey = this.studioKey(keys, 3);
+      const jobPayloadKey = this.studioKey(keys, 4);
+      const readyJobKey = this.studioKey(keys, 5);
+      const releaseFenceKey = this.studioKey(keys, 6);
+      const readyOutboxKey = this.studioKey(keys, 7);
+      const acknowledgementKey = this.studioKey(keys, 8);
+      const acknowledgementPayloadKey = this.studioKey(keys, 9);
+      const acknowledgementLaneKey = this.studioKey(keys, 10);
+      const tapbackKey = this.studioKey(keys, 11);
+      const tapbackPayloadKey = this.studioKey(keys, 12);
+      const tapbackLaneKey = this.studioKey(keys, 13);
+      const jobId = this.studioArgument(args, 0);
+      const serializedMetadata = this.studioArgument(args, 1);
+      const serializedPayload = this.studioArgument(args, 2);
+      const dailyTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+      const jobPayloadTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
+      const userLimit = this.studioPositiveInteger(this.studioArgument(args, 5));
+      const dailySpendCap = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+      const reservedCents = this.studioNonnegativeInteger(this.studioArgument(args, 7));
+      const now = this.studioNonnegativeInteger(this.studioArgument(args, 8));
+      const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 9));
+      const releasePhase = this.studioArgument(args, 10);
+      const perJobCap = this.studioNonnegativeInteger(this.studioArgument(args, 11));
+      const serializedAcknowledgement = this.studioArgument(args, 12);
+      const serializedAcknowledgementPayload = this.studioArgument(args, 13);
+      const acknowledgementId = this.studioArgument(args, 14);
+      const acknowledgementSequence = this.studioNonnegativeInteger(this.studioArgument(args, 15));
+      const acknowledgementDueAt = this.studioNonnegativeInteger(this.studioArgument(args, 16));
+      const serializedTapback = this.studioArgument(args, 17);
+      const serializedTapbackPayload = this.studioArgument(args, 18);
+      const tapbackId = this.studioArgument(args, 19);
+      const tapbackSequence = this.studioNonnegativeInteger(this.studioArgument(args, 20));
+      const tapbackDueAt = this.studioNonnegativeInteger(this.studioArgument(args, 21));
+      const hasTapbackRaw = this.studioArgument(args, 22);
+      const outboxPayloadTtl = this.studioPositiveInteger(this.studioArgument(args, 23));
+      if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") {
+        return ["release_blocked"];
+      }
+      if (hasTapbackRaw !== "0" && hasTapbackRaw !== "1") return ["storage_error"];
+      const hasTapback = hasTapbackRaw === "1";
+      const expectedAcknowledgementSequence = hasTapback ? 2 : 1;
+      if (acknowledgementSequence !== expectedAcknowledgementSequence || (hasTapback && tapbackSequence !== 1)) {
+        return ["storage_error"];
+      }
+
+      const candidate = this.studioRecordFromJson(serializedMetadata);
+      if (
+        candidate.jobId !== jobId
+        || typeof candidate.senderHash !== "string"
+        || typeof candidate.threadHash !== "string"
+      ) return ["storage_error"];
+
+      // Existing job state wins before current release/cap checks, exactly as
+      // the Redis script does for a retry after a release transition.
+      this.assertStringOrMissing(jobKey);
+      const existing = this.studioString(jobKey);
+      if (existing !== null) {
+        const record = this.studioRecordFailClosed(jobKey);
+        if (
+          !record
+          || record.jobId !== jobId
+          || record.senderHash !== candidate.senderHash
+          || record.threadHash !== candidate.threadHash
+          || !this.studioValidReleaseStamp(record.releaseStamp)
+          || !this.studioInitialNotificationManifestMatches(
+            record.initialNotifications,
+            acknowledgementId,
+            tapbackId,
+            hasTapback,
+          )
+        ) return ["notification_incomplete"];
+        this.assertStringOrMissing(acknowledgementKey);
+        const acknowledgement = this.studioRecordFailClosed(acknowledgementKey);
+        if (!this.studioInitialAdmissionOutboxMatches(
+          acknowledgement,
+          acknowledgementId,
+          jobId,
+          candidate.senderHash,
+          "job-acknowledgement",
+          record.releaseStamp,
+          expectedAcknowledgementSequence,
+        )) return ["notification_incomplete"];
+        if (hasTapback) {
+          this.assertStringOrMissing(tapbackKey);
+          const tapback = this.studioRecordFailClosed(tapbackKey);
+          if (!this.studioInitialAdmissionOutboxMatches(
+            tapback,
+            tapbackId,
+            jobId,
+            candidate.senderHash,
+            "tapback",
+            record.releaseStamp,
+            1,
+          )) return ["notification_incomplete"];
+        }
+        if (record.state === "admitted" || record.state === "executing") {
+          this.assertZSetOrMissing(readyJobKey);
+          this.getZSet(readyJobKey, true).value.set(jobId, now);
+        }
+        return ["existing", existing];
+      }
+
+      if (
+        !this.studioValidReleaseStamp(candidate.releaseStamp)
+        || candidate.releaseStamp.generation !== releaseGeneration
+        || candidate.releaseStamp.phase !== releasePhase
+      ) {
+        return ["release_blocked"];
+      }
+
+      // Validate every key and every serialised record before the first
+      // mutation, preserving the all-or-nothing Lua boundary in tests.
+      this.assertStringOrMissing(activeKey);
+      this.assertStringOrMissing(userCountKey);
+      this.assertStringOrMissing(spendKey);
+      this.assertStringOrMissing(jobPayloadKey);
+      this.assertZSetOrMissing(readyJobKey);
+      this.assertStringOrMissing(releaseFenceKey);
+      this.assertZSetOrMissing(readyOutboxKey);
+      this.assertStringOrMissing(acknowledgementKey);
+      this.assertStringOrMissing(acknowledgementPayloadKey);
+      this.assertZSetOrMissing(acknowledgementLaneKey);
+      if (hasTapback) {
+        this.assertStringOrMissing(tapbackKey);
+        this.assertStringOrMissing(tapbackPayloadKey);
+        this.assertZSetOrMissing(tapbackLaneKey);
+      }
+      if (this.studioReleasePersistenceStatus(candidate, releaseFenceKey, releaseGeneration, releasePhase) !== 1) {
+        return ["release_blocked"];
+      }
+      if (reservedCents > perJobCap) return ["per_job_cap"];
+      this.studioRecordFromJson(serializedPayload);
+      const acknowledgement = this.studioRecordFromJson(serializedAcknowledgement);
+      this.studioRecordFromJson(serializedAcknowledgementPayload);
+      if (
+        !this.studioInitialNotificationManifestMatches(
+          candidate.initialNotifications,
+          acknowledgementId,
+          tapbackId,
+          hasTapback,
+        )
+        || !this.studioInitialAdmissionOutboxMatches(
+          acknowledgement,
+          acknowledgementId,
+          jobId,
+          candidate.senderHash,
+          "job-acknowledgement",
+          candidate.releaseStamp,
+          acknowledgementSequence,
+          acknowledgementDueAt,
+          true,
+        )
+      ) return ["storage_error"];
+      if (hasTapback) {
+        const tapback = this.studioRecordFromJson(serializedTapback);
+        this.studioRecordFromJson(serializedTapbackPayload);
+        if (!this.studioInitialAdmissionOutboxMatches(
+          tapback,
+          tapbackId,
+          jobId,
+          candidate.senderHash,
+          "tapback",
+          candidate.releaseStamp,
+          tapbackSequence,
+          tapbackDueAt,
+          true,
+        )) return ["storage_error"];
+      }
+      if (
+        this.getEntry(jobPayloadKey)
+        || this.getEntry(acknowledgementKey)
+        || this.getEntry(acknowledgementPayloadKey)
+        || (hasTapback && (this.getEntry(tapbackKey) || this.getEntry(tapbackPayloadKey)))
+      ) return ["storage_error"];
+      if (this.getZSet(readyJobKey, false)?.value.has(jobId)) return ["storage_error"];
+      if ([...(this.getZSet(acknowledgementLaneKey, false)?.value.values() ?? [])]
+        .some((score) => score === acknowledgementSequence)) return ["storage_error"];
+      if (hasTapback && [...(this.getZSet(tapbackLaneKey, false)?.value.values() ?? [])]
+        .some((score) => score === tapbackSequence)) return ["storage_error"];
+
+      if (this.studioString(activeKey) !== null) return ["active_job"];
+      const userCount = this.studioCounter(userCountKey);
+      if (userCount >= userLimit) return ["user_limit"];
+      const spend = this.studioCounter(spendKey);
+      if (spend + reservedCents > dailySpendCap) return ["daily_cap"];
+
+      this.values.set(activeKey, { kind: "string", value: jobId, expiresAt: null });
+      this.values.set(userCountKey, {
+        kind: "string",
+        value: String(userCount + 1),
+        expiresAt: this.now() + dailyTtl * 1_000,
+      });
+      this.values.set(spendKey, {
+        kind: "string",
+        value: String(spend + reservedCents),
+        expiresAt: this.now() + dailyTtl * 1_000,
+      });
+      this.values.set(jobKey, { kind: "string", value: serializedMetadata, expiresAt: null });
+      this.values.set(jobPayloadKey, {
+        kind: "string",
+        value: serializedPayload,
+        expiresAt: this.now() + jobPayloadTtl * 1_000,
+      });
+      this.values.set(acknowledgementKey, { kind: "string", value: serializedAcknowledgement, expiresAt: null });
+      this.values.set(acknowledgementPayloadKey, {
+        kind: "string",
+        value: serializedAcknowledgementPayload,
+        expiresAt: this.now() + outboxPayloadTtl * 1_000,
+      });
+      this.getZSet(readyOutboxKey, true).value.set(acknowledgementId, acknowledgementDueAt);
+      this.getZSet(acknowledgementLaneKey, true).value.set(acknowledgementId, acknowledgementSequence);
+      if (hasTapback) {
+        this.values.set(tapbackKey, { kind: "string", value: serializedTapback, expiresAt: null });
+        this.values.set(tapbackPayloadKey, {
+          kind: "string",
+          value: serializedTapbackPayload,
+          expiresAt: this.now() + outboxPayloadTtl * 1_000,
+        });
+        this.getZSet(readyOutboxKey, true).value.set(tapbackId, tapbackDueAt);
+        this.getZSet(tapbackLaneKey, true).value.set(tapbackId, tapbackSequence);
+      }
+      // Scheduler publication is intentionally last, mirroring Lua.
+      this.getZSet(readyJobKey, true).value.set(jobId, now);
+      return ["admitted"];
+    } catch {
+      return ["storage_error"];
+    }
   }
 
   private evalStudioClaimInbox(keys: readonly string[], args: readonly string[]): string | false {
@@ -1785,7 +2061,11 @@ export class MemoryRedis implements RedisLike {
       this.getZSet(readyKey, true).value.set(member, now + attempts * backoff);
     } else {
       this.studioRemoveMember(readyKey, member);
-      if (nextState !== "send_unknown") this.studioRemoveMember(laneKey, member);
+      // A job-scoped Like is best-effort. Preserve its ambiguous audit state,
+      // but allow the paired acknowledgement behind it to proceed.
+      if (nextState !== "send_unknown" || (record.lane === "tapback" && record.jobId !== undefined)) {
+        this.studioRemoveMember(laneKey, member);
+      }
     }
     return JSON.stringify(record);
   }
@@ -1807,14 +2087,18 @@ export class MemoryRedis implements RedisLike {
     record.updatedAtMs = now;
     this.studioSetPersistentRecord(recordKey, record);
     this.studioRemoveMember(readyKey, member);
+    if (record.lane === "tapback" && record.jobId !== undefined) {
+      this.studioRemoveMember(this.studioKey(keys, 4), member);
+    }
     return 1;
   }
 
   private evalStudioTransitionJob(keys: readonly string[], args: readonly string[]): string | false {
-    this.assertStudioArity(keys, args, 3, 7);
+    this.assertStudioArity(keys, args, 4, 7);
     const jobKey = this.studioKey(keys, 0);
     const jobPayloadKey = this.studioKey(keys, 1);
     const activeKey = this.studioKey(keys, 2);
+    const readyKey = this.studioKey(keys, 3);
     const from = this.studioArgument(args, 0);
     const expectedVersion = this.studioPositiveInteger(this.studioArgument(args, 1));
     const to = this.studioArgument(args, 2);
@@ -1832,10 +2116,40 @@ export class MemoryRedis implements RedisLike {
       this.studioSetRecord(jobKey, record, ttl);
       this.values.delete(jobPayloadKey);
       if (this.studioString(activeKey) === jobId) this.values.delete(activeKey);
+      this.studioRemoveMember(readyKey, jobId);
     } else {
       this.studioSetPersistentRecord(jobKey, record);
     }
     return JSON.stringify(record);
+  }
+
+  private evalStudioRescheduleClaimedJob(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 3, 5);
+    const jobKey = this.studioKey(keys, 0);
+    const leaseKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const leaseToken = this.studioArgument(args, 0);
+    const expectedVersion = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+    const dueAt = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+    const jobId = this.studioArgument(args, 4);
+    if (this.studioString(leaseKey) !== leaseToken) return 0;
+    const record = this.studioRecordFailClosed(jobKey);
+    if (!record) {
+      this.studioRemoveMember(readyKey, jobId);
+      this.values.delete(leaseKey);
+      return 2;
+    }
+    if (this.studioStateVersion(record) !== expectedVersion) return 0;
+    if (record.state !== "admitted" && record.state !== "executing") {
+      this.studioRemoveMember(readyKey, jobId);
+      this.values.delete(leaseKey);
+      return 2;
+    }
+    if (dueAt < now) return 0;
+    this.getZSet(readyKey, true).value.set(jobId, dueAt);
+    this.values.delete(leaseKey);
+    return 1;
   }
 
   private evalStudioBeginProviderSubmission(keys: readonly string[], args: readonly string[]): string {
@@ -1987,13 +2301,14 @@ export class MemoryRedis implements RedisLike {
   }
 
   private evalStudioAttachProviderRequestReconciliation(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 6, 7);
+    this.assertStudioArity(keys, args, 7, 7);
     const subrunKey = this.studioKey(keys, 0);
     const referenceKey = this.studioKey(keys, 1);
     const leaseKey = this.studioKey(keys, 2);
     const jobKey = this.studioKey(keys, 3);
     const payloadKey = this.studioKey(keys, 4);
     const auditKey = this.studioKey(keys, 5);
+    const readyKey = this.studioKey(keys, 6);
     const expectedSubrunVersion = this.studioPositiveInteger(this.studioArgument(args, 0));
     const expectedJobVersion = this.studioPositiveInteger(this.studioArgument(args, 1));
     const expectedSubrunId = this.studioArgument(args, 2);
@@ -2038,12 +2353,13 @@ export class MemoryRedis implements RedisLike {
     this.studioSet(referenceKey, encryptedReference, payloadTtl);
     this.values.delete(leaseKey);
     this.studioSetPersistentRecord(jobKey, job);
+    this.getZSet(readyKey, true).value.set(expectedJobId, now);
     this.studioSetPersistent(auditKey, audit);
     return 1;
   }
 
   private evalStudioTerminalizeProviderReconciliation(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 7, 7);
+    this.assertStudioArity(keys, args, 8, 7);
     const subrunKey = this.studioKey(keys, 0);
     const referenceKey = this.studioKey(keys, 1);
     const leaseKey = this.studioKey(keys, 2);
@@ -2051,6 +2367,7 @@ export class MemoryRedis implements RedisLike {
     const payloadKey = this.studioKey(keys, 4);
     const activeJobKey = this.studioKey(keys, 5);
     const auditKey = this.studioKey(keys, 6);
+    const readyKey = this.studioKey(keys, 7);
     const expectedSubrunVersion = this.studioPositiveInteger(this.studioArgument(args, 0));
     const expectedJobVersion = this.studioPositiveInteger(this.studioArgument(args, 1));
     const expectedSubrunId = this.studioArgument(args, 2);
@@ -2090,6 +2407,7 @@ export class MemoryRedis implements RedisLike {
     this.studioSetRecord(jobKey, job, terminalTtl);
     this.values.delete(payloadKey);
     if (this.studioString(activeJobKey) === expectedJobId) this.values.delete(activeJobKey);
+    this.studioRemoveMember(readyKey, expectedJobId);
     this.studioSetPersistent(auditKey, audit);
     return 1;
   }
@@ -2353,6 +2671,67 @@ export class MemoryRedis implements RedisLike {
     } catch {
       throw new Error("invalid studio record");
     }
+  }
+
+  private studioValidReleaseStamp(value: unknown): value is Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const stamp = value as Record<string, unknown>;
+    return typeof stamp.generation === "number"
+      && Number.isSafeInteger(stamp.generation)
+      && stamp.generation >= 0
+      && (stamp.phase === "dark" || stamp.phase === "canary" || stamp.phase === "production")
+      && (stamp.phase === "dark" || stamp.generation >= 1);
+  }
+
+  private studioSameReleaseStamp(left: unknown, right: unknown): boolean {
+    return this.studioValidReleaseStamp(left)
+      && this.studioValidReleaseStamp(right)
+      && left.generation === right.generation
+      && left.phase === right.phase;
+  }
+
+  private studioInitialNotificationManifestMatches(
+    value: unknown,
+    acknowledgementId: string,
+    tapbackId: string,
+    hasTapback: boolean,
+  ): boolean {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const manifest = value as Record<string, unknown>;
+    if (
+      manifest.schemaVersion !== 1
+      || manifest.acknowledgementOutboxId !== acknowledgementId
+    ) return false;
+    return hasTapback
+      ? manifest.tapbackOutboxId === tapbackId
+      : manifest.tapbackOutboxId === undefined;
+  }
+
+  private studioInitialAdmissionOutboxMatches(
+    record: Record<string, unknown> | null,
+    outboxId: string,
+    jobId: string,
+    senderHash: unknown,
+    lane: "job-acknowledgement" | "tapback",
+    releaseStamp: unknown,
+    sequence: number,
+    dueAtMs?: number,
+    requireIntent = false,
+  ): boolean {
+    if (!record) return false;
+    if (
+      record.outboxId !== outboxId
+      || record.jobId !== jobId
+      || record.senderHash !== senderHash
+      || record.lane !== lane
+      || record.sequence !== sequence
+      || !this.studioSameReleaseStamp(record.releaseStamp, releaseStamp)
+    ) return false;
+    if (!requireIntent) return true;
+    return record.state === "intent"
+      && record.attempts === 0
+      && record.stateVersion === 1
+      && record.dueAtMs === dueAtMs;
   }
 
   private studioReleaseFence(key: string): MemoryStudioReleaseFence | "invalid" | null {

@@ -2,6 +2,7 @@ import { createQueueCipher, type QueueCipher } from "../crypto.js";
 import { connectRedisFromUrl, type ConnectedRedis } from "../redis.js";
 import { loadStudioEnvironment, studioReadinessProblems, type StudioEnvironment } from "./config.js";
 import { UnverifiedPhotonTransport, type StudioIMessageTransport } from "./imessage-transport.js";
+import { AIR_MODEL_REGISTRY, type AirModelRegistry } from "./model-registry.js";
 import { UnprovisionedStudioProvider, type StudioProviderPort } from "./provider-port.js";
 import { StudioStore } from "./store.js";
 
@@ -14,6 +15,8 @@ export interface StudioRuntime {
   readonly transport: StudioIMessageTransport;
   /** Never live by default; the executor rejects this unverified provider. */
   readonly provider: StudioProviderPort;
+  /** Committed registry; tests may inject a reviewed fixture without mutating code defaults. */
+  readonly registry?: AirModelRegistry | undefined;
   readonly storageTransport: "rest" | "tcp";
   readiness(expectedRegistryVersion: string): readonly string[];
   close(): Promise<void>;
@@ -101,6 +104,7 @@ function runtimeFromConnectedRedis(
     store,
     transport,
     provider,
+    registry: AIR_MODEL_REGISTRY,
     storageTransport: environment.storageTransport === "rest" ? "rest" : "tcp",
     readiness(expectedRegistryVersion: string): readonly string[] {
       const problems = [...studioReadinessProblems(environment, expectedRegistryVersion)];
