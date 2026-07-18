@@ -44,6 +44,37 @@ boundary, cancellation and rollback after durable intent, source-payload TTL
 loss at completion, cancellation observed after provider completion, capped
 provider-reference retention, and expired or expiring encrypted job snapshots.
 
+## Reconciliation foundation
+
+`StudioStore` now has zero-spend, version-fenced reconciliation primitives for
+the ambiguous boundaries. They do not call a provider, look up a provider
+request, send iMessage, or expose an HTTP operator route.
+
+- A `submission_unknown` subrun can receive a verified provider request ID or
+  be terminalized with a bounded reason. Both operations compare the current
+  job and subrun versions, bind the stored subrun ID to the requested key, and
+  append an opaque HMAC-derived actor audit record. Attaching evidence resumes
+  only observation-ready `executing`; it cannot submit again.
+- A `send_unknown` outbox can be resolved as sent or confirmed absent under an
+  exact outbox version. Confirmed absence remains durable and keeps its lane
+  blocked until an explicit outcome is known.
+- Requeueing a confirmed absence creates one new encrypted outbox record only
+  while the source payload remains inside its original Redis TTL. The source
+  becomes terminal `requeued`, its payload is scrubbed, and the replacement
+  atomically inherits the original lane position—even for isolated response,
+  tapback, and job lanes. A media-first replacement also retains the original
+  pending guard, so a later cancellation, supersession, or expiry still blocks
+  it before dispatch.
+- If the private payload has expired before (or during) a confirmed-absent
+  requeue, the source terminalizes as `failed` with
+  `terminalReason: artifact_expired`. Air does not refetch, regenerate, or
+  silently reopen it.
+
+Reconciliation metadata and audit records are content-free and non-expiring
+while reconciliation is outstanding. Encrypted job/provider/outbox references
+still retain their independent 24-hour privacy deadline. Audit keys are
+write-once; a collision or stale version fails closed before a state mutation.
+
 ## What is intentionally absent
 
 - The committed registry still has zero enabled models, and creation commands
@@ -55,6 +86,10 @@ provider-reference retention, and expired or expiring encrypted job snapshots.
   or delivery path.
 - Photon/Spectrum transport remains `UnverifiedPhotonTransport`; no actual
   iMessage attachment fetch, reply, tapback, typing, or send is possible.
+- There is no authenticated reconciliation command surface yet. Binding these
+  primitives to an operator endpoint requires a separately authorized
+  responder/authentication design and a recovery drill; it must not be added
+  speculatively to the dark preview.
 
 ## Required before activation
 

@@ -235,6 +235,95 @@ describe("Air provider submission executor", () => {
     expect(provider.submit).toHaveBeenCalledTimes(1);
   });
 
+  it("attaches verified provider evidence through a fenced reconciliation without resubmitting", async () => {
+    const provider = fakeProvider({ kind: "ambiguous" });
+    const setup = fixture({ provider });
+    const admitted = setup.job("attach-provider-reconciliation");
+    const subrunId = deriveOpaqueId(IDENTITY_SECRET, "studio-provider-subrun", admitted.jobId);
+    await setup.admit(admitted);
+    await setup.arm();
+    await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "reconciliation_required" });
+
+    const unknownSubrun = await setup.store.getProviderSubrun(subrunId);
+    const unknownJob = await setup.store.getJob(admitted.jobId);
+    if (!unknownSubrun || !unknownJob) throw new Error("expected ambiguous provider state");
+    const attached = await setup.store.attachProviderRequestForReconciliation({
+      subrunId,
+      expectedSubrunVersion: unknownSubrun.stateVersion,
+      expectedJobVersion: unknownJob.stateVersion,
+      providerRequestId: "verified-provider-request-123",
+      operatorHash: setup.store.operatorAuditHash("on-call-operator"),
+    });
+    if (attached.kind !== "applied") throw new Error("expected reconciled provider evidence");
+
+    await expect(setup.store.getProviderSubrun(subrunId)).resolves.toMatchObject({ state: "submitted", stateVersion: 4 });
+    await expect(setup.store.getProviderSubrunReference(subrunId))
+      .resolves.toEqual({ providerRequestId: "verified-provider-request-123" });
+    await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "executing", stateVersion: 4 });
+    await expect(setup.store.getReconciliationAudit(attached.auditId)).resolves.toMatchObject({
+      action: "provider_request_attached",
+      subjectId: subrunId,
+      actorHash: setup.store.operatorAuditHash("on-call-operator"),
+    });
+    const rawAudit = await setup.redis.get(`${STUDIO_REDIS_PREFIX}:workflow-executor-test:reconciliation:audit:${attached.auditId}`);
+    expect(rawAudit ?? "").not.toContain("verified-provider-request-123");
+    expect(rawAudit ?? "").not.toContain("private prompt");
+
+    await expect(setup.store.attachProviderRequestForReconciliation({
+      subrunId,
+      expectedSubrunVersion: unknownSubrun.stateVersion,
+      expectedJobVersion: unknownJob.stateVersion,
+      providerRequestId: "must-not-replace-provider-request",
+      operatorHash: setup.store.operatorAuditHash("on-call-operator"),
+    })).resolves.toEqual({ kind: "conflict" });
+    await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "submitted" });
+    expect(provider.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("terminalizes an ambiguous provider submission under a version fence while retaining its reservation", async () => {
+    const provider = fakeProvider({ kind: "ambiguous" });
+    const setup = fixture({ provider });
+    const admitted = setup.job("terminalize-provider-reconciliation");
+    const subrunId = deriveOpaqueId(IDENTITY_SECRET, "studio-provider-subrun", admitted.jobId);
+    await setup.admit(admitted);
+    await setup.arm();
+    await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "reconciliation_required" });
+
+    const unknownSubrun = await setup.store.getProviderSubrun(subrunId);
+    const unknownJob = await setup.store.getJob(admitted.jobId);
+    if (!unknownSubrun || !unknownJob) throw new Error("expected ambiguous provider state");
+    const terminalized = await setup.store.terminalizeProviderSubmissionForReconciliation({
+      subrunId,
+      expectedSubrunVersion: unknownSubrun.stateVersion,
+      expectedJobVersion: unknownJob.stateVersion,
+      reason: "provider_not_found",
+      operatorHash: setup.store.operatorAuditHash("on-call-operator"),
+    });
+    if (terminalized.kind !== "applied") throw new Error("expected provider terminalization");
+
+    await expect(setup.store.getProviderSubrun(subrunId)).resolves.toMatchObject({
+      state: "reconciliation_terminalized",
+      stateVersion: 4,
+    });
+    await expect(setup.store.getProviderSubrunReference(subrunId)).resolves.toBeNull();
+    const failedJob = await setup.store.getJob(admitted.jobId);
+    expect(failedJob).toMatchObject({ state: "failed", stateVersion: 4, reservedCents: 25 });
+    expect(failedJob).not.toHaveProperty("encryptedPayload");
+    await expect(setup.store.getReconciliationAudit(terminalized.auditId)).resolves.toMatchObject({
+      action: "provider_terminalized",
+      reason: "provider_not_found",
+      subjectId: subrunId,
+    });
+    await expect(setup.store.terminalizeProviderSubmissionForReconciliation({
+      subrunId,
+      expectedSubrunVersion: unknownSubrun.stateVersion,
+      expectedJobVersion: unknownJob.stateVersion,
+      reason: "provider_not_found",
+      operatorHash: setup.store.operatorAuditHash("on-call-operator"),
+    })).resolves.toEqual({ kind: "conflict" });
+    expect(provider.submit).toHaveBeenCalledTimes(1);
+  });
+
   it("turns a crashed submitting lease into submission_unknown before any second call", async () => {
     const provider = fakeProvider({ kind: "accepted", providerRequestId: "must-not-be-called" });
     const setup = fixture({ provider });

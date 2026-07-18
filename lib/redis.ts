@@ -1191,6 +1191,21 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V2")) {
       return this.evalStudioFinishProviderSubmission(options.keys, options.arguments);
     }
+    if (script.includes("AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V1")) {
+      return this.evalStudioAttachProviderRequestReconciliation(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_TERMINALIZE_PROVIDER_RECONCILIATION_V1")) {
+      return this.evalStudioTerminalizeProviderReconciliation(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_RESOLVE_OUTBOX_SEND_RECONCILIATION_V1")) {
+      return this.evalStudioResolveOutboxSendReconciliation(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_REQUEUE_CONFIRMED_ABSENT_OUTBOX_V1")) {
+      return this.evalStudioRequeueConfirmedAbsentOutbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_TERMINALIZE_EXPIRED_OUTBOX_RECONCILIATION_V1")) {
+      return this.evalStudioTerminalizeExpiredOutboxReconciliation(options.keys, options.arguments);
+    }
     throw new Error("MemoryRedis does not implement this Lua script");
   }
 
@@ -1971,6 +1986,307 @@ export class MemoryRedis implements RedisLike {
     return JSON.stringify(record);
   }
 
+  private evalStudioAttachProviderRequestReconciliation(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 6, 7);
+    const subrunKey = this.studioKey(keys, 0);
+    const referenceKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const jobKey = this.studioKey(keys, 3);
+    const payloadKey = this.studioKey(keys, 4);
+    const auditKey = this.studioKey(keys, 5);
+    const expectedSubrunVersion = this.studioPositiveInteger(this.studioArgument(args, 0));
+    const expectedJobVersion = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const expectedSubrunId = this.studioArgument(args, 2);
+    const expectedJobId = this.studioArgument(args, 3);
+    const encryptedReference = this.studioArgument(args, 4);
+    const audit = this.studioArgument(args, 5);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+
+    const subrun = this.studioRecordFailClosed(subrunKey);
+    const job = this.studioRecordFailClosed(jobKey);
+    if (!subrun || !job) return -3;
+    if (
+      subrun.state !== "submission_unknown"
+      || typeof subrun.stateVersion !== "number"
+      || !Number.isSafeInteger(subrun.stateVersion)
+      || subrun.stateVersion !== expectedSubrunVersion
+      || subrun.subrunId !== expectedSubrunId
+      || subrun.jobId !== expectedJobId
+      || job.jobId !== expectedJobId
+      || job.state !== "reconciliation_required"
+      || typeof job.stateVersion !== "number"
+      || !Number.isSafeInteger(job.stateVersion)
+      || job.stateVersion !== expectedJobVersion
+    ) return -1;
+
+    // Keep the new encrypted provider reference bounded by the original job
+    // snapshot's remaining lifetime. Reconciliation must never extend it.
+    const payload = this.getEntry(payloadKey);
+    const payloadTtl = !payload || payload.expiresAt === null
+      ? -1
+      : Math.max(0, payload.expiresAt - this.now());
+    if (payloadTtl < 1) return -2;
+    if (this.getEntry(auditKey)) return -3;
+
+    subrun.state = "submitted";
+    subrun.stateVersion = expectedSubrunVersion + 1;
+    subrun.updatedAtMs = now;
+    job.state = "executing";
+    job.stateVersion = expectedJobVersion + 1;
+    job.updatedAtMs = now;
+    this.studioSetPersistentRecord(subrunKey, subrun);
+    this.studioSet(referenceKey, encryptedReference, payloadTtl);
+    this.values.delete(leaseKey);
+    this.studioSetPersistentRecord(jobKey, job);
+    this.studioSetPersistent(auditKey, audit);
+    return 1;
+  }
+
+  private evalStudioTerminalizeProviderReconciliation(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 7, 7);
+    const subrunKey = this.studioKey(keys, 0);
+    const referenceKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const jobKey = this.studioKey(keys, 3);
+    const payloadKey = this.studioKey(keys, 4);
+    const activeJobKey = this.studioKey(keys, 5);
+    const auditKey = this.studioKey(keys, 6);
+    const expectedSubrunVersion = this.studioPositiveInteger(this.studioArgument(args, 0));
+    const expectedJobVersion = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const expectedSubrunId = this.studioArgument(args, 2);
+    const expectedJobId = this.studioArgument(args, 3);
+    const audit = this.studioArgument(args, 4);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 5));
+    const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 6));
+
+    const subrun = this.studioRecordFailClosed(subrunKey);
+    const job = this.studioRecordFailClosed(jobKey);
+    if (!subrun || !job) return -3;
+    if (
+      subrun.state !== "submission_unknown"
+      || typeof subrun.stateVersion !== "number"
+      || !Number.isSafeInteger(subrun.stateVersion)
+      || subrun.stateVersion !== expectedSubrunVersion
+      || subrun.subrunId !== expectedSubrunId
+      || subrun.jobId !== expectedJobId
+      || job.jobId !== expectedJobId
+      || job.state !== "reconciliation_required"
+      || typeof job.stateVersion !== "number"
+      || !Number.isSafeInteger(job.stateVersion)
+      || job.stateVersion !== expectedJobVersion
+    ) return -1;
+    if (this.getEntry(auditKey)) return -3;
+
+    subrun.state = "reconciliation_terminalized";
+    subrun.stateVersion = expectedSubrunVersion + 1;
+    subrun.updatedAtMs = now;
+    job.state = "failed";
+    job.stateVersion = expectedJobVersion + 1;
+    job.updatedAtMs = now;
+    delete job.encryptedPayload;
+    this.studioSetRecord(subrunKey, subrun, terminalTtl);
+    this.values.delete(referenceKey);
+    this.values.delete(leaseKey);
+    this.studioSetRecord(jobKey, job, terminalTtl);
+    this.values.delete(payloadKey);
+    if (this.studioString(activeJobKey) === expectedJobId) this.values.delete(activeJobKey);
+    this.studioSetPersistent(auditKey, audit);
+    return 1;
+  }
+
+  private evalStudioResolveOutboxSendReconciliation(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 5, 6);
+    const outboxKey = this.studioKey(keys, 0);
+    const payloadKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const laneKey = this.studioKey(keys, 3);
+    const auditKey = this.studioKey(keys, 4);
+    const expectedVersion = this.studioPositiveInteger(this.studioArgument(args, 0));
+    const resolution = this.studioArgument(args, 1);
+    const audit = this.studioArgument(args, 2);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+    const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
+    const outboxId = this.studioArgument(args, 5);
+
+    const record = this.studioRecordFailClosed(outboxKey);
+    if (!record) return -3;
+    if (
+      record.outboxId !== outboxId
+      || record.state !== "send_unknown"
+      || typeof record.stateVersion !== "number"
+      || !Number.isSafeInteger(record.stateVersion)
+      || record.stateVersion !== expectedVersion
+    ) return -1;
+    if (resolution !== "sent" && resolution !== "confirmed_absent") return -3;
+    if (this.getEntry(auditKey)) return -3;
+
+    if (resolution === "sent") {
+      record.state = "sent";
+      record.stateVersion = expectedVersion + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(outboxKey, record, terminalTtl);
+      this.values.delete(payloadKey);
+      this.studioRemoveMember(readyKey, outboxId);
+      this.studioRemoveMember(laneKey, outboxId);
+    } else {
+      const payload = this.getEntry(payloadKey);
+      const payloadTtl = !payload || payload.expiresAt === null
+        ? -1
+        : Math.max(0, payload.expiresAt - this.now());
+      if (payloadTtl < 1) {
+        record.state = "failed";
+        record.terminalReason = "artifact_expired";
+        record.stateVersion = expectedVersion + 1;
+        record.updatedAtMs = now;
+        this.studioSetRecord(outboxKey, record, terminalTtl);
+        this.values.delete(payloadKey);
+        this.studioRemoveMember(readyKey, outboxId);
+        this.studioRemoveMember(laneKey, outboxId);
+      } else {
+        record.state = "confirmed_absent";
+        record.stateVersion = expectedVersion + 1;
+        record.updatedAtMs = now;
+        this.studioSetPersistentRecord(outboxKey, record);
+        this.studioRemoveMember(readyKey, outboxId);
+      }
+    }
+    this.studioSetPersistent(auditKey, audit);
+    return 1;
+  }
+
+  private evalStudioRequeueConfirmedAbsentOutbox(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 8, 12);
+    const sourceKey = this.studioKey(keys, 0);
+    const sourcePayloadKey = this.studioKey(keys, 1);
+    const replacementKey = this.studioKey(keys, 2);
+    const replacementPayloadKey = this.studioKey(keys, 3);
+    const readyKey = this.studioKey(keys, 4);
+    const laneKey = this.studioKey(keys, 5);
+    const releaseFenceKey = this.studioKey(keys, 6);
+    const auditKey = this.studioKey(keys, 7);
+    const expectedSourceVersion = this.studioPositiveInteger(this.studioArgument(args, 0));
+    const expectedSourceId = this.studioArgument(args, 1);
+    const replacementRaw = this.studioArgument(args, 2);
+    const replacementPayload = this.studioArgument(args, 3);
+    const dueAtMs = this.studioNonnegativeInteger(this.studioArgument(args, 4));
+    const replacementId = this.studioArgument(args, 5);
+    const replacementSequence = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+    const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 7));
+    const releasePhase = this.studioArgument(args, 8);
+    const audit = this.studioArgument(args, 9);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 10));
+    const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 11));
+
+    const source = this.studioRecordFailClosed(sourceKey);
+    if (!source) return -4;
+    if (
+      source.outboxId !== expectedSourceId
+      || source.state !== "confirmed_absent"
+      || typeof source.stateVersion !== "number"
+      || !Number.isSafeInteger(source.stateVersion)
+      || source.stateVersion !== expectedSourceVersion
+    ) return -1;
+    if (this.getEntry(replacementKey)) return -1;
+
+    let replacement: Record<string, unknown>;
+    try {
+      replacement = this.studioRecordFromJson(replacementRaw);
+    } catch {
+      return -4;
+    }
+    if (
+      replacement.outboxId !== replacementId
+      || replacement.state !== "intent"
+      || replacement.stateVersion !== 1
+    ) return -4;
+    const sourcePayload = this.getEntry(sourcePayloadKey);
+    const payloadTtl = !sourcePayload || sourcePayload.expiresAt === null
+      ? -1
+      : Math.max(0, sourcePayload.expiresAt - this.now());
+    if (payloadTtl < 1) return -2;
+    if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") return -3;
+    const stamp = replacement.releaseStamp;
+    if (!stamp || typeof stamp !== "object" || Array.isArray(stamp)) return -3;
+    const replacementStamp = stamp as Record<string, unknown>;
+    if (
+      typeof replacementStamp.generation !== "number"
+      || !Number.isSafeInteger(replacementStamp.generation)
+      || replacementStamp.generation < 0
+      || replacementStamp.generation !== releaseGeneration
+      || replacementStamp.phase !== releasePhase
+    ) return -3;
+    if (this.studioReleasePersistenceStatus(replacement, releaseFenceKey, releaseGeneration, releasePhase) !== 1) {
+      return -3;
+    }
+
+    const lane = this.getZSet(laneKey, false);
+    const laneEntries = [...(lane?.value.entries() ?? [])]
+      .sort(([firstMember, firstSequence], [secondMember, secondSequence]) =>
+        firstSequence === secondSequence ? firstMember.localeCompare(secondMember) : firstSequence - secondSequence,
+      );
+    if (laneEntries.length === 0 || laneEntries[0]?.[0] !== expectedSourceId) return -1;
+    const matchingSequence = laneEntries.filter(([, score]) => score === replacementSequence);
+    if (matchingSequence.length !== 1 || matchingSequence[0]?.[0] !== expectedSourceId) return -1;
+    if (this.getEntry(auditKey)) return -5;
+
+    source.state = "requeued";
+    source.stateVersion = expectedSourceVersion + 1;
+    source.updatedAtMs = now;
+    delete source.terminalReason;
+    this.studioSetRecord(sourceKey, source, terminalTtl);
+    this.values.delete(sourcePayloadKey);
+    this.studioSetPersistentRecord(replacementKey, replacement);
+    this.studioSet(replacementPayloadKey, replacementPayload, payloadTtl);
+    const ready = this.getZSet(readyKey, true);
+    ready.value.set(replacementId, dueAtMs);
+    const replacementLane = this.getZSet(laneKey, true);
+    replacementLane.value.delete(expectedSourceId);
+    replacementLane.value.set(replacementId, replacementSequence);
+    this.studioSetPersistent(auditKey, audit);
+    return 1;
+  }
+
+  private evalStudioTerminalizeExpiredOutboxReconciliation(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 5, 5);
+    const outboxKey = this.studioKey(keys, 0);
+    const payloadKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const laneKey = this.studioKey(keys, 3);
+    const auditKey = this.studioKey(keys, 4);
+    const expectedVersion = this.studioPositiveInteger(this.studioArgument(args, 0));
+    const expectedOutboxId = this.studioArgument(args, 1);
+    const audit = this.studioArgument(args, 2);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+    const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
+
+    const record = this.studioRecordFailClosed(outboxKey);
+    if (!record) return -3;
+    if (
+      record.outboxId !== expectedOutboxId
+      || record.state !== "confirmed_absent"
+      || typeof record.stateVersion !== "number"
+      || !Number.isSafeInteger(record.stateVersion)
+      || record.stateVersion !== expectedVersion
+    ) return -1;
+    const payload = this.getEntry(payloadKey);
+    const payloadTtl = !payload || payload.expiresAt === null
+      ? -1
+      : Math.max(0, payload.expiresAt - this.now());
+    if (payloadTtl >= 1) return -2;
+    if (this.getEntry(auditKey)) return -3;
+
+    record.state = "failed";
+    record.terminalReason = "artifact_expired";
+    record.stateVersion = expectedVersion + 1;
+    record.updatedAtMs = now;
+    this.studioSetRecord(outboxKey, record, terminalTtl);
+    this.values.delete(payloadKey);
+    this.studioRemoveMember(readyKey, expectedOutboxId);
+    this.studioRemoveMember(laneKey, expectedOutboxId);
+    this.studioSetPersistent(auditKey, audit);
+    return 1;
+  }
+
   private assertStudioArity(keys: readonly string[], args: readonly string[], keyCount: number, argCount: number): void {
     if (keys.length !== keyCount || args.length !== argCount) throw new Error("invalid studio Lua arguments");
   }
@@ -2219,9 +2535,13 @@ export class MemoryRedis implements RedisLike {
     this.studioSet(key, JSON.stringify(record), ttlSeconds * 1_000);
   }
 
-  private studioSetPersistentRecord(key: string, record: Record<string, unknown>): void {
+  private studioSetPersistent(key: string, value: string): void {
     this.assertStringOrMissing(key);
-    this.values.set(key, { kind: "string", value: JSON.stringify(record), expiresAt: null });
+    this.values.set(key, { kind: "string", value, expiresAt: null });
+  }
+
+  private studioSetPersistentRecord(key: string, record: Record<string, unknown>): void {
+    this.studioSetPersistent(key, JSON.stringify(record));
   }
 
   private studioStateVersion(record: Record<string, unknown>): number {

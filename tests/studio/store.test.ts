@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { createQueueCipher, type QueueCipher } from "../../lib/crypto.js";
 import { MemoryRedis } from "../../lib/redis.js";
-import { hashSenderIdentifier, hashThreadIdentifier, type SenderHash, type ThreadHash } from "../../lib/security.js";
+import { deriveOpaqueId, hashSenderIdentifier, hashThreadIdentifier, type SenderHash, type ThreadHash } from "../../lib/security.js";
 import {
   STUDIO_MAX_OUTBOX_SEND_ATTEMPTS,
   STUDIO_CRON_FRESHNESS_MS,
@@ -385,6 +385,367 @@ describe("Air v2 studio durable store", () => {
     advance(7 * 24 * 60 * 60 * 1_000);
     await expect(store.getOutbox(claim.record.outboxId))
       .resolves.toMatchObject({ state: "send_unknown" });
+  });
+
+  it("reconciles a confirmed-absent send once, preserves its lane, and carries only the remaining payload lifetime forward", async () => {
+    const { redis, store, prefix } = fixture();
+    const { senderHash } = identities();
+    const sourceOutboxId = deriveOpaqueId(identitySecret, "reconciliation-outbox", "source");
+    const laterOutboxId = deriveOpaqueId(identitySecret, "reconciliation-outbox", "later");
+    const operatorHash = store.operatorAuditHash("on-call-operator");
+    const payload = {
+      kind: "text" as const,
+      text: "private reconciliation delivery",
+      thread: { chatGuid: "chat", sendingLine: "line", replyTargetId: "reply-guid" },
+    };
+    await store.createOutbox({
+      outboxId: sourceOutboxId,
+      senderHash,
+      lane: "onboarding",
+      sequence: 1,
+      payload,
+    });
+    await store.createOutbox({
+      outboxId: laterOutboxId,
+      senderHash,
+      lane: "onboarding",
+      sequence: 2,
+      payload: { ...payload, text: "later private reconciliation delivery" },
+    });
+    const claim = await store.claimNextOutbox();
+    if (!claim) throw new Error("expected source outbox claim");
+    expect(claim.record.outboxId).toBe(sourceOutboxId);
+    expect(await store.finishOutbox(sourceOutboxId, claim.leaseToken, "send_unknown")).toBe(true);
+    const unknown = await store.getOutbox(sourceOutboxId);
+    if (!unknown) throw new Error("expected unknown source outbox");
+
+    const absent = await store.resolveOutboxSendForReconciliation({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: unknown.stateVersion,
+      resolution: "confirmed_absent",
+      operatorHash,
+    });
+    if (absent.kind !== "applied") throw new Error("expected confirmed absence");
+    await expect(store.getOutbox(sourceOutboxId)).resolves.toMatchObject({
+      state: "confirmed_absent",
+      stateVersion: 4,
+    });
+    // Outstanding reconciliation records are durable even though their
+    // encrypted payload keeps its original 24-hour privacy deadline.
+    expect(await redis.pttl(`${prefix}:outbox:${sourceOutboxId}`)).toBe(-1);
+    await expect(store.claimNextOutbox()).resolves.toBeNull();
+    const remainingPayloadTtl = await redis.pttl(`${prefix}:outbox:payload:${sourceOutboxId}`);
+    expect(remainingPayloadTtl).toBeGreaterThan(0);
+
+    const requeued = await store.requeueConfirmedAbsentOutbox({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: 4,
+      operatorHash,
+    });
+    if (requeued.kind !== "applied" || !requeued.replacementOutboxId) {
+      throw new Error("expected one audited replacement outbox");
+    }
+    await expect(store.getOutbox(sourceOutboxId)).resolves.toMatchObject({ state: "requeued", stateVersion: 5 });
+    const sourceAfter = await store.getOutbox(sourceOutboxId);
+    expect(sourceAfter).not.toHaveProperty("encryptedPayload");
+    expect(await redis.get(`${prefix}:outbox:payload:${sourceOutboxId}`)).toBeNull();
+    expect(await redis.pttl(`${prefix}:outbox:${sourceOutboxId}`)).toBe(7 * 24 * 60 * 60 * 1_000);
+    const replacement = await store.getOutbox(requeued.replacementOutboxId);
+    if (!replacement) throw new Error("expected replacement outbox");
+    expect(replacement).toMatchObject({ state: "intent", stateVersion: 1, sequence: 1 });
+    expect(store.decryptOutboxPayload(replacement)).toEqual(payload);
+    expect(await redis.pttl(`${prefix}:outbox:payload:${requeued.replacementOutboxId}`)).toBeLessThanOrEqual(remainingPayloadTtl);
+    await expect(store.getReconciliationAudit(requeued.auditId)).resolves.toMatchObject({
+      action: "outbox_requeued",
+      subjectId: sourceOutboxId,
+      relatedId: requeued.replacementOutboxId,
+      actorHash: operatorHash,
+    });
+    const rawAudit = await redis.get(`${prefix}:reconciliation:audit:${requeued.auditId}`);
+    expect(rawAudit ?? "").not.toContain("private reconciliation delivery");
+    expect(rawAudit ?? "").not.toContain("reply-guid");
+
+    // The replacement atomically takes the unresolved lane position, so the
+    // later onboarding bubble cannot overtake it.
+    const replacementClaim = await store.claimNextOutbox();
+    expect(replacementClaim?.record.outboxId).toBe(requeued.replacementOutboxId);
+    await expect(store.requeueConfirmedAbsentOutbox({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: 4,
+      operatorHash,
+    })).resolves.toEqual({ kind: "conflict" });
+  });
+
+  it("terminalizes a confirmed-absent send as artifact_expired when its private payload has elapsed", async () => {
+    const { redis, store, prefix, advance } = fixture();
+    const { senderHash } = identities();
+    const sourceOutboxId = deriveOpaqueId(identitySecret, "reconciliation-outbox", "expired-source");
+    const operatorHash = store.operatorAuditHash("on-call-operator");
+    await store.createOutbox({
+      outboxId: sourceOutboxId,
+      senderHash,
+      lane: "onboarding",
+      sequence: 1,
+      payload: { kind: "text", text: "short lived result", thread: { chatGuid: "chat", sendingLine: "line" } },
+    });
+    const claim = await store.claimNextOutbox();
+    if (!claim) throw new Error("expected source outbox claim");
+    expect(await store.finishOutbox(sourceOutboxId, claim.leaseToken, "send_unknown")).toBe(true);
+    const unknown = await store.getOutbox(sourceOutboxId);
+    if (!unknown) throw new Error("expected unknown source outbox");
+    const absent = await store.resolveOutboxSendForReconciliation({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: unknown.stateVersion,
+      resolution: "confirmed_absent",
+      operatorHash,
+    });
+    if (absent.kind !== "applied") throw new Error("expected confirmed absence");
+
+    advance(24 * 60 * 60 * 1_000 + 1);
+    const expired = await store.requeueConfirmedAbsentOutbox({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: 4,
+      operatorHash,
+    });
+    if (expired.kind !== "payload_expired" || !expired.auditId) {
+      throw new Error("expected artifact-expiry terminalization");
+    }
+    await expect(store.getOutbox(sourceOutboxId)).resolves.toMatchObject({
+      state: "failed",
+      terminalReason: "artifact_expired",
+      stateVersion: 5,
+    });
+    expect(await redis.get(`${prefix}:outbox:payload:${sourceOutboxId}`)).toBeNull();
+    await expect(store.getReconciliationAudit(expired.auditId)).resolves.toMatchObject({
+      action: "outbox_artifact_expired",
+      subjectId: sourceOutboxId,
+      actorHash: operatorHash,
+    });
+  });
+
+  it("terminalizes the expiry race between requeue payload read and atomic copy", async () => {
+    const { redis, store, cipher, prefix, now, advance } = fixture();
+    const { senderHash } = identities();
+    const sourceOutboxId = deriveOpaqueId(identitySecret, "reconciliation-outbox", "copy-expiry-race");
+    const operatorHash = store.operatorAuditHash("on-call-operator");
+    await store.createOutbox({
+      outboxId: sourceOutboxId,
+      senderHash,
+      lane: "onboarding",
+      sequence: 1,
+      payload: { kind: "text", text: "expire at copy boundary", thread: { chatGuid: "chat", sendingLine: "line" } },
+    });
+    const claim = await store.claimNextOutbox();
+    if (!claim) throw new Error("expected source outbox claim");
+    expect(await store.finishOutbox(sourceOutboxId, claim.leaseToken, "send_unknown")).toBe(true);
+    const unknown = await store.getOutbox(sourceOutboxId);
+    if (!unknown) throw new Error("expected unknown source outbox");
+    const absent = await store.resolveOutboxSendForReconciliation({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: unknown.stateVersion,
+      resolution: "confirmed_absent",
+      operatorHash,
+    });
+    if (absent.kind !== "applied") throw new Error("expected confirmed absence");
+
+    advance(24 * 60 * 60 * 1_000 - 1);
+    // The canary fence is intentionally unarmed. Privacy expiry must still
+    // win over a release-blocked requeue rather than stranding the lane.
+    const active = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: { generation: 1, phase: "canary" },
+    });
+    const evaluate = redis.eval.bind(redis);
+    const evaluator = vi.spyOn(redis, "eval").mockImplementation(async (script, options) => {
+      if (script.includes("AIR_STUDIO_REQUEUE_CONFIRMED_ABSENT_OUTBOX_V1")) advance(2);
+      return evaluate(script, options);
+    });
+    try {
+      const result = await active.requeueConfirmedAbsentOutbox({
+        outboxId: sourceOutboxId,
+        expectedOutboxVersion: 4,
+        operatorHash: active.operatorAuditHash("on-call-operator"),
+      });
+      expect(result.kind).toBe("payload_expired");
+    } finally {
+      evaluator.mockRestore();
+    }
+    await expect(store.getOutbox(sourceOutboxId)).resolves.toMatchObject({
+      state: "failed",
+      terminalReason: "artifact_expired",
+      stateVersion: 5,
+    });
+  });
+
+  it("keeps a requeued attempt in its original isolated or fallback lane", async () => {
+    const { store } = fixture();
+    const { senderHash } = identities();
+    const operatorHash = store.operatorAuditHash("on-call-operator");
+    const lanes = ["request-response", "tapback", "job-result"] as const;
+
+    for (const lane of lanes) {
+      const sourceOutboxId = deriveOpaqueId(identitySecret, "reconciliation-outbox", `lane-${lane}`);
+      const payload = lane === "tapback"
+        ? { kind: "tapback" as const, targetMessageId: "target-message", thread: { chatGuid: "chat", sendingLine: "line" } }
+        : { kind: "text" as const, text: `private ${lane} result`, thread: { chatGuid: "chat", sendingLine: "line" } };
+      await store.createOutbox({
+        outboxId: sourceOutboxId,
+        senderHash,
+        lane,
+        sequence: 0,
+        payload,
+      });
+      const sourceClaim = await store.claimNextOutbox();
+      if (!sourceClaim) throw new Error(`expected ${lane} source claim`);
+      expect(sourceClaim.record.outboxId).toBe(sourceOutboxId);
+      expect(await store.finishOutbox(sourceOutboxId, sourceClaim.leaseToken, "send_unknown")).toBe(true);
+      const unknown = await store.getOutbox(sourceOutboxId);
+      if (!unknown) throw new Error(`expected ${lane} unknown state`);
+      const absent = await store.resolveOutboxSendForReconciliation({
+        outboxId: sourceOutboxId,
+        expectedOutboxVersion: unknown.stateVersion,
+        resolution: "confirmed_absent",
+        operatorHash,
+      });
+      if (absent.kind !== "applied") throw new Error(`expected ${lane} absence confirmation`);
+      const requeued = await store.requeueConfirmedAbsentOutbox({
+        outboxId: sourceOutboxId,
+        expectedOutboxVersion: 4,
+        operatorHash,
+      });
+      if (requeued.kind !== "applied" || !requeued.replacementOutboxId) {
+        throw new Error(`expected ${lane} replacement`);
+      }
+      await expect(store.getOutbox(requeued.replacementOutboxId)).resolves.toMatchObject({
+        laneIdentity: sourceOutboxId,
+        sequence: 0,
+      });
+      const replacementClaim = await store.claimNextOutbox();
+      if (!replacementClaim) throw new Error(`expected ${lane} replacement claim`);
+      expect(replacementClaim.record.outboxId).toBe(requeued.replacementOutboxId);
+      expect(await store.finishOutbox(replacementClaim.record.outboxId, replacementClaim.leaseToken, "sent")).toBe(true);
+    }
+  });
+
+  it("carries a media-first pending guard into a requeue so a revoked acknowledgement cannot send", async () => {
+    const { store } = fixture();
+    const { senderHash, threadHash } = identities();
+    const source = await persistScopeRecord(store, senderHash, threadHash, "guarded-reconciliation-source");
+    const pending = await store.putPendingWithGuard(source, { attachmentId: "private-media-reference" });
+    if (pending.kind !== "active") throw new Error("expected active pending guard");
+    const sourceOutboxId = deriveOpaqueId(identitySecret, "reconciliation-outbox", "guarded-source");
+    const created = await store.createPendingGuardedOutbox(pending.guard, {
+      outboxId: sourceOutboxId,
+      senderHash,
+      lane: "request-response",
+      sequence: 0,
+      payload: { kind: "text", text: "I saved that attachment.", thread: { chatGuid: "chat", sendingLine: "line" } },
+    });
+    if (created.kind !== "persisted") throw new Error("expected guarded outbox");
+    const sourceClaim = await store.claimNextOutbox();
+    if (!sourceClaim) throw new Error("expected guarded source claim");
+    expect(await store.finishOutbox(sourceOutboxId, sourceClaim.leaseToken, "send_unknown")).toBe(true);
+    const unknown = await store.getOutbox(sourceOutboxId);
+    if (!unknown) throw new Error("expected guarded unknown state");
+    const operatorHash = store.operatorAuditHash("on-call-operator");
+    const absent = await store.resolveOutboxSendForReconciliation({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: unknown.stateVersion,
+      resolution: "confirmed_absent",
+      operatorHash,
+    });
+    if (absent.kind !== "applied") throw new Error("expected confirmed absence");
+    const cancel = await persistScopeRecord(store, senderHash, threadHash, "guarded-reconciliation-cancel");
+    await expect(store.clearPending(cancel)).resolves.toEqual({ kind: "canceled" });
+
+    const requeued = await store.requeueConfirmedAbsentOutbox({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: 4,
+      operatorHash,
+    });
+    if (requeued.kind !== "applied" || !requeued.replacementOutboxId) {
+      throw new Error("expected guarded replacement outbox");
+    }
+    await expect(store.getOutbox(requeued.replacementOutboxId)).resolves.toMatchObject({ pendingGuard: pending.guard });
+    await expect(store.claimNextOutbox()).resolves.toBeNull();
+    await expect(store.getOutbox(requeued.replacementOutboxId)).resolves.toMatchObject({ state: "canceled" });
+  });
+
+  it("terminalizes an already-expired payload while confirming absence instead of leaving a blocked lane", async () => {
+    const { store, advance } = fixture();
+    const { senderHash } = identities();
+    const sourceOutboxId = deriveOpaqueId(identitySecret, "reconciliation-outbox", "expired-before-absence");
+    await store.createOutbox({
+      outboxId: sourceOutboxId,
+      senderHash,
+      lane: "onboarding",
+      sequence: 1,
+      payload: { kind: "text", text: "expired before operator evidence", thread: { chatGuid: "chat", sendingLine: "line" } },
+    });
+    const claim = await store.claimNextOutbox();
+    if (!claim) throw new Error("expected source outbox claim");
+    expect(await store.finishOutbox(sourceOutboxId, claim.leaseToken, "send_unknown")).toBe(true);
+    const unknown = await store.getOutbox(sourceOutboxId);
+    if (!unknown) throw new Error("expected unknown source outbox");
+
+    advance(24 * 60 * 60 * 1_000 + 1);
+    const resolved = await store.resolveOutboxSendForReconciliation({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: unknown.stateVersion,
+      resolution: "confirmed_absent",
+      operatorHash: store.operatorAuditHash("on-call-operator"),
+    });
+    expect(resolved.kind).toBe("applied");
+    await expect(store.getOutbox(sourceOutboxId)).resolves.toMatchObject({
+      state: "failed",
+      terminalReason: "artifact_expired",
+      stateVersion: 4,
+    });
+  });
+
+  it("refuses a requeue when the replacement release is not fenced current", async () => {
+    const { redis, store: dark, cipher, prefix, now } = fixture();
+    const { senderHash } = identities();
+    const sourceOutboxId = deriveOpaqueId(identitySecret, "reconciliation-outbox", "unarmed-active");
+    const operatorHash = dark.operatorAuditHash("on-call-operator");
+    await dark.createOutbox({
+      outboxId: sourceOutboxId,
+      senderHash,
+      lane: "onboarding",
+      sequence: 1,
+      payload: { kind: "text", text: "do not release through an unarmed fence", thread: { chatGuid: "chat", sendingLine: "line" } },
+    });
+    const claim = await dark.claimNextOutbox();
+    if (!claim) throw new Error("expected source outbox claim");
+    expect(await dark.finishOutbox(sourceOutboxId, claim.leaseToken, "send_unknown")).toBe(true);
+    const unknown = await dark.getOutbox(sourceOutboxId);
+    if (!unknown) throw new Error("expected unknown source outbox");
+    const absent = await dark.resolveOutboxSendForReconciliation({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: unknown.stateVersion,
+      resolution: "confirmed_absent",
+      operatorHash,
+    });
+    if (absent.kind !== "applied") throw new Error("expected confirmed absence");
+    const active = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: { generation: 1, phase: "canary" },
+    });
+
+    await expect(active.requeueConfirmedAbsentOutbox({
+      outboxId: sourceOutboxId,
+      expectedOutboxVersion: 4,
+      operatorHash: active.operatorAuditHash("on-call-operator"),
+    })).resolves.toEqual({ kind: "release_blocked" });
+    await expect(dark.getOutbox(sourceOutboxId)).resolves.toMatchObject({ state: "confirmed_absent", stateVersion: 4 });
   });
 
   it("requires an explicit monotonic release fence before an active generation can publish", async () => {

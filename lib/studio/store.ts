@@ -30,6 +30,7 @@ export const STUDIO_OUTBOX_STATES = Object.freeze([
   "canceled",
   "send_unknown",
   "confirmed_absent",
+  "requeued",
 ] as const);
 export type StudioOutboxState = (typeof STUDIO_OUTBOX_STATES)[number];
 
@@ -157,6 +158,7 @@ export const STUDIO_PROVIDER_SUBRUN_STATES = Object.freeze([
   "submitted",
   "definitive_rejection",
   "submission_unknown",
+  "reconciliation_terminalized",
   "canceled",
 ] as const);
 export type StudioProviderSubrunState = (typeof STUDIO_PROVIDER_SUBRUN_STATES)[number];
@@ -201,6 +203,75 @@ export type StudioProviderSubmissionOutcome =
   | { readonly kind: "definitive_rejection" }
   | { readonly kind: "ambiguous" };
 
+/**
+ * Opaque, append-only reconciliation evidence.  It intentionally contains no
+ * prompt, phone, GUID, provider URL, provider request ID, or artifact data.
+ */
+export const STUDIO_RECONCILIATION_AUDIT_ACTIONS = Object.freeze([
+  "provider_request_attached",
+  "provider_terminalized",
+  "outbox_sent_confirmed",
+  "outbox_absence_confirmed",
+  "outbox_requeued",
+  "outbox_artifact_expired",
+] as const);
+export type StudioReconciliationAuditAction = (typeof STUDIO_RECONCILIATION_AUDIT_ACTIONS)[number];
+
+export type StudioProviderTerminalizationReason =
+  | "provider_not_found"
+  | "provider_unrecoverable"
+  | "operator_canceled";
+
+export interface StudioReconciliationAuditRecord {
+  readonly schemaVersion: 1;
+  readonly auditId: string;
+  /** HMAC-derived actor identity; callers must never persist the raw value. */
+  readonly actorHash: string;
+  readonly action: StudioReconciliationAuditAction;
+  /** Opaque provider-subrun or outbox identifier. */
+  readonly subjectId: string;
+  /** Opaque replacement outbox ID for a confirmed-absent requeue. */
+  readonly relatedId?: string | undefined;
+  readonly reason?: StudioProviderTerminalizationReason | undefined;
+  readonly occurredAtMs: number;
+}
+
+export type StudioReconciliationResult =
+  | { readonly kind: "applied"; readonly auditId: string; readonly replacementOutboxId?: string | undefined }
+  | { readonly kind: "conflict" }
+  | { readonly kind: "payload_expired"; readonly auditId?: string | undefined }
+  | { readonly kind: "release_blocked" }
+  | { readonly kind: "unavailable" };
+
+export interface AttachProviderRequestForReconciliationInput {
+  readonly subrunId: string;
+  readonly expectedSubrunVersion: number;
+  readonly expectedJobVersion: number;
+  readonly providerRequestId: string;
+  readonly operatorHash: string;
+}
+
+export interface TerminalizeProviderSubmissionForReconciliationInput {
+  readonly subrunId: string;
+  readonly expectedSubrunVersion: number;
+  readonly expectedJobVersion: number;
+  readonly reason: StudioProviderTerminalizationReason;
+  readonly operatorHash: string;
+}
+
+export interface ResolveOutboxSendForReconciliationInput {
+  readonly outboxId: string;
+  readonly expectedOutboxVersion: number;
+  readonly resolution: "sent" | "confirmed_absent";
+  readonly operatorHash: string;
+}
+
+export interface RequeueConfirmedAbsentOutboxInput {
+  readonly outboxId: string;
+  readonly expectedOutboxVersion: number;
+  readonly operatorHash: string;
+}
+
 export interface StudioOutboxPayload {
   readonly kind: "text" | "attachment" | "tapback";
   readonly thread: {
@@ -220,8 +291,12 @@ export interface StudioOutboxRecord {
   readonly jobId?: string | undefined;
   readonly senderHash: SenderHash;
   readonly lane: "onboarding" | "tapback" | "job-acknowledgement" | "job-result" | "request-response";
+  /** Stable identity for an isolated lane across an explicitly requeued send. */
+  readonly laneIdentity?: string | undefined;
   readonly sequence: number;
   readonly state: StudioOutboxState;
+  /** A known privacy-expiry failure is terminal and never triggers a refetch. */
+  readonly terminalReason?: "artifact_expired" | undefined;
   readonly attempts: number;
   readonly stateVersion: number;
   /** Every user-visible intent is bound to one shared release generation. */
@@ -903,6 +978,124 @@ export class StudioStore {
     }
   }
 
+  /**
+   * Derives a non-reversible operator audit identity from an operator-supplied
+   * label.  The raw label is never accepted by any durable record, log, or
+   * reconciliation primitive.
+   */
+  public operatorAuditHash(operatorIdentifier: string): string {
+    if (!isSafeRecordString(operatorIdentifier, 160)) {
+      throw new Error("operator identity is invalid");
+    }
+    return deriveOpaqueId(this.secret, "studio-reconciliation-operator", operatorIdentifier);
+  }
+
+  /** Read one opaque reconciliation audit record. It contains no user or provider content. */
+  public async getReconciliationAudit(auditId: string): Promise<StudioReconciliationAuditRecord | null> {
+    if (!isOpaqueStudioIdentifier(auditId)) return null;
+    const record = parseStored<StudioReconciliationAuditRecord>(await this.redis.get(this.reconciliationAuditKey(auditId)));
+    return record && isReconciliationAuditRecord(record) ? Object.freeze(record) : null;
+  }
+
+  /**
+   * Attaches a verified provider request ID to an ambiguous subrun without
+   * submitting anything.  Both the job and subrun versions are compared in
+   * one Redis transaction, then the job returns only to observation-ready
+   * `executing`; the executor sees `submitted` and cannot resubmit it.
+   */
+  public async attachProviderRequestForReconciliation(
+    input: AttachProviderRequestForReconciliationInput,
+  ): Promise<StudioReconciliationResult> {
+    if (
+      !isOpaqueStudioIdentifier(input.subrunId)
+      || !isPositiveSafeInteger(input.expectedSubrunVersion)
+      || !isPositiveSafeInteger(input.expectedJobVersion)
+      || !isSafeProviderRequestId(input.providerRequestId)
+      || !isOpaqueStudioIdentifier(input.operatorHash)
+    ) return Object.freeze({ kind: "unavailable" });
+
+    const subrun = await this.getProviderSubrun(input.subrunId);
+    const job = subrun ? await this.getJob(subrun.jobId) : null;
+    if (!subrun || !job || subrun.subrunId !== input.subrunId) return Object.freeze({ kind: "unavailable" });
+    const audit = this.buildReconciliationAudit({
+      actorHash: input.operatorHash,
+      action: "provider_request_attached",
+      subjectId: subrun.subrunId,
+    });
+    const encryptedReference = this.cipher.encrypt(
+      { providerRequestId: input.providerRequestId },
+      `provider-subrun:${subrun.subrunId}`,
+    );
+    const result = await this.redis.eval(ATTACH_PROVIDER_REQUEST_RECONCILIATION_LUA, {
+      keys: [
+        this.providerSubrunKey(input.subrunId),
+        this.providerSubrunReferenceKey(input.subrunId),
+        this.providerSubrunLeaseKey(input.subrunId),
+        this.jobKey(subrun.jobId),
+        this.jobPayloadKey(subrun.jobId),
+        this.reconciliationAuditKey(audit.auditId),
+      ],
+      arguments: [
+        String(input.expectedSubrunVersion),
+        String(input.expectedJobVersion),
+        input.subrunId,
+        subrun.jobId,
+        JSON.stringify(encryptedReference),
+        JSON.stringify(audit),
+        String(this.now()),
+      ],
+    });
+    return reconciliationResult(result, audit.auditId, undefined, { payloadExpired: true });
+  }
+
+  /**
+   * Terminalizes an unreconciled provider submission without creating another
+   * provider request.  The reservation remains in immutable job metadata;
+   * only the short-lived execution payload/reference is removed.
+   */
+  public async terminalizeProviderSubmissionForReconciliation(
+    input: TerminalizeProviderSubmissionForReconciliationInput,
+  ): Promise<StudioReconciliationResult> {
+    if (
+      !isOpaqueStudioIdentifier(input.subrunId)
+      || !isPositiveSafeInteger(input.expectedSubrunVersion)
+      || !isPositiveSafeInteger(input.expectedJobVersion)
+      || !isProviderTerminalizationReason(input.reason)
+      || !isOpaqueStudioIdentifier(input.operatorHash)
+    ) return Object.freeze({ kind: "unavailable" });
+
+    const subrun = await this.getProviderSubrun(input.subrunId);
+    const job = subrun ? await this.getJob(subrun.jobId) : null;
+    if (!subrun || !job || subrun.subrunId !== input.subrunId) return Object.freeze({ kind: "unavailable" });
+    const audit = this.buildReconciliationAudit({
+      actorHash: input.operatorHash,
+      action: "provider_terminalized",
+      subjectId: subrun.subrunId,
+      reason: input.reason,
+    });
+    const result = await this.redis.eval(TERMINALIZE_PROVIDER_RECONCILIATION_LUA, {
+      keys: [
+        this.providerSubrunKey(input.subrunId),
+        this.providerSubrunReferenceKey(input.subrunId),
+        this.providerSubrunLeaseKey(input.subrunId),
+        this.jobKey(subrun.jobId),
+        this.jobPayloadKey(subrun.jobId),
+        this.activeJobKey(job.senderHash),
+        this.reconciliationAuditKey(audit.auditId),
+      ],
+      arguments: [
+        String(input.expectedSubrunVersion),
+        String(input.expectedJobVersion),
+        input.subrunId,
+        subrun.jobId,
+        JSON.stringify(audit),
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+      ],
+    });
+    return reconciliationResult(result, audit.auditId);
+  }
+
   public async createOutbox(input: CreateStudioOutboxInput): Promise<StudioOutboxRecord> {
     const record = this.buildOutboxRecord(input);
     const result = await this.persistOutbox(record);
@@ -969,6 +1162,7 @@ export class StudioStore {
   private buildOutboxRecord(
     input: CreateStudioOutboxInput,
     pendingGuard?: PendingWriteGuard,
+    laneIdentity?: string,
   ): StudioOutboxRecord {
     if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
       throw new Error("outbox sequence is invalid");
@@ -978,12 +1172,16 @@ export class StudioStore {
     if (!Number.isSafeInteger(dueAtMs) || dueAtMs < 0) {
       throw new Error("outbox due time is invalid");
     }
+    if (laneIdentity !== undefined && !isSafeRecordString(laneIdentity, 160)) {
+      throw new Error("outbox lane identity is invalid");
+    }
     const record: StudioOutboxRecord = Object.freeze({
       schemaVersion: 3,
       outboxId: input.outboxId,
       ...(input.jobId === undefined ? {} : { jobId: input.jobId }),
       senderHash: input.senderHash,
       lane: input.lane,
+      ...(laneIdentity === undefined ? {} : { laneIdentity }),
       sequence: input.sequence,
       // Every physical send starts as a durable intent. Callers cannot create
       // a pre-sent/retryable record and accidentally bypass this invariant.
@@ -1025,6 +1223,57 @@ export class StudioStore {
     const existing = await this.getOutbox(outboxId);
     if (!existing) throw new Error("outbox publication could not be confirmed");
     return existing;
+  }
+
+  private buildReconciliationAudit(input: {
+    readonly actorHash: string;
+    readonly action: StudioReconciliationAuditAction;
+    readonly subjectId: string;
+    readonly relatedId?: string | undefined;
+    readonly reason?: StudioProviderTerminalizationReason | undefined;
+  }): StudioReconciliationAuditRecord {
+    return Object.freeze({
+      schemaVersion: 1,
+      auditId: randomBytes(32).toString("hex"),
+      actorHash: input.actorHash,
+      action: input.action,
+      subjectId: input.subjectId,
+      ...(input.relatedId === undefined ? {} : { relatedId: input.relatedId }),
+      ...(input.reason === undefined ? {} : { reason: input.reason }),
+      occurredAtMs: this.now(),
+    });
+  }
+
+  private async terminalizeExpiredConfirmedAbsentOutbox(
+    input: RequeueConfirmedAbsentOutboxInput,
+    source: Pick<StudioOutboxRecord, "outboxId" | "senderHash" | "lane" | "jobId">,
+  ): Promise<StudioReconciliationResult> {
+    const audit = this.buildReconciliationAudit({
+      actorHash: input.operatorHash,
+      action: "outbox_artifact_expired",
+      subjectId: input.outboxId,
+    });
+    const expired = await this.redis.eval(TERMINALIZE_EXPIRED_OUTBOX_RECONCILIATION_LUA, {
+      keys: [
+        this.outboxKey(input.outboxId),
+        this.outboxPayloadKey(input.outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(source),
+        this.reconciliationAuditKey(audit.auditId),
+      ],
+      arguments: [
+        String(input.expectedOutboxVersion),
+        input.outboxId,
+        JSON.stringify(audit),
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+      ],
+    });
+    if (expired === 1 || expired === "1") {
+      return Object.freeze({ kind: "payload_expired", auditId: audit.auditId });
+    }
+    if (expired === -1 || expired === "-1") return Object.freeze({ kind: "conflict" });
+    return Object.freeze({ kind: "unavailable" });
   }
 
   private async hydrateJobPayload(metadata: StudioJobRecord): Promise<StudioJobRecord> {
@@ -1076,7 +1325,7 @@ export class StudioStore {
   public async finishOutbox(
     outboxId: string,
     leaseToken: string,
-    state: Exclude<StudioOutboxState, "intent" | "sending" | "canceled" | "confirmed_absent">,
+    state: Exclude<StudioOutboxState, "intent" | "sending" | "canceled" | "confirmed_absent" | "requeued">,
   ): Promise<boolean> {
     const record = await this.getOutbox(outboxId);
     if (!record) return false;
@@ -1085,6 +1334,126 @@ export class StudioStore {
       arguments: [leaseToken, state, String(this.now()), String(TERMINAL_METADATA_TTL_SECONDS), outboxId, String(STUDIO_MAX_OUTBOX_SEND_ATTEMPTS), String(OUTBOX_RETRY_BACKOFF_MS)],
     });
     return typeof result === "string";
+  }
+
+  /**
+   * Resolves a physical iMessage attempt only after an operator has confirmed
+   * its outcome.  No send occurs here; a confirmed absence merely makes an
+   * explicit later requeue possible.
+   */
+  public async resolveOutboxSendForReconciliation(
+    input: ResolveOutboxSendForReconciliationInput,
+  ): Promise<StudioReconciliationResult> {
+    if (
+      !isOpaqueStudioIdentifier(input.outboxId)
+      || !isPositiveSafeInteger(input.expectedOutboxVersion)
+      || (input.resolution !== "sent" && input.resolution !== "confirmed_absent")
+      || !isOpaqueStudioIdentifier(input.operatorHash)
+    ) return Object.freeze({ kind: "unavailable" });
+
+    const outbox = await this.getOutbox(input.outboxId);
+    if (!outbox || outbox.outboxId !== input.outboxId) return Object.freeze({ kind: "unavailable" });
+    const audit = this.buildReconciliationAudit({
+      actorHash: input.operatorHash,
+      action: input.resolution === "sent" ? "outbox_sent_confirmed" : "outbox_absence_confirmed",
+      subjectId: outbox.outboxId,
+    });
+    const result = await this.redis.eval(RESOLVE_OUTBOX_SEND_RECONCILIATION_LUA, {
+      keys: [
+        this.outboxKey(input.outboxId),
+        this.outboxPayloadKey(input.outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(outbox),
+        this.reconciliationAuditKey(audit.auditId),
+      ],
+      arguments: [
+        String(input.expectedOutboxVersion),
+        input.resolution,
+        JSON.stringify(audit),
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        input.outboxId,
+      ],
+    });
+    return reconciliationResult(result, audit.auditId);
+  }
+
+  /**
+   * Creates one fresh, explicitly audited attempt from an operator-confirmed
+   * absent send. The ciphertext is re-encrypted under a new opaque outbox ID
+   * and inherits the source payload's remaining Redis TTL, never a fresh day.
+   */
+  public async requeueConfirmedAbsentOutbox(
+    input: RequeueConfirmedAbsentOutboxInput,
+  ): Promise<StudioReconciliationResult> {
+    if (
+      !isOpaqueStudioIdentifier(input.outboxId)
+      || !isPositiveSafeInteger(input.expectedOutboxVersion)
+      || !isOpaqueStudioIdentifier(input.operatorHash)
+    ) return Object.freeze({ kind: "unavailable" });
+
+    const source = await this.getOutbox(input.outboxId);
+    if (!source || source.outboxId !== input.outboxId) return Object.freeze({ kind: "unavailable" });
+    if (!source.encryptedPayload) return this.terminalizeExpiredConfirmedAbsentOutbox(input, source);
+    let payload: StudioOutboxPayload;
+    try {
+      payload = this.decryptOutboxPayload(source);
+    } catch {
+      return Object.freeze({ kind: "unavailable" });
+    }
+    const replacementOutboxId = randomBytes(32).toString("hex");
+    const laneIdentity = source.lane === "request-response"
+      || source.lane === "tapback"
+      || ((source.lane === "job-acknowledgement" || source.lane === "job-result") && source.jobId === undefined)
+      ? (source.laneIdentity ?? source.outboxId)
+      : undefined;
+    const replacement = this.buildOutboxRecord({
+      outboxId: replacementOutboxId,
+      ...(source.jobId === undefined ? {} : { jobId: source.jobId }),
+      senderHash: source.senderHash,
+      lane: source.lane,
+      sequence: source.sequence,
+      payload,
+    }, source.pendingGuard, laneIdentity);
+    const audit = this.buildReconciliationAudit({
+      actorHash: input.operatorHash,
+      action: "outbox_requeued",
+      subjectId: source.outboxId,
+      relatedId: replacementOutboxId,
+    });
+    const result = await this.redis.eval(REQUEUE_CONFIRMED_ABSENT_OUTBOX_LUA, {
+      keys: [
+        this.outboxKey(input.outboxId),
+        this.outboxPayloadKey(input.outboxId),
+        this.outboxKey(replacement.outboxId),
+        this.outboxPayloadKey(replacement.outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(replacement),
+        this.releaseFenceKey(),
+        this.reconciliationAuditKey(audit.auditId),
+      ],
+      arguments: [
+        String(input.expectedOutboxVersion),
+        input.outboxId,
+        JSON.stringify(outboxMetadata(replacement)),
+        JSON.stringify(requiredOutboxPayload(replacement)),
+        String(replacement.dueAtMs),
+        replacement.outboxId,
+        String(replacement.sequence),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+        JSON.stringify(audit),
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+      ],
+    });
+    // The source payload can expire after the read/decrypt above but before
+    // the atomic copy. Make that privacy expiry a durable known failure
+    // rather than leaving reconciliation outstanding.
+    if (result === -2 || result === "-2") {
+      return this.terminalizeExpiredConfirmedAbsentOutbox(input, source);
+    }
+    return reconciliationResult(result, audit.auditId, replacementOutboxId, { releaseBlocked: true });
   }
 
   /**
@@ -1212,6 +1581,7 @@ export class StudioStore {
   private providerSubrunKey(subrunId: string): string { return `${this.prefix}:provider-subrun:${subrunId}`; }
   private providerSubrunReferenceKey(subrunId: string): string { return `${this.prefix}:provider-subrun:reference:${subrunId}`; }
   private providerSubrunLeaseKey(subrunId: string): string { return `${this.prefix}:provider-subrun:lease:${subrunId}`; }
+  private reconciliationAuditKey(auditId: string): string { return `${this.prefix}:reconciliation:audit:${auditId}`; }
   private outboxKey(outboxId: string): string { return `${this.prefix}:outbox:${outboxId}`; }
   private outboxPayloadKey(outboxId: string): string { return `${this.prefix}:outbox:payload:${outboxId}`; }
   private readyOutboxKey(): string { return `${this.prefix}:outbox:ready`; }
@@ -1221,18 +1591,18 @@ export class StudioStore {
    * request/response and tapback effects must never block each other, while a
    * job acknowledgement/result pair and onboarding bubbles remain serialized.
    */
-  private outboxLaneKey(record: Pick<StudioOutboxRecord, "outboxId" | "senderHash" | "lane" | "jobId">): string {
+  private outboxLaneKey(record: Pick<StudioOutboxRecord, "outboxId" | "senderHash" | "lane" | "laneIdentity" | "jobId">): string {
     const base = `${this.prefix}:outbox:lane:${record.senderHash}`;
     switch (record.lane) {
       case "onboarding":
         return `${base}:onboarding`;
       case "job-acknowledgement":
       case "job-result":
-        return `${base}:job:${record.jobId ?? record.outboxId}`;
+        return `${base}:job:${record.jobId ?? record.laneIdentity ?? record.outboxId}`;
       case "request-response":
-        return `${base}:request:${record.outboxId}`;
+        return `${base}:request:${record.laneIdentity ?? record.outboxId}`;
       case "tapback":
-        return `${base}:tapback:${record.outboxId}`;
+        return `${base}:tapback:${record.laneIdentity ?? record.outboxId}`;
     }
   }
 }
@@ -1290,7 +1660,10 @@ const OUTBOX_TRANSITIONS: Readonly<Record<StudioOutboxState, readonly StudioOutb
   sending: ["sent", "retryable_failure", "failed", "canceled", "send_unknown"],
   retryable_failure: ["sending", "failed", "canceled"],
   send_unknown: ["sent", "confirmed_absent"],
-  confirmed_absent: ["intent", "failed"],
+  // A verified absence can spawn one separately audited replacement. The
+  // source becomes terminal `requeued`, never a fresh physical attempt.
+  confirmed_absent: ["requeued", "failed"],
+  requeued: [],
   sent: [],
   failed: [],
   canceled: [],
@@ -2101,6 +2474,208 @@ redis.call('DEL', KEYS[3])
 return cjson.encode(record)
 `;
 
+const ATTACH_PROVIDER_REQUEST_RECONCILIATION_LUA = `
+-- AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V1
+-- KEYS: subrun metadata, encrypted provider reference, execution lease, job metadata,
+--       encrypted job payload, append-only audit record
+-- ARGV: expected subrun version, expected job version, expected subrun id,
+--       expected job id, encrypted provider reference, audit record, now
+local subrunRaw = redis.call('GET', KEYS[1])
+local jobRaw = redis.call('GET', KEYS[4])
+if not subrunRaw or not jobRaw then return -3 end
+local subrunOk, subrun = pcall(cjson.decode, subrunRaw)
+local jobOk, job = pcall(cjson.decode, jobRaw)
+if not subrunOk or type(subrun) ~= 'table' or not jobOk or type(job) ~= 'table' then return -3 end
+if subrun.state ~= 'submission_unknown'
+  or tonumber(subrun.stateVersion) ~= tonumber(ARGV[1])
+  or subrun.subrunId ~= ARGV[3]
+  or subrun.jobId ~= ARGV[4]
+  or job.jobId ~= ARGV[4]
+  or job.state ~= 'reconciliation_required'
+  or tonumber(job.stateVersion) ~= tonumber(ARGV[2]) then return -1 end
+local payloadTtl = redis.call('PTTL', KEYS[5])
+if not payloadTtl or payloadTtl < 1 then return -2 end
+if not redis.call('SET', KEYS[6], ARGV[6], 'NX') then return -3 end
+subrun.state = 'submitted'
+subrun.stateVersion = tonumber(subrun.stateVersion) + 1
+subrun.updatedAtMs = tonumber(ARGV[7])
+job.state = 'executing'
+job.stateVersion = tonumber(job.stateVersion) + 1
+job.updatedAtMs = tonumber(ARGV[7])
+redis.call('SET', KEYS[1], cjson.encode(subrun))
+redis.call('SET', KEYS[2], ARGV[5], 'PX', payloadTtl)
+redis.call('DEL', KEYS[3])
+redis.call('SET', KEYS[4], cjson.encode(job))
+return 1
+`;
+
+const TERMINALIZE_PROVIDER_RECONCILIATION_LUA = `
+-- AIR_STUDIO_TERMINALIZE_PROVIDER_RECONCILIATION_V1
+-- KEYS: subrun metadata, encrypted provider reference, execution lease, job metadata,
+--       encrypted job payload, active-job marker, append-only audit record
+-- ARGV: expected subrun version, expected job version, expected subrun id, expected job id,
+--       audit record, now, terminal metadata ttl
+local subrunRaw = redis.call('GET', KEYS[1])
+local jobRaw = redis.call('GET', KEYS[4])
+if not subrunRaw or not jobRaw then return -3 end
+local subrunOk, subrun = pcall(cjson.decode, subrunRaw)
+local jobOk, job = pcall(cjson.decode, jobRaw)
+if not subrunOk or type(subrun) ~= 'table' or not jobOk or type(job) ~= 'table' then return -3 end
+if subrun.state ~= 'submission_unknown'
+  or tonumber(subrun.stateVersion) ~= tonumber(ARGV[1])
+  or subrun.subrunId ~= ARGV[3]
+  or subrun.jobId ~= ARGV[4]
+  or job.jobId ~= ARGV[4]
+  or job.state ~= 'reconciliation_required'
+  or tonumber(job.stateVersion) ~= tonumber(ARGV[2]) then return -1 end
+if not redis.call('SET', KEYS[7], ARGV[5], 'NX') then return -3 end
+subrun.state = 'reconciliation_terminalized'
+subrun.stateVersion = tonumber(subrun.stateVersion) + 1
+subrun.updatedAtMs = tonumber(ARGV[6])
+job.state = 'failed'
+job.stateVersion = tonumber(job.stateVersion) + 1
+job.updatedAtMs = tonumber(ARGV[6])
+job.encryptedPayload = nil
+redis.call('SET', KEYS[1], cjson.encode(subrun), 'EX', ARGV[7])
+redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[3])
+redis.call('SET', KEYS[4], cjson.encode(job), 'EX', ARGV[7])
+redis.call('DEL', KEYS[5])
+if redis.call('GET', KEYS[6]) == ARGV[4] then redis.call('DEL', KEYS[6]) end
+return 1
+`;
+
+const RESOLVE_OUTBOX_SEND_RECONCILIATION_LUA = `
+-- AIR_STUDIO_RESOLVE_OUTBOX_SEND_RECONCILIATION_V1
+-- KEYS: outbox metadata, encrypted outbox payload, ready index, lane index, audit record
+-- ARGV: expected outbox version, sent|confirmed_absent, audit record, now,
+--       terminal metadata ttl, outbox id
+local raw = redis.call('GET', KEYS[1])
+if not raw then return -3 end
+local ok, record = pcall(cjson.decode, raw)
+if not ok or type(record) ~= 'table' then return -3 end
+if record.outboxId ~= ARGV[6]
+  or record.state ~= 'send_unknown'
+  or tonumber(record.stateVersion) ~= tonumber(ARGV[1]) then return -1 end
+if ARGV[2] ~= 'sent' and ARGV[2] ~= 'confirmed_absent' then return -3 end
+if not redis.call('SET', KEYS[5], ARGV[3], 'NX') then return -3 end
+if ARGV[2] == 'sent' then
+  record.state = 'sent'
+  record.stateVersion = tonumber(record.stateVersion) + 1
+  record.updatedAtMs = tonumber(ARGV[4])
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[5])
+  redis.call('DEL', KEYS[2])
+  redis.call('ZREM', KEYS[3], ARGV[6])
+  redis.call('ZREM', KEYS[4], ARGV[6])
+else
+  local payloadTtl = redis.call('PTTL', KEYS[2])
+  if not payloadTtl or payloadTtl < 1 then
+    -- A known absence cannot be safely requeued once the Air-owned private
+    -- reference has elapsed. Terminalize rather than refetching/regenerating.
+    record.state = 'failed'
+    record.terminalReason = 'artifact_expired'
+    record.stateVersion = tonumber(record.stateVersion) + 1
+    record.updatedAtMs = tonumber(ARGV[4])
+    redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[5])
+    redis.call('DEL', KEYS[2])
+    redis.call('ZREM', KEYS[3], ARGV[6])
+    redis.call('ZREM', KEYS[4], ARGV[6])
+  else
+    -- Outstanding reconciliation remains durable; the encrypted payload
+    -- itself retains its original privacy deadline independently.
+    record.state = 'confirmed_absent'
+    record.stateVersion = tonumber(record.stateVersion) + 1
+    record.updatedAtMs = tonumber(ARGV[4])
+    redis.call('SET', KEYS[1], cjson.encode(record))
+    redis.call('ZREM', KEYS[3], ARGV[6])
+  end
+end
+return 1
+`;
+
+const REQUEUE_CONFIRMED_ABSENT_OUTBOX_LUA = `
+-- AIR_STUDIO_REQUEUE_CONFIRMED_ABSENT_OUTBOX_V1
+-- KEYS: source metadata, source payload, replacement metadata, replacement payload,
+--       ready index, replacement lane index, shared release fence, audit record
+-- ARGV: expected source version, expected source outbox id, replacement metadata,
+--       replacement encrypted payload, replacement due time, replacement id,
+--       replacement sequence, release generation, release phase, audit record,
+--       now, terminal metadata ttl
+local sourceRaw = redis.call('GET', KEYS[1])
+if not sourceRaw then return -4 end
+local sourceOk, source = pcall(cjson.decode, sourceRaw)
+if not sourceOk or type(source) ~= 'table' then return -4 end
+if source.outboxId ~= ARGV[2]
+  or source.state ~= 'confirmed_absent'
+  or tonumber(source.stateVersion) ~= tonumber(ARGV[1]) then return -1 end
+if redis.call('EXISTS', KEYS[3]) == 1 then return -1 end
+local replacementOk, replacement = pcall(cjson.decode, ARGV[3])
+if not replacementOk or type(replacement) ~= 'table'
+  or replacement.outboxId ~= ARGV[6]
+  or replacement.state ~= 'intent'
+  or tonumber(replacement.stateVersion) ~= 1 then return -4 end
+local payloadTtl = redis.call('PTTL', KEYS[2])
+if not payloadTtl or payloadTtl < 1 then return -2 end
+local stamp = replacement.releaseStamp
+if type(stamp) ~= 'table'
+  or type(stamp.generation) ~= 'number' or stamp.generation < 0
+  or stamp.generation ~= math.floor(stamp.generation)
+  or stamp.generation ~= tonumber(ARGV[8]) or stamp.phase ~= ARGV[9] then return -3 end
+local fenceRaw = redis.call('GET', KEYS[7])
+if fenceRaw then
+  local fenceOk, fence = pcall(cjson.decode, fenceRaw)
+  if not fenceOk or type(fence) ~= 'table'
+    or type(fence.generation) ~= 'number' or fence.generation < 0
+    or fence.generation ~= math.floor(fence.generation)
+    or (fence.phase ~= 'dark' and fence.phase ~= 'canary' and fence.phase ~= 'production') then return -3 end
+  if fence.generation ~= tonumber(ARGV[8]) or fence.phase ~= ARGV[9] then return -3 end
+elseif ARGV[9] ~= 'dark' then
+  return -3
+end
+local laneHead = redis.call('ZRANGE', KEYS[6], 0, 0)
+if #laneHead ~= 1 or laneHead[1] ~= ARGV[2] then return -1 end
+local laneSequence = redis.call('ZRANGEBYSCORE', KEYS[6], ARGV[7], ARGV[7])
+if #laneSequence ~= 1 or laneSequence[1] ~= ARGV[2] then return -1 end
+if not redis.call('SET', KEYS[8], ARGV[10], 'NX') then return -5 end
+source.state = 'requeued'
+source.stateVersion = tonumber(source.stateVersion) + 1
+source.updatedAtMs = tonumber(ARGV[11])
+source.terminalReason = nil
+redis.call('SET', KEYS[1], cjson.encode(source), 'EX', ARGV[12])
+redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[3], ARGV[3])
+redis.call('SET', KEYS[4], ARGV[4], 'PX', payloadTtl)
+redis.call('ZADD', KEYS[5], tonumber(ARGV[5]), ARGV[6])
+redis.call('ZREM', KEYS[6], ARGV[2])
+redis.call('ZADD', KEYS[6], tonumber(ARGV[7]), ARGV[6])
+return 1
+`;
+
+const TERMINALIZE_EXPIRED_OUTBOX_RECONCILIATION_LUA = `
+-- AIR_STUDIO_TERMINALIZE_EXPIRED_OUTBOX_RECONCILIATION_V1
+-- KEYS: outbox metadata, encrypted outbox payload, ready index, lane index, audit record
+-- ARGV: expected outbox version, expected outbox id, audit record, now, terminal metadata ttl
+local raw = redis.call('GET', KEYS[1])
+if not raw then return -3 end
+local ok, record = pcall(cjson.decode, raw)
+if not ok or type(record) ~= 'table' then return -3 end
+if record.outboxId ~= ARGV[2]
+  or record.state ~= 'confirmed_absent'
+  or tonumber(record.stateVersion) ~= tonumber(ARGV[1]) then return -1 end
+local payloadTtl = redis.call('PTTL', KEYS[2])
+if payloadTtl and payloadTtl >= 1 then return -2 end
+if not redis.call('SET', KEYS[5], ARGV[3], 'NX') then return -3 end
+record.state = 'failed'
+record.terminalReason = 'artifact_expired'
+record.stateVersion = tonumber(record.stateVersion) + 1
+record.updatedAtMs = tonumber(ARGV[4])
+redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[5])
+redis.call('DEL', KEYS[2])
+redis.call('ZREM', KEYS[3], ARGV[2])
+redis.call('ZREM', KEYS[4], ARGV[2])
+return 1
+`;
+
 function parseStored<T>(raw: string | null): T | null {
   if (raw === null) return null;
   try {
@@ -2109,6 +2684,29 @@ function parseStored<T>(raw: string | null): T | null {
   } catch {
     return null;
   }
+}
+
+function reconciliationResult(
+  raw: unknown,
+  auditId: string,
+  replacementOutboxId?: string,
+  options: { readonly payloadExpired?: boolean; readonly releaseBlocked?: boolean } = {},
+): StudioReconciliationResult {
+  if (raw === 1 || raw === "1") {
+    return Object.freeze({
+      kind: "applied",
+      auditId,
+      ...(replacementOutboxId === undefined ? {} : { replacementOutboxId }),
+    });
+  }
+  if (raw === -1 || raw === "-1") return Object.freeze({ kind: "conflict" });
+  if (options.payloadExpired && (raw === -2 || raw === "-2")) {
+    return Object.freeze({ kind: "payload_expired" });
+  }
+  if (options.releaseBlocked && (raw === -3 || raw === "-3")) {
+    return Object.freeze({ kind: "release_blocked" });
+  }
+  return Object.freeze({ kind: "unavailable" });
 }
 
 function parseProviderSubmissionBeginResult(raw: string | null): StudioProviderSubmissionBeginResult {
@@ -2164,6 +2762,20 @@ function isProviderSubrunRecord(value: unknown): value is StudioProviderSubrunRe
     && typeof candidate.updatedAtMs === "number" && isNonnegativeSafeInteger(candidate.updatedAtMs);
 }
 
+function isReconciliationAuditRecord(value: unknown): value is StudioReconciliationAuditRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<StudioReconciliationAuditRecord>;
+  return candidate.schemaVersion === 1
+    && isOpaqueStudioIdentifier(candidate.auditId)
+    && isOpaqueStudioIdentifier(candidate.actorHash)
+    && STUDIO_RECONCILIATION_AUDIT_ACTIONS.includes(candidate.action as StudioReconciliationAuditAction)
+    && isOpaqueStudioIdentifier(candidate.subjectId)
+    && (candidate.relatedId === undefined || isOpaqueStudioIdentifier(candidate.relatedId))
+    && (candidate.reason === undefined || isProviderTerminalizationReason(candidate.reason))
+    && typeof candidate.occurredAtMs === "number"
+    && isNonnegativeSafeInteger(candidate.occurredAtMs);
+}
+
 function sameProviderSubrunIdentity(
   left: StudioProviderSubrunRecord,
   right: StudioProviderSubrunRecord,
@@ -2185,6 +2797,10 @@ function isOpaqueStudioIdentifier(value: unknown): value is string {
 
 function isSafeProviderRequestId(value: string): boolean {
   return isSafeRecordString(value, 512);
+}
+
+function isProviderTerminalizationReason(value: unknown): value is StudioProviderTerminalizationReason {
+  return value === "provider_not_found" || value === "provider_unrecoverable" || value === "operator_canceled";
 }
 
 function isSafeRecordString(value: unknown, maximumLength: number): value is string {

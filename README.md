@@ -126,6 +126,15 @@ ambiguous outcome becomes `submission_unknown` and is never replayed. The
 deployed runtime supplies an unverified provider port and does not invoke this
 executor from ingress or Cron, so it does not make a provider path live.
 
+The store also contains dark-only, fake-tested reconciliation primitives. They
+compare exact record versions, record only opaque actor/audit metadata, and
+never call a provider or transport. A verified provider request ID can be
+attached to an ambiguous subrun; an ambiguous iMessage send can be confirmed
+or requeued exactly once as a new delivery attempt. Requeue preserves the
+original lane and payload's remaining 24-hour TTL; an expired payload becomes
+the terminal `artifact_expired` state rather than being refetched or resent.
+No reconciliation HTTP endpoint is exposed in the dark preview.
+
 Provider catalog/schema evidence, price authority, media upload/download,
 polling, output delivery, real transport proof, and a bounded rollback drill
 remain mandatory canary gates. The outbox and pre-submit fences are not an
