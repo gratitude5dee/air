@@ -5,6 +5,7 @@ import { MemoryRedis } from "../../lib/redis.js";
 import { hashSenderIdentifier, hashThreadIdentifier, type SenderHash, type ThreadHash } from "../../lib/security.js";
 import {
   STUDIO_MAX_OUTBOX_SEND_ATTEMPTS,
+  STUDIO_CRON_FRESHNESS_MS,
   STUDIO_REDIS_PREFIX,
   StudioStore,
   canTransitionJob,
@@ -95,6 +96,25 @@ function job(
 }
 
 describe("Air v2 studio durable store", () => {
+  it("keeps Cron heartbeats scoped by deployment and classifies stale or malformed markers", async () => {
+    const { redis, store, prefix, now, advance } = fixture();
+
+    await store.recordCronHeartbeat("preview");
+    expect(await store.getCronFreshness("preview")).toBe("fresh");
+    expect(await store.getCronFreshness("production")).toBe("missing");
+
+    advance(STUDIO_CRON_FRESHNESS_MS + 1);
+    expect(await store.getCronFreshness("preview")).toBe("stale");
+
+    await redis.set(`${prefix}:operations:cron-heartbeat:production`, "not-a-timestamp");
+    expect(await store.getCronFreshness("production")).toBe("invalid");
+    await redis.set(`${prefix}:operations:cron-heartbeat:development`, String(now() + 1));
+    expect(await store.getCronFreshness("development")).toBe("invalid");
+
+    advance(24 * 60 * 60 * 1_000);
+    expect(await store.getCronFreshness("preview")).toBe("missing");
+  });
+
   it("persists a verified inbound receipt before acknowledgement, dedupes it, and keeps private data encrypted", async () => {
     const { redis, store, prefix } = fixture();
     const { senderHash, threadHash } = identities();

@@ -1,4 +1,12 @@
-import { loadStudioEnvironment, studioReadinessProblems, type StudioEnvironment } from "./config.js";
+import {
+  canAcceptStudioJobs,
+  canDeliverStudioMessages,
+  canRecoverStudioProvider,
+  canSubmitStudioProvider,
+  loadStudioEnvironment,
+  studioReadinessProblems,
+  type StudioEnvironment,
+} from "./config.js";
 import { AIR_MODEL_REGISTRY, AIR_MODEL_REGISTRY_VERSION, listEnabledModels } from "./model-registry.js";
 import { getStudioRuntime, type StudioRuntime } from "./runtime.js";
 import { authorizeStudioDrain } from "./webhook-handler.js";
@@ -33,6 +41,9 @@ export async function handleStudioDrain(
 
   try {
     await drain(runtime);
+    // Vercel Cron invokes the configured route with GET. A successful manual
+    // POST deliberately does not make the production Cron look healthy.
+    if (request.method === "GET") await runtime.store.recordCronHeartbeat(environment.deploymentMode);
   } catch {
     return privateEmptyResponse(503);
   }
@@ -41,14 +52,14 @@ export async function handleStudioDrain(
 }
 
 /**
- * Protected, secret-safe readiness diagnostic. It deliberately does not
- * connect to Redis or GMI: an operator needs to see dark-deploy blockers even
- * when the backing service is intentionally absent or disabled.
+ * Protected, secret-safe readiness diagnostic. It verifies the configured
+ * Redis path through the operational heartbeat key, but never contacts a
+ * provider or reads any tenant record.
  */
-export function handleStudioReadiness(
+export async function handleStudioReadiness(
   request: Request,
   options: StudioInternalRouteOptions = {},
-): Response {
+): Promise<Response> {
   if (request.method !== "GET") {
     return new Response(null, {
       status: 405,
@@ -66,6 +77,51 @@ export function handleStudioReadiness(
   problems.push("transport_unverified");
   if (enabledModels === 0) problems.push("no_enabled_models");
 
+  let redis: "reachable" | "unreachable" | "unknown" = "unknown";
+  let cron: "fresh" | "stale" | "missing" | "invalid" | "not_scheduled" | "unreachable" | "unknown" = "unknown";
+  if (!canProbeRedis(environment)) {
+    problems.push("redis_reachability_unknown", "cron_freshness_unknown");
+  } else {
+    let runtime: StudioRuntime;
+    try {
+      runtime = await (options.getRuntime ?? getStudioRuntime)();
+    } catch {
+      redis = "unreachable";
+      cron = "unreachable";
+      problems.push("redis_unavailable", "cron_freshness_unknown");
+      return readinessResponse(environment, enabledModels, redis, cron, problems);
+    }
+    try {
+      const freshness = await runtime.store.getCronFreshness(environment.deploymentMode);
+      redis = "reachable";
+      // Vercel only schedules Cron jobs on production deployments. Preview and
+      // development readiness still verify Redis but must not claim a missed
+      // scheduled invocation.
+      if (environment.deploymentMode === "production") {
+        cron = freshness;
+        if (cron === "stale") problems.push("cron_stale");
+        if (cron === "missing") problems.push("cron_missing");
+        if (cron === "invalid") problems.push("cron_invalid");
+      } else {
+        cron = "not_scheduled";
+      }
+    } catch {
+      redis = "unreachable";
+      cron = "unreachable";
+      problems.push("redis_unavailable", "cron_freshness_unknown");
+    }
+  }
+
+  return readinessResponse(environment, enabledModels, redis, cron, problems);
+}
+
+function readinessResponse(
+  environment: StudioEnvironment,
+  enabledModels: number,
+  redis: "reachable" | "unreachable" | "unknown",
+  cron: "fresh" | "stale" | "missing" | "invalid" | "not_scheduled" | "unreachable" | "unknown",
+  problems: readonly string[],
+): Response {
   return Response.json(
     {
       ok: problems.length === 0,
@@ -73,10 +129,23 @@ export function handleStudioReadiness(
       registryVersion: AIR_MODEL_REGISTRY_VERSION,
       enabledModels,
       sideEffects: environment.policy,
+      effectiveSideEffects: {
+        acceptNewJobs: canAcceptStudioJobs(environment),
+        allowProviderSubmit: canSubmitStudioProvider(environment),
+        allowProviderRecovery: canRecoverStudioProvider(environment),
+        deliveryEnabled: canDeliverStudioMessages(environment),
+      },
+      redis,
+      cron,
       problems,
     },
     { status: problems.length === 0 ? 200 : 503, headers: { "cache-control": "no-store" } },
   );
+}
+
+function canProbeRedis(environment: StudioEnvironment): boolean {
+  return environment.storageTransport !== "unconfigured"
+    && Boolean(environment.idHashSecret && environment.queueEncryptionKey);
 }
 
 function loadAuthorizedEnvironment(

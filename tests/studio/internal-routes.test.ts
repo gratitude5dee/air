@@ -61,6 +61,18 @@ describe("Studio Vercel internal routes", () => {
     expect(drain).not.toHaveBeenCalled();
   });
 
+  it("does not create a runtime for an unauthenticated readiness request", async () => {
+    const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
+    const response = await handleStudioReadiness(
+      new Request("https://air.example.test/internal/readiness", { method: "GET" }),
+      { loadEnvironment: darkEnvironment, getRuntime },
+    );
+
+    expect(response.status).toBe(401);
+    expect(await response.text()).toBe("");
+    expect(getRuntime).not.toHaveBeenCalled();
+  });
+
   it("runs the same authenticated drain used by the minute cron and reports only acceptance", async () => {
     const runtime = {} as StudioRuntime;
     const getRuntime = vi.fn(async () => runtime);
@@ -76,6 +88,56 @@ describe("Studio Vercel internal routes", () => {
     expect(response.status).toBe(202);
     await expect(response.json()).resolves.toEqual({ accepted: true });
     expect(getRuntime).toHaveBeenCalledTimes(1);
+    expect(drain).toHaveBeenCalledTimes(1);
+  });
+
+  it("records an environment-scoped Cron heartbeat only after a successful authenticated GET drain", async () => {
+    const recordCronHeartbeat = vi.fn(async (_scope: string) => undefined);
+    const runtime = { store: { recordCronHeartbeat } } as unknown as StudioRuntime;
+    const drain = vi.fn(async () => undefined);
+    const manualResponse = await handleStudioDrain(
+      authorizedRequest("/internal/drain-inbox", "POST"),
+      drain,
+      { loadEnvironment: darkEnvironment, getRuntime: async () => runtime },
+    );
+    const response = await handleStudioDrain(
+      authorizedRequest("/internal/drain-inbox", "GET"),
+      drain,
+      { loadEnvironment: darkEnvironment, getRuntime: async () => runtime },
+    );
+
+    expect(manualResponse.status).toBe(202);
+    expect(response.status).toBe(202);
+    expect(drain).toHaveBeenCalledTimes(2);
+    expect(recordCronHeartbeat).toHaveBeenCalledWith("preview");
+    expect(recordCronHeartbeat).toHaveBeenCalledTimes(1);
+  });
+
+  it("never records a Cron heartbeat when the authenticated drain fails", async () => {
+    const recordCronHeartbeat = vi.fn(async () => undefined);
+    const runtime = { store: { recordCronHeartbeat } } as unknown as StudioRuntime;
+    const response = await handleStudioDrain(
+      authorizedRequest("/internal/drain-inbox", "GET"),
+      async () => Promise.reject(new Error("drain failed")),
+      { loadEnvironment: darkEnvironment, getRuntime: async () => runtime },
+    );
+
+    expect(response.status).toBe(503);
+    expect(recordCronHeartbeat).not.toHaveBeenCalled();
+  });
+
+  it("fails closed if a successful Cron drain cannot persist its heartbeat", async () => {
+    const runtime = {
+      store: { recordCronHeartbeat: vi.fn(async () => Promise.reject(new Error("redis unavailable"))) },
+    } as unknown as StudioRuntime;
+    const drain = vi.fn(async () => undefined);
+    const response = await handleStudioDrain(
+      authorizedRequest("/internal/drain-inbox", "GET"),
+      drain,
+      { loadEnvironment: darkEnvironment, getRuntime: async () => runtime },
+    );
+
+    expect(response.status).toBe(503);
     expect(drain).toHaveBeenCalledTimes(1);
   });
 
@@ -95,12 +157,11 @@ describe("Studio Vercel internal routes", () => {
     expect(drain).not.toHaveBeenCalled();
   });
 
-  it("reports dark-release blockers without connecting to storage or exposing secrets", async () => {
-    const response = handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+  it("reports dark-release blockers with a secret-safe Redis probe and preview Cron status", async () => {
+    const getCronFreshness = vi.fn(async (_scope: string) => "missing" as const);
+    const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
       loadEnvironment: darkEnvironment,
-      getRuntime: vi.fn(async () => {
-        throw new Error("must not connect");
-      }),
+      getRuntime: vi.fn(async () => ({ store: { getCronFreshness } }) as unknown as StudioRuntime),
     });
 
     expect(response.status).toBe(503);
@@ -115,12 +176,125 @@ describe("Studio Vercel internal routes", () => {
         allowProviderRecovery: false,
         deliveryEnabled: false,
       },
+      effectiveSideEffects: {
+        acceptNewJobs: false,
+        allowProviderSubmit: false,
+        allowProviderRecovery: false,
+        deliveryEnabled: false,
+      },
+      redis: "reachable",
+      cron: "not_scheduled",
       problems: expect.arrayContaining(["transport_unverified", "no_enabled_models"]),
+    }));
+    expect(getCronFreshness).toHaveBeenCalledWith("preview");
+  });
+
+  it("reports dark-phase switches as ineffective even when their configured values are true", async () => {
+    const environment = {
+      ...darkEnvironment(),
+      policy: {
+        acceptNewJobs: true,
+        allowProviderSubmit: true,
+        allowProviderRecovery: true,
+        deliveryEnabled: true,
+      },
+    };
+    const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+      loadEnvironment: () => environment,
+      getRuntime: async () => ({
+        store: { getCronFreshness: vi.fn(async () => "fresh" as const) },
+      }) as unknown as StudioRuntime,
+    });
+
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+      sideEffects: environment.policy,
+      effectiveSideEffects: {
+        acceptNewJobs: false,
+        allowProviderSubmit: false,
+        allowProviderRecovery: false,
+        deliveryEnabled: false,
+      },
+    }));
+  });
+
+  it("reports a stale production Cron heartbeat without exposing its timestamp", async () => {
+    const environment = { ...darkEnvironment(), deploymentMode: "production" as const };
+    const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+      loadEnvironment: () => environment,
+      getRuntime: async () => ({
+        store: { getCronFreshness: vi.fn(async () => "stale" as const) },
+      }) as unknown as StudioRuntime,
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+      redis: "reachable",
+      cron: "stale",
+      problems: expect.arrayContaining(["cron_stale"]),
+    }));
+  });
+
+  it("distinguishes a missing or invalid production Cron heartbeat from a stale one", async () => {
+    const environment = { ...darkEnvironment(), deploymentMode: "production" as const };
+    for (const [freshness, expectedCron, expectedProblem] of [
+      ["missing", "missing", "cron_missing"],
+      ["invalid", "invalid", "cron_invalid"],
+    ] as const) {
+      const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+        loadEnvironment: () => environment,
+        getRuntime: async () => ({
+          store: { getCronFreshness: vi.fn(async () => freshness) },
+        }) as unknown as StudioRuntime,
+      });
+
+      expect(response.status).toBe(503);
+      await expect(response.json()).resolves.toEqual(expect.objectContaining({
+        redis: "reachable",
+        cron: expectedCron,
+        problems: expect.arrayContaining([expectedProblem]),
+      }));
+    }
+  });
+
+  it("does not mislabel missing runtime prerequisites as a Redis outage", async () => {
+    const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
+    const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+      loadEnvironment: () => ({
+        ...darkEnvironment(),
+        storageTransport: "unconfigured",
+        upstashRedisRestUrl: undefined,
+        upstashRedisRestToken: undefined,
+        idHashSecret: undefined,
+        queueEncryptionKey: undefined,
+      }),
+      getRuntime,
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+      redis: "unknown",
+      cron: "unknown",
+      problems: expect.arrayContaining(["redis_reachability_unknown", "cron_freshness_unknown"]),
+    }));
+    expect(getRuntime).not.toHaveBeenCalled();
+  });
+
+  it("reports an unavailable Redis path only after a configured runtime probe fails", async () => {
+    const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+      loadEnvironment: darkEnvironment,
+      getRuntime: async () => Promise.reject(new Error("redis unavailable")),
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+      redis: "unreachable",
+      cron: "unreachable",
+      problems: expect.arrayContaining(["redis_unavailable", "cron_freshness_unknown"]),
     }));
   });
 
   it("allows readiness only through its bearer-protected GET contract", async () => {
-    const response = handleStudioReadiness(new Request("https://air.example.test/internal/readiness", {
+    const response = await handleStudioReadiness(new Request("https://air.example.test/internal/readiness", {
       method: "POST",
       headers: { authorization: "Bearer cron-secret" },
     }), { loadEnvironment: darkEnvironment });

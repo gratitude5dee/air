@@ -37,7 +37,10 @@ by this document.
    Ambiguous provider submission or iMessage delivery is reconciled manually,
    never blindly retried.
 5. The minute Vercel recovery route is `CRON_SECRET` bearer-protected and each
-   serverless function has a 60-second execution limit.
+   serverless function has a 60-second execution limit. Protected readiness
+   verifies Redis with a non-tenant operational key, reports a
+   environment-scoped Cron heartbeat, and reports both configured and effective
+   (release-phase-gated) kill-switch state without returning values.
 
 ## Activation gates beyond dark deployment
 

@@ -28,7 +28,16 @@ surfaces:
   without a body containing configuration details. Readiness is GET-only;
   drain also accepts POST for manual recovery.
 - An authorized request to `/internal/readiness` shows `transport_unverified`
-  and `no_enabled_models`; that is the expected dark state.
+  and `no_enabled_models`; that is the expected dark state. With Redis
+  configured, preview readiness reports `redis: "reachable"` and
+  `cron: "not_scheduled"`: Vercel only runs configured Cron jobs on a
+  production deployment.
+- A successful authenticated `GET /internal/drain-inbox` records a
+  environment-scoped Redis heartbeat after the drain completes. Manual `POST`
+  recovery never updates it. On production, readiness distinguishes a missing
+  or invalid marker from `cron: "stale"` after three missed minute beats; a
+  bearer-authenticated GET is still not a substitute for verifying Vercel's
+  scheduler behavior in deployment logs.
 
 Do not use an actual GMI key, make a model catalog call, or send an iMessage
 while doing these checks. A signed webhook fixture is a later gate and must use

@@ -141,6 +141,16 @@ export interface AdmitStudioJobInput {
   readonly dailySpendCapCents: number;
 }
 
+/**
+ * The configured Vercel recovery route runs every minute. Three missed beats
+ * is enough to surface an outage while allowing a single slow function or
+ * scheduler delay without declaring a false incident.
+ */
+export const STUDIO_CRON_FRESHNESS_MS = 3 * 60 * 1_000;
+
+export type StudioCronFreshness = "fresh" | "stale" | "missing" | "invalid";
+export type StudioCronHeartbeatScope = "development" | "preview" | "production";
+
 const INBOX_TTL_SECONDS = 7 * 24 * 60 * 60;
 const JOB_TTL_SECONDS = 7 * 24 * 60 * 60;
 const SETTINGS_TTL_SECONDS = 90 * 24 * 60 * 60;
@@ -148,6 +158,7 @@ const PENDING_TTL_SECONDS = 10 * 60;
 const LEASE_TTL_MS = 90_000;
 const MAX_INBOX_RETRY_DELAY_MS = 24 * 60 * 60 * 1_000;
 const OUTBOX_RETRY_BACKOFF_MS = 30_000;
+const CRON_HEARTBEAT_TTL_SECONDS = 24 * 60 * 60;
 
 /**
  * Compact encrypted control-plane store. It intentionally models only Air v2
@@ -171,6 +182,38 @@ export class StudioStore {
 
   public receiptId(projectId: string, messageId: string): string {
     return deriveOpaqueId(this.secret, "studio-receipt", `${projectId}\u0000${messageId}`);
+  }
+
+  /**
+   * A successful GET drain records only its completion time. It contains no
+   * user data and doubles as a lightweight Redis reachability check for the
+   * protected readiness route.
+   */
+  public async recordCronHeartbeat(scope: StudioCronHeartbeatScope): Promise<void> {
+    const result = await this.redis.set(this.cronHeartbeatKey(scope), String(this.now()), {
+      ex: CRON_HEARTBEAT_TTL_SECONDS,
+    });
+    if (result !== "OK") throw new Error("cron heartbeat could not be persisted");
+  }
+
+  /**
+   * Reading this fixed operational key is deliberately the readiness Redis
+   * probe. It never opens or decrypts a tenant record.
+   */
+  public async getCronFreshness(
+    scope: StudioCronHeartbeatScope,
+    maxAgeMs = STUDIO_CRON_FRESHNESS_MS,
+  ): Promise<StudioCronFreshness> {
+    if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs < 1) {
+      throw new Error("cron freshness window is invalid");
+    }
+    const raw = await this.redis.get(this.cronHeartbeatKey(scope));
+    if (raw === null) return "missing";
+    if (!/^(?:0|[1-9]\d*)$/u.test(raw)) return "invalid";
+    const recordedAtMs = Number(raw);
+    const now = this.now();
+    if (!Number.isSafeInteger(recordedAtMs) || recordedAtMs > now) return "invalid";
+    return now - recordedAtMs <= maxAgeMs ? "fresh" : "stale";
   }
 
   public async persistInbox(input: {
@@ -480,6 +523,9 @@ export class StudioStore {
   private inboxKey(receiptId: string): string { return `${this.prefix}:inbox:${receiptId}`; }
   private readyInboxKey(): string { return `${this.prefix}:inbox:ready`; }
   private inboxLeaseKey(receiptId: string): string { return `${this.prefix}:inbox:lease:${receiptId}`; }
+  private cronHeartbeatKey(scope: StudioCronHeartbeatScope): string {
+    return `${this.prefix}:operations:cron-heartbeat:${scope}`;
+  }
   private settingsKey(senderHash: SenderHash): string { return `${this.prefix}:settings:${senderHash}`; }
   private pendingKey(senderHash: SenderHash, threadHash: ThreadHash): string { return `${this.prefix}:pending:${senderHash}:${threadHash}`; }
   private activeJobKey(senderHash: SenderHash): string { return `${this.prefix}:active:${senderHash}`; }

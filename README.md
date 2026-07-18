@@ -47,7 +47,9 @@ flowchart LR
 
 `vercel.json` declares the recovery cron exactly once, every minute, with a
 60-second function limit. The operator routes do not reveal configuration
-values, raw messages, sender hashes, or provider responses.
+values, raw messages, sender hashes, or provider responses. Readiness probes
+only a fixed Redis operational key; it reports coarse Redis and Cron status,
+the configured switches, and their effective release-phase-gated state.
 
 ## Current deployment state
 
