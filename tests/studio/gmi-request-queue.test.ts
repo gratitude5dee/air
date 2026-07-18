@@ -4,6 +4,17 @@ import {
   createGmiRequestQueueClientFromEnv,
   GmiRequestQueueError,
 } from "../../lib/studio/gmi-request-queue.js";
+import type { StudioSideEffectEnvironment } from "../../lib/studio/config.js";
+
+const ACTIVE_PROVIDER_POLICY = {
+  releasePhase: "production",
+  policy: {
+    acceptNewJobs: true,
+    allowProviderSubmit: true,
+    allowProviderRecovery: true,
+    deliveryEnabled: true,
+  },
+} satisfies StudioSideEffectEnvironment;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -14,12 +25,17 @@ function json(body: unknown, status = 200): Response {
 
 function client(
   fetch: typeof globalThis.fetch,
-  options?: { readonly maxResponseBytes?: number; readonly timeoutMs?: number },
+  options?: {
+    readonly maxResponseBytes?: number;
+    readonly timeoutMs?: number;
+    readonly sideEffectEnvironment?: StudioSideEffectEnvironment;
+  },
 ): ReturnType<typeof createGmiRequestQueueClient> {
   return createGmiRequestQueueClient({
     apiKey: "gmi-test-secret",
     organizationId: "org_test",
     fetch,
+    sideEffectEnvironment: options?.sideEffectEnvironment ?? ACTIVE_PROVIDER_POLICY,
     ...options,
   });
 }
@@ -80,6 +96,37 @@ describe("GMI request-queue client", () => {
       model: "Kling-Text2Video-V2.1-Master",
       payload: { prompt: "A private fixture prompt", durationSeconds: "5" },
     });
+  });
+
+  it("requires both an active release phase and the provider recovery switch before provider work", async () => {
+    let calls = 0;
+    const fetch = async (): Promise<Response> => {
+      calls += 1;
+      return json({ request_id: "gmi-request-123", status: "success" });
+    };
+    const dark = client(fetch, {
+      sideEffectEnvironment: {
+        ...ACTIVE_PROVIDER_POLICY,
+        releasePhase: "dark",
+      },
+    });
+    const recoveryDisabled = client(fetch, {
+      sideEffectEnvironment: {
+        ...ACTIVE_PROVIDER_POLICY,
+        policy: { ...ACTIVE_PROVIDER_POLICY.policy, allowProviderRecovery: false },
+      },
+    });
+
+    await expect(dark.submit({ model: "Veo3", payload: { prompt: "fixture" } })).rejects.toMatchObject({
+      code: "provider_submission_disabled",
+    });
+    await expect(dark.getRequestStatus("gmi-request-123")).rejects.toMatchObject({
+      code: "provider_recovery_disabled",
+    });
+    await expect(recoveryDisabled.getRequest("gmi-request-123")).rejects.toMatchObject({
+      code: "provider_recovery_disabled",
+    });
+    expect(calls).toBe(0);
   });
 
   it("classifies only provider-proven non-rate-limit 4xx responses as definitive rejections", async () => {

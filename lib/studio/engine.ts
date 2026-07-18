@@ -8,6 +8,11 @@ import {
   type StudioVideoDurationSeconds,
 } from "./commands.js";
 import {
+  canAcceptStudioJobs,
+  canDeliverStudioMessages,
+  canSubmitStudioProvider,
+} from "./config.js";
+import {
   AIR_MODEL_REGISTRY,
   checkModelCompatibility,
   listEnabledModels,
@@ -134,7 +139,7 @@ export async function drainStudioWithStats(runtime: StudioRuntime): Promise<Stud
  * for the later verified transport/release gate.
  */
 export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number> {
-  if (!runtime.environment.policy.deliveryEnabled || !runtime.transport.verified) return 0;
+  if (!canDeliverStudioMessages(runtime.environment) || !runtime.transport.verified) return 0;
 
   let delivered = 0;
   for (let index = 0; index < MAX_OUTBOX_PER_DRAIN; index += 1) {
@@ -245,7 +250,7 @@ async function handleBareText(
   // A pending prompt is only actionable after a separately approved release
   // enables admissions. In dark mode do not turn a follow-up bubble into a
   // paid job or silently preserve an intent that looks accepted.
-  if (!runtime.environment.policy.acceptNewJobs) {
+  if (!canAcceptStudioJobs(runtime.environment)) {
     await runtime.store.clearPending(record.senderHash, record.threadHash);
     await enqueueMaintenanceNotice(runtime, record, envelope, "pending-prompt-maintenance");
     return "maintenance_rejected";
@@ -317,7 +322,7 @@ async function handleCreation(
   // This is the explicit Section 16 rollback/dark gate. It is deliberately
   // checked before pending assembly, model selection, reservation, or any
   // provider code so a dark release cannot create a later paid surprise.
-  if (!runtime.environment.policy.acceptNewJobs) {
+  if (!canAcceptStudioJobs(runtime.environment)) {
     await enqueueMaintenanceNotice(runtime, record, envelope, `maintenance-${mode}`);
     return "maintenance_rejected";
   }
@@ -347,7 +352,7 @@ async function handleCreation(
   // accidentally introducing a multi-step paid plan. This build intentionally
   // does not contain an enabled execution adapter: GMI catalog evidence,
   // numeric spend authority, and real transport evidence are still absent.
-  if (!isSinglePaidStepWorkflow(getStudioWorkflow(mode)) || !runtime.environment.policy.allowProviderSubmit) {
+  if (!isSinglePaidStepWorkflow(getStudioWorkflow(mode)) || !canSubmitStudioProvider(runtime.environment)) {
     await enqueueResponse(
       runtime,
       record,

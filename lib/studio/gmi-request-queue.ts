@@ -1,3 +1,9 @@
+import {
+  canRecoverStudioProvider,
+  canSubmitStudioProvider,
+  type StudioSideEffectEnvironment,
+} from "./config.js";
+
 /**
  * Narrow, direct boundary for GMI's documented request-queue API.
  *
@@ -42,6 +48,8 @@ export interface GmiJsonObject {
 export type GmiRequestQueueErrorCode =
   | "invalid_configuration"
   | "invalid_request"
+  | "provider_submission_disabled"
+  | "provider_recovery_disabled"
   | "request_timeout"
   | "transport_failure"
   | "unexpected_status"
@@ -65,6 +73,12 @@ export class GmiRequestQueueError extends Error {
 export interface GmiRequestQueueClientOptions {
   readonly apiKey: string;
   readonly organizationId?: string | undefined;
+  /**
+   * Required for every mutating request and provider-recovery request. Omit it
+   * for read-only catalog discovery only; omission fails closed for all other
+   * operations.
+   */
+  readonly sideEffectEnvironment?: StudioSideEffectEnvironment | undefined;
   readonly fetch?: typeof globalThis.fetch | undefined;
   readonly timeoutMs?: number | undefined;
   /** Primarily useful for deterministic overflow tests. Never raises the hard cap. */
@@ -172,6 +186,7 @@ type FetchLike = typeof globalThis.fetch;
 export class GmiRequestQueueClient {
   private readonly apiKey: string;
   private readonly organizationId: string | undefined;
+  private readonly sideEffectEnvironment: StudioSideEffectEnvironment | undefined;
   private readonly fetch: FetchLike;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
@@ -181,6 +196,7 @@ export class GmiRequestQueueClient {
     this.organizationId = options.organizationId === undefined
       ? undefined
       : parseOrganizationId(options.organizationId);
+    this.sideEffectEnvironment = options.sideEffectEnvironment;
     this.fetch = options.fetch ?? globalThis.fetch;
     if (typeof this.fetch !== "function") {
       throw new GmiRequestQueueError("invalid_configuration", false);
@@ -226,6 +242,7 @@ export class GmiRequestQueueClient {
    * deliberately returned as `ambiguous` rather than retried here.
    */
   public async submitRequest(input: GmiSubmitRequestInput): Promise<GmiSubmitResult> {
+    this.requireProviderSubmission();
     validateSubmitInput(input);
     let response: Response;
     try {
@@ -264,6 +281,7 @@ export class GmiRequestQueueClient {
 
   /** Observe an already accepted request. Status retries are owned by the job worker. */
   public async getRequestStatus(requestId: string): Promise<GmiRequestObservation> {
+    this.requireProviderRecovery();
     validateRequestId(requestId);
     const response = await this.requestJson(`/requests/${encodeURIComponent(requestId)}`, {
       method: "GET",
@@ -282,6 +300,7 @@ export class GmiRequestQueueClient {
    * an exact registry-provided GCS host and object prefix before they escape.
    */
   public async createUploadUrl(input: GmiCreateUploadUrlInput): Promise<GmiUploadUrl> {
+    this.requireProviderSubmission();
     validateUploadInput(input);
     const storage = normalizeStoragePolicy(input.storage, "invalid_request");
     const response = await this.requestJson("/upload-url", {
@@ -298,6 +317,18 @@ export class GmiRequestQueueClient {
   /** Alias for call sites that use the provider's endpoint terminology. */
   public async getUploadUrl(input: GmiCreateUploadUrlInput): Promise<GmiUploadUrl> {
     return this.createUploadUrl(input);
+  }
+
+  private requireProviderSubmission(): void {
+    if (!this.sideEffectEnvironment || !canSubmitStudioProvider(this.sideEffectEnvironment)) {
+      throw new GmiRequestQueueError("provider_submission_disabled", false);
+    }
+  }
+
+  private requireProviderRecovery(): void {
+    if (!this.sideEffectEnvironment || !canRecoverStudioProvider(this.sideEffectEnvironment)) {
+      throw new GmiRequestQueueError("provider_recovery_disabled", false);
+    }
   }
 
   private async requestJson(

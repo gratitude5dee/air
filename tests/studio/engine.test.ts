@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createQueueCipher } from "../../lib/crypto.js";
 import { MemoryRedis } from "../../lib/redis.js";
 import { hashSenderIdentifier, hashThreadIdentifier } from "../../lib/security.js";
-import type { StudioEnvironment } from "../../lib/studio/config.js";
+import type { StudioEnvironment, StudioReleasePhase } from "../../lib/studio/config.js";
 import { drainStudioOutbox, drainStudioWithStats } from "../../lib/studio/engine.js";
 import type { IMessageThreadReference, StudioIMessageTransport, TransportOutcome } from "../../lib/studio/imessage-transport.js";
 import { getStudioWorkflow, isSinglePaidStepWorkflow } from "../../lib/studio/workflows.js";
@@ -23,6 +23,8 @@ const SENDING_LINE = "+14155550999";
 function createDarkFixture(options: {
   readonly acceptNewJobs?: boolean;
   readonly allowProviderSubmit?: boolean;
+  readonly deliveryEnabled?: boolean;
+  readonly releasePhase?: StudioReleasePhase;
   readonly transportVerified?: boolean;
 } = {}) {
   const now = 1_784_990_400_000;
@@ -61,7 +63,7 @@ function createDarkFixture(options: {
   } satisfies StudioIMessageTransport;
   const environment: StudioEnvironment = {
     deploymentMode: "preview",
-    releasePhase: "dark",
+    releasePhase: options.releasePhase ?? "dark",
     storageTransport: "rest",
     imessageProjectId: "test-project",
     imessageProjectSecret: "test-project-secret",
@@ -80,7 +82,7 @@ function createDarkFixture(options: {
       acceptNewJobs: options.acceptNewJobs ?? false,
       allowProviderSubmit: options.allowProviderSubmit ?? false,
       allowProviderRecovery: false,
-      deliveryEnabled: false,
+      deliveryEnabled: options.deliveryEnabled ?? false,
     },
     policyExplicit: true,
     spendCaps: {
@@ -197,6 +199,27 @@ describe("Air studio dark engine", () => {
     expect(fixture.transport.addLikeTapback).not.toHaveBeenCalled();
   });
 
+  it("does not claim or invoke a verified transport in the dark phase even when delivery is enabled", async () => {
+    const fixture = createDarkFixture({ transportVerified: true, deliveryEnabled: true });
+    const outboxId = "dark-phase-delivery-intent";
+    await fixture.store.createOutbox({
+      outboxId,
+      senderHash: fixture.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: {
+        kind: "text",
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+        text: "The release phase must be an independent delivery gate.",
+      },
+    });
+
+    await expect(drainStudioOutbox(fixture.runtime)).resolves.toBe(0);
+    await expect(fixture.store.getOutbox(outboxId)).resolves.toMatchObject({ state: "intent", attempts: 0 });
+    expect(fixture.transport.showTyping).not.toHaveBeenCalled();
+    expect(fixture.transport.sendText).not.toHaveBeenCalled();
+  });
+
   it("defines every launch workflow as exactly one provider-generation paid step", () => {
     for (const mode of ["imagine", "animate", "edit-image", "edit-video"] as const) {
       const workflow = getStudioWorkflow(mode);
@@ -206,10 +229,10 @@ describe("Air studio dark engine", () => {
     }
   });
 
-  it("never submits a creation or bare text bubble while admissions are disabled", async () => {
-    // Keep the provider switch true here to prove the separate admission gate
-    // itself is decisive. Delivery remains disabled as required for dark mode.
-    const fixture = createDarkFixture({ allowProviderSubmit: true });
+  it("never admits a creation in the dark phase even when admission and provider switches are true", async () => {
+    // The release phase remains dark. Both switches are intentionally true to
+    // prove that phase is an independent gate.
+    const fixture = createDarkFixture({ acceptNewJobs: true, allowProviderSubmit: true });
     const admitJob = vi.spyOn(fixture.store, "admitJob");
     const creationReceipt = await persistInbound(fixture, "creation-002", "/imagine a cobalt paper lantern");
     const bareTextReceipt = await persistInbound(fixture, "bare-text-001", "make it feel more cinematic");

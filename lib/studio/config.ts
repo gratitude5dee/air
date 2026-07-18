@@ -52,6 +52,13 @@ export interface StudioEnvironment {
   readonly spendCaps: StudioSpendCaps;
 }
 
+/**
+ * The capability checks below deliberately require both a non-dark release
+ * phase and the matching explicit switch. A switch set to true must never turn
+ * a dark deployment into a side-effecting deployment by itself.
+ */
+export type StudioSideEffectEnvironment = Pick<StudioEnvironment, "releasePhase" | "policy">;
+
 export type EnvironmentSource = Readonly<Record<string, string | undefined>>;
 
 const PROTECTED_CONFIGURATION_NAMES = Object.freeze([
@@ -147,6 +154,34 @@ export function loadStudioEnvironment(source: EnvironmentSource = process.env): 
 
   validatePublicBaseUrl(environment.publicBaseUrl);
   return environment;
+}
+
+/** Canary and production are the only explicitly active release phases. */
+export function isStudioSideEffectPhaseActive(
+  environment: Pick<StudioEnvironment, "releasePhase">,
+): boolean {
+  return environment.releasePhase === "canary" || environment.releasePhase === "production";
+}
+
+export function canAcceptStudioJobs(environment: StudioSideEffectEnvironment): boolean {
+  return isStudioSideEffectPhaseActive(environment) && environment.policy.acceptNewJobs;
+}
+
+export function canSubmitStudioProvider(environment: StudioSideEffectEnvironment): boolean {
+  return isStudioSideEffectPhaseActive(environment) && environment.policy.allowProviderSubmit;
+}
+
+/**
+ * Polling, artifact fetch, and cancellation are provider side effects too.
+ * Keeping this separate from submission preserves the credential-compromise
+ * kill switch without letting a dark release recover provider work.
+ */
+export function canRecoverStudioProvider(environment: StudioSideEffectEnvironment): boolean {
+  return isStudioSideEffectPhaseActive(environment) && environment.policy.allowProviderRecovery;
+}
+
+export function canDeliverStudioMessages(environment: StudioSideEffectEnvironment): boolean {
+  return isStudioSideEffectPhaseActive(environment) && environment.policy.deliveryEnabled;
 }
 
 /**

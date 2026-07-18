@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { explicitBoolean, loadStudioEnvironment, studioReadinessProblems, usdToCents } from "../../lib/studio/config.js";
+import {
+  canAcceptStudioJobs,
+  canDeliverStudioMessages,
+  canRecoverStudioProvider,
+  canSubmitStudioProvider,
+  explicitBoolean,
+  loadStudioEnvironment,
+  studioReadinessProblems,
+  usdToCents,
+} from "../../lib/studio/config.js";
 
 const key = Buffer.alloc(32, 7).toString("base64");
 const senderHash = "a".repeat(64);
@@ -45,6 +54,31 @@ describe("Air studio configuration", () => {
     expect(environment.policy.allowProviderSubmit).toBe(false);
     expect(environment.storageTransport).toBe("tcp");
     expect(studioReadinessProblems(environment, "test-registry")).toEqual([]);
+  });
+
+  it("requires an active release phase as well as every side-effect switch", () => {
+    const enabledSwitches = {
+      AIR_ACCEPT_NEW_JOBS: "true",
+      AIR_ALLOW_PROVIDER_SUBMIT: "true",
+      AIR_ALLOW_PROVIDER_RECOVERY: "true",
+      AIR_DELIVERY_ENABLED: "true",
+    };
+    const dark = loadStudioEnvironment(configured(enabledSwitches));
+
+    expect(canAcceptStudioJobs(dark)).toBe(false);
+    expect(canSubmitStudioProvider(dark)).toBe(false);
+    expect(canRecoverStudioProvider(dark)).toBe(false);
+    expect(canDeliverStudioMessages(dark)).toBe(false);
+
+    const active = loadStudioEnvironment(configured({
+      ...enabledSwitches,
+      VERCEL_ENV: "production",
+      AIR_RELEASE_PHASE: "production",
+    }));
+    expect(canAcceptStudioJobs(active)).toBe(true);
+    expect(canSubmitStudioProvider(active)).toBe(true);
+    expect(canRecoverStudioProvider(active)).toBe(true);
+    expect(canDeliverStudioMessages(active)).toBe(true);
   });
 
   it("requires explicit side-effect switches for production readiness", () => {
