@@ -8,13 +8,16 @@ record.
 
 - Existing Vercel project: `air` (`prj_oVVN8AruxpRajmJDO92xdVj7cFWY`) in the
   existing `5-Dee Studios` team.
-- Git revision: `76c53992fddd4c606dc53a6c038415f0ce027ce8`
-  (`feat: verify Redis and Cron readiness`).
-- Preview deployment: `dpl_32Ky5yeXu4TNMtZV5MDiPwsy3WaZ`, Ready, Git-sourced,
-  branch `codex/air-direct-studio`, target `null` (not production).
-- Preview URL: `https://air-hvvq5jd5j-5dee-studios.vercel.app`.
-- Vercel errors-only build log ended with `Build Completed`; local checks at
-  this revision passed `npm run check` (85 tests) and `npm run build`.
+- Implementation revision: `f8153b7e5e6150d4d728e4a6e7613296d9c07a00`
+  (`feat: add fenced reconciliation primitives`).
+- Preview deployment: `dpl_Ec8cEciamCFYBmZhczHPmEk7xRt4`, Ready, Git-sourced,
+  branch `codex/air-direct-studio`, preview target (not production).
+- Preview URL: `https://air-n2vomk3hl-5dee-studios.vercel.app`.
+- Stable branch alias:
+  `https://air-git-codex-air-direct-studio-5dee-studios.vercel.app`.
+- Vercel metadata verified the exact Git SHA, private-project visibility, and
+  a Ready build with the six expected serverless entrypoints. Local checks at
+  this revision passed `npm run check` (137 tests) and `npm run build`.
 
 ## Isolation and verification boundary
 
