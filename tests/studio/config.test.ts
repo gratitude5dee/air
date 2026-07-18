@@ -47,23 +47,25 @@ describe("Air studio configuration", () => {
     expect(() => loadStudioEnvironment(configured({ UPSTASH_REDIS_REST_URL: "https://redis.example.test" }))).toThrow(/pair/);
   });
 
-  it("accepts a REST pair only when it proves the same existing Redis resource as REDIS_URL", () => {
+  it("prioritizes the explicit V2 REST pair while preserving a legacy TCP URL for rollback", () => {
     const shared = loadStudioEnvironment(configured({
       UPSTASH_REDIS_REST_URL: "https://redis.example.test",
       UPSTASH_REDIS_REST_TOKEN: "rest-token",
     }));
     expect(shared.storageTransport).toBe("rest");
 
-    expect(() => loadStudioEnvironment(configured({
+    const legacy = loadStudioEnvironment(configured({
       UPSTASH_REDIS_REST_URL: "https://other-redis.example.test",
       UPSTASH_REDIS_REST_TOKEN: "rest-token",
-    }))).toThrow(/same Redis resource/);
+    }));
+    expect(legacy.storageTransport).toBe("rest");
 
-    expect(() => loadStudioEnvironment(configured({
+    const logicalDatabase = loadStudioEnvironment(configured({
       REDIS_URL: "rediss://redis.example.test:6380/1",
       UPSTASH_REDIS_REST_URL: "https://redis.example.test",
       UPSTASH_REDIS_REST_TOKEN: "rest-token",
-    }))).toThrow(/same Redis resource/);
+    }));
+    expect(logicalDatabase.storageTransport).toBe("rest");
   });
 
   it("keeps a dark release closed even when all identity settings are present", () => {
