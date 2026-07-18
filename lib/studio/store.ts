@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import type { EncryptedPayload, QueueCipher } from "../crypto.js";
-import type { RedisLike } from "../redis.js";
+import { acquireRedisLease, type RedisLease, type RedisLike } from "../redis.js";
 import { deriveOpaqueId, type SenderHash, type ThreadHash } from "../security.js";
 
 /** All new records live under this namespace. Legacy Air records stay untouched. */
@@ -92,6 +92,38 @@ export interface StudioJobPayload {
   readonly chatGuid: string;
   readonly sendingLine: string;
   readonly replyTargetId?: string | undefined;
+  /**
+   * Immutable, encrypted admission evidence for the one allowed provider
+   * operation. Historical dark jobs intentionally omit this field and can
+   * never be sent through the executor by accident.
+   */
+  readonly execution?: StudioExecutionSnapshot | undefined;
+}
+
+/**
+ * A reviewed model/workflow snapshot carried only inside the job's encrypted
+ * 24-hour payload. It is deliberately narrower than a provider request: no
+ * prompt, chat, attachment reference, provider request ID, or artifact URL
+ * belongs in durable plaintext metadata.
+ */
+export interface StudioExecutionSnapshot {
+  readonly schemaVersion: 1;
+  readonly workflow: {
+    readonly workflowId: string;
+    readonly workflowVersion: 1;
+    readonly stepId: "provider-generation";
+  };
+  readonly model: {
+    readonly slug: string;
+    readonly provider: "gmi" | "fal";
+    readonly providerModelId: string;
+  };
+  readonly output: {
+    readonly count: number;
+    readonly durationSeconds?: number | undefined;
+  };
+  /** The release generation that was allowed to admit this exact work. */
+  readonly releaseStamp: StudioReleaseStamp;
 }
 
 export interface StudioJobRecord {
@@ -117,6 +149,57 @@ export interface StudioJobRecord {
 export type StudioJobRecordWithPayload = StudioJobRecord & {
   readonly encryptedPayload: EncryptedPayload;
 };
+
+/** A single native provider submission; Air v2 workflows contain exactly one. */
+export const STUDIO_PROVIDER_SUBRUN_STATES = Object.freeze([
+  "reserved",
+  "submitting",
+  "submitted",
+  "definitive_rejection",
+  "submission_unknown",
+  "canceled",
+] as const);
+export type StudioProviderSubrunState = (typeof STUDIO_PROVIDER_SUBRUN_STATES)[number];
+
+/**
+ * Opaque durable metadata only. Provider request IDs and all provider output
+ * references live in the separately encrypted short-lived reference record.
+ */
+export interface StudioProviderSubrunRecord {
+  readonly schemaVersion: 1;
+  readonly subrunId: string;
+  readonly jobId: string;
+  readonly provider: "gmi" | "fal";
+  readonly modelSlug: string;
+  readonly workflowId: string;
+  readonly stepId: "provider-generation";
+  readonly releaseStamp: StudioReleaseStamp;
+  /** Stable opaque intent identity assigned before the provider call. */
+  readonly submissionIntentId: string;
+  readonly state: StudioProviderSubrunState;
+  readonly stateVersion: number;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+/** Stored encrypted for 24 hours at most, and only after provider acceptance. */
+export interface StudioProviderSubrunReference {
+  readonly providerRequestId: string;
+}
+
+export type StudioProviderSubmissionBeginResult =
+  | { readonly kind: "ready"; readonly subrun: StudioProviderSubrunRecord }
+  | { readonly kind: "already_submitted"; readonly subrun: StudioProviderSubrunRecord }
+  | { readonly kind: "definitive_rejection"; readonly subrun: StudioProviderSubrunRecord }
+  | { readonly kind: "submission_unknown"; readonly subrun: StudioProviderSubrunRecord }
+  | { readonly kind: "release_blocked"; readonly subrun: StudioProviderSubrunRecord }
+  | { readonly kind: "canceled"; readonly subrun: StudioProviderSubrunRecord }
+  | { readonly kind: "lease_lost" | "unavailable" };
+
+export type StudioProviderSubmissionOutcome =
+  | { readonly kind: "accepted"; readonly providerRequestId: string }
+  | { readonly kind: "definitive_rejection" }
+  | { readonly kind: "ambiguous" };
 
 export interface StudioOutboxPayload {
   readonly kind: "text" | "attachment" | "tapback";
@@ -259,12 +342,20 @@ const INBOX_TTL_SECONDS = TERMINAL_METADATA_TTL_SECONDS;
 /** Encrypted inbound content may include media references and never outlives one day. */
 const INBOX_ENVELOPE_TTL_SECONDS = 24 * 60 * 60;
 /** Prompts, media references, and thread data in a job payload never outlive one day. */
-const JOB_PAYLOAD_TTL_SECONDS = 24 * 60 * 60;
+export const STUDIO_JOB_PAYLOAD_TTL_MS = 24 * 60 * 60 * 1_000;
+const JOB_PAYLOAD_TTL_SECONDS = STUDIO_JOB_PAYLOAD_TTL_MS / 1_000;
 const OUTBOX_PAYLOAD_TTL_SECONDS = 24 * 60 * 60;
 const SETTINGS_TTL_SECONDS = 90 * 24 * 60 * 60;
 const PENDING_TTL_SECONDS = 10 * 60;
 const PENDING_TTL_MS = PENDING_TTL_SECONDS * 1_000;
 const LEASE_TTL_MS = 90_000;
+/**
+ * A provider submit needs its full bounded lease plus a small persistence
+ * margin before the immutable encrypted job payload expires.  This is a
+ * fail-closed admission-to-submit deadline, not a promise that an external
+ * provider call can be rolled back after it has begun.
+ */
+export const STUDIO_PROVIDER_REFERENCE_COMMIT_WINDOW_MS = LEASE_TTL_MS + 5_000;
 const MAX_INBOX_RETRY_DELAY_MS = 24 * 60 * 60 * 1_000;
 const OUTBOX_RETRY_BACKOFF_MS = 30_000;
 const CRON_HEARTBEAT_TTL_SECONDS = 24 * 60 * 60;
@@ -636,6 +727,17 @@ export class StudioStore {
     return this.cipher.decrypt<StudioJobPayload>(job.encryptedPayload, `job:${job.jobId}`);
   }
 
+  /**
+   * The encrypted admission snapshot has an absolute wall-clock deadline. A
+   * provider submit must leave a bounded window to persist its encrypted
+   * request reference without extending that privacy lifetime.
+   */
+  public jobPayloadRemainingMs(job: Pick<StudioJobRecord, "createdAtMs">): number {
+    const expiresAtMs = job.createdAtMs + STUDIO_JOB_PAYLOAD_TTL_MS;
+    if (!Number.isSafeInteger(expiresAtMs)) return 0;
+    return Math.max(0, expiresAtMs - this.now());
+  }
+
   public async transitionJob(jobId: string, from: StudioJobState, to: StudioJobState): Promise<StudioJobRecord | null> {
     const job = await this.getJob(jobId);
     if (!job || job.state !== from || !canTransitionJob(from, to)) return null;
@@ -646,6 +748,156 @@ export class StudioStore {
     const next = parseStored<StudioJobRecord>(typeof result === "string" ? result : null);
     if (!next) return null;
     return this.hydrateJobPayload(next);
+  }
+
+  /**
+   * Creates the single provider subrun from immutable encrypted admission
+   * evidence. This operation is deliberately idempotent: a worker crash after
+   * changing a job to `executing` cannot cause a second paid subrun to exist.
+   */
+  public async ensureProviderSubrun(
+    job: StudioJobRecord,
+    snapshot: StudioExecutionSnapshot,
+  ): Promise<StudioProviderSubrunRecord> {
+    if (!isExecutionSnapshotForJob(snapshot, job)) {
+      throw new Error("provider execution snapshot is invalid");
+    }
+    const subrunId = deriveOpaqueId(this.secret, "studio-provider-subrun", job.jobId);
+    const template: StudioProviderSubrunRecord = Object.freeze({
+      schemaVersion: 1,
+      subrunId,
+      jobId: job.jobId,
+      provider: snapshot.model.provider,
+      modelSlug: snapshot.model.slug,
+      workflowId: snapshot.workflow.workflowId,
+      stepId: snapshot.workflow.stepId,
+      releaseStamp: normalizeReleaseStamp(snapshot.releaseStamp),
+      submissionIntentId: deriveOpaqueId(this.secret, "studio-provider-intent", subrunId),
+      state: "reserved",
+      stateVersion: 1,
+      createdAtMs: this.now(),
+      updatedAtMs: this.now(),
+    });
+    const created = await this.redis.set(this.providerSubrunKey(subrunId), JSON.stringify(template), { nx: true });
+    if (created === "OK") return template;
+
+    const existing = await this.getProviderSubrun(subrunId);
+    if (!existing || !sameProviderSubrunIdentity(existing, template)) {
+      throw new Error("provider subrun collision");
+    }
+    return existing;
+  }
+
+  public async getProviderSubrun(subrunId: string): Promise<StudioProviderSubrunRecord | null> {
+    if (!isOpaqueStudioIdentifier(subrunId)) return null;
+    const record = parseStored<StudioProviderSubrunRecord>(await this.redis.get(this.providerSubrunKey(subrunId)));
+    return record && isProviderSubrunRecord(record) ? Object.freeze(record) : null;
+  }
+
+  /**
+   * A lease spans only the bounded provider call. The final write verifies the
+   * token atomically, so a late worker can never overwrite a newer recovery
+   * decision after its lease has expired.
+   */
+  public async acquireProviderSubrunLease(subrunId: string): Promise<RedisLease | null> {
+    if (!isOpaqueStudioIdentifier(subrunId)) return null;
+    return acquireRedisLease(this.redis, this.providerSubrunLeaseKey(subrunId), {
+      now: this.now,
+      ttlMs: LEASE_TTL_MS,
+    });
+  }
+
+  /**
+   * Persists the provider submission intent and performs the final durable
+   * pre-call release/job-state check. A recovered `submitting` record is made
+   * `submission_unknown`, never retried. An external provider call cannot be
+   * atomically coupled to this Redis transition, so a rollback after `ready`
+   * is handled as reconciliation rather than a claimed prevention.
+   */
+  public async beginProviderSubmission(
+    subrunId: string,
+    leaseToken: string,
+    job: Pick<StudioJobRecord, "jobId" | "state" | "stateVersion">,
+  ): Promise<StudioProviderSubmissionBeginResult> {
+    if (job.state !== "executing") return Object.freeze({ kind: "unavailable" });
+    const result = await this.redis.eval(BEGIN_PROVIDER_SUBMISSION_LUA, {
+      keys: [
+        this.providerSubrunKey(subrunId),
+        this.providerSubrunLeaseKey(subrunId),
+        this.releaseFenceKey(),
+        this.jobKey(job.jobId),
+      ],
+      arguments: [
+        leaseToken,
+        String(this.now()),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        job.jobId,
+        String(job.stateVersion),
+      ],
+    });
+    return parseProviderSubmissionBeginResult(typeof result === "string" ? result : null);
+  }
+
+  /**
+   * Commits one provider outcome under the same lease that authorized the
+   * physical call. Accepted request IDs remain encrypted and expire with the
+   * immutable 24-hour job privacy horizon; opaque ambiguity metadata remains
+   * recoverable for operator reconciliation.
+   */
+  public async finishProviderSubmission(
+    subrunId: string,
+    leaseToken: string,
+    outcome: StudioProviderSubmissionOutcome,
+  ): Promise<StudioProviderSubrunRecord | null> {
+    if (!isOpaqueStudioIdentifier(subrunId)) return null;
+    if (outcome.kind === "accepted" && !isSafeProviderRequestId(outcome.providerRequestId)) {
+      // A malformed "accepted" response cannot safely become a known
+      // submission. Preserve the durable intent as unknown rather than
+      // throwing and leaving a replay-shaped record behind.
+      return this.finishProviderSubmission(subrunId, leaseToken, { kind: "ambiguous" });
+    }
+    const subrun = await this.getProviderSubrun(subrunId);
+    if (!subrun) return null;
+    const job = await this.getJob(subrun.jobId);
+    const referenceTtlSeconds = outcome.kind === "accepted" && job
+      ? Math.floor(this.jobPayloadRemainingMs(job) / 1_000)
+      : 0;
+    // Never create a fresh 24-hour provider-reference lifetime after an old
+    // job was accepted. If the original privacy deadline wins, retain no
+    // request ID and immediately record the physical call as ambiguous.
+    if (outcome.kind === "accepted" && referenceTtlSeconds < 1) {
+      return this.finishProviderSubmission(subrunId, leaseToken, { kind: "ambiguous" });
+    }
+    const encryptedReference = outcome.kind === "accepted"
+      ? this.cipher.encrypt({ providerRequestId: outcome.providerRequestId }, `provider-subrun:${subrunId}`)
+      : undefined;
+    const result = await this.redis.eval(FINISH_PROVIDER_SUBMISSION_LUA, {
+      keys: [this.providerSubrunKey(subrunId), this.providerSubrunReferenceKey(subrunId), this.providerSubrunLeaseKey(subrunId)],
+      arguments: [
+        leaseToken,
+        outcome.kind,
+        encryptedReference === undefined ? "" : JSON.stringify(encryptedReference),
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        String(referenceTtlSeconds),
+      ],
+    });
+    const record = parseStored<StudioProviderSubrunRecord>(typeof result === "string" ? result : null);
+    return record && isProviderSubrunRecord(record) ? Object.freeze(record) : null;
+  }
+
+  /** Read the encrypted provider reference only when a bounded recovery needs it. */
+  public async getProviderSubrunReference(subrunId: string): Promise<StudioProviderSubrunReference | null> {
+    if (!isOpaqueStudioIdentifier(subrunId)) return null;
+    const encrypted = parseStored<EncryptedPayload>(await this.redis.get(this.providerSubrunReferenceKey(subrunId)));
+    if (!encrypted) return null;
+    try {
+      return Object.freeze(this.cipher.decrypt<StudioProviderSubrunReference>(encrypted, `provider-subrun:${subrunId}`));
+    } catch {
+      return null;
+    }
   }
 
   public async createOutbox(input: CreateStudioOutboxInput): Promise<StudioOutboxRecord> {
@@ -954,6 +1206,9 @@ export class StudioStore {
   private dailySpendKey(day: string): string { return `${this.prefix}:spend:${day}`; }
   private jobKey(jobId: string): string { return `${this.prefix}:job:${jobId}`; }
   private jobPayloadKey(jobId: string): string { return `${this.prefix}:job:payload:${jobId}`; }
+  private providerSubrunKey(subrunId: string): string { return `${this.prefix}:provider-subrun:${subrunId}`; }
+  private providerSubrunReferenceKey(subrunId: string): string { return `${this.prefix}:provider-subrun:reference:${subrunId}`; }
+  private providerSubrunLeaseKey(subrunId: string): string { return `${this.prefix}:provider-subrun:lease:${subrunId}`; }
   private outboxKey(outboxId: string): string { return `${this.prefix}:outbox:${outboxId}`; }
   private outboxPayloadKey(outboxId: string): string { return `${this.prefix}:outbox:payload:${outboxId}`; }
   private readyOutboxKey(): string { return `${this.prefix}:outbox:ready`; }
@@ -1664,6 +1919,131 @@ end
 return cjson.encode(record)
 `;
 
+const BEGIN_PROVIDER_SUBMISSION_LUA = `
+-- AIR_STUDIO_BEGIN_PROVIDER_SUBMISSION_V2
+-- KEYS: provider subrun metadata, short execution lease, shared release fence, job metadata
+-- ARGV: lease token, now, release generation, release phase, terminal metadata ttl,
+--       expected job id, expected job state version
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return cjson.encode({ kind = 'lease_lost' }) end
+local raw = redis.call('GET', KEYS[1])
+if not raw then return cjson.encode({ kind = 'unavailable' }) end
+local ok, record = pcall(cjson.decode, raw)
+if not ok or type(record) ~= 'table' then return cjson.encode({ kind = 'unavailable' }) end
+local function persistPersistent()
+  redis.call('SET', KEYS[1], cjson.encode(record))
+end
+local function persistTerminal()
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[5])
+end
+local function response(kind)
+  return cjson.encode({ kind = kind, subrun = record })
+end
+if record.state == 'submitting' then
+  -- A prior owner may have crossed the physical-call point before crashing.
+  -- It is never safe to decide that a second submit is a retry.
+  record.state = 'submission_unknown'
+  record.stateVersion = tonumber(record.stateVersion or 0) + 1
+  record.updatedAtMs = tonumber(ARGV[2])
+  persistPersistent()
+  return response('submission_unknown')
+end
+if record.state == 'submitted' then return response('already_submitted') end
+if record.state == 'definitive_rejection' then return response('definitive_rejection') end
+if record.state == 'submission_unknown' then return response('submission_unknown') end
+if record.state == 'canceled' then return response('canceled') end
+if record.state ~= 'reserved' then return cjson.encode({ kind = 'unavailable' }) end
+
+-- A cancellation, failure, or state transition that completes before this
+-- final durable authorization must win over a provider submit. We cannot make
+-- an external provider call atomic with Redis after this script returns.
+local jobRaw = redis.call('GET', KEYS[4])
+local job = nil
+if jobRaw then
+  local decoded, parsed = pcall(cjson.decode, jobRaw)
+  if decoded and type(parsed) == 'table' then job = parsed end
+end
+local jobValid = job ~= nil
+  and job.jobId == ARGV[6]
+  and record.jobId == ARGV[6]
+  and job.state == 'executing'
+  and type(job.stateVersion) == 'number'
+  and job.stateVersion == math.floor(job.stateVersion)
+  and job.stateVersion == tonumber(ARGV[7])
+if not jobValid then
+  record.state = 'canceled'
+  record.stateVersion = tonumber(record.stateVersion or 0) + 1
+  record.updatedAtMs = tonumber(ARGV[2])
+  persistTerminal()
+  return response('canceled')
+end
+
+local stamp = record.releaseStamp
+local current = nil
+local fenceRaw = redis.call('GET', KEYS[3])
+if fenceRaw then
+  local decoded, fence = pcall(cjson.decode, fenceRaw)
+  if decoded and type(fence) == 'table' then current = fence end
+end
+local stampValid = type(stamp) == 'table'
+  and type(stamp.generation) == 'number' and stamp.generation >= 1
+  and stamp.generation == math.floor(stamp.generation)
+  and (stamp.phase == 'canary' or stamp.phase == 'production')
+  and stamp.generation == tonumber(ARGV[3]) and stamp.phase == ARGV[4]
+local fenceValid = current ~= nil and current.schemaVersion == 1
+  and type(current.generation) == 'number' and current.generation >= 1
+  and current.generation == math.floor(current.generation)
+  and (current.phase == 'canary' or current.phase == 'production')
+  and current.generation == tonumber(ARGV[3]) and current.phase == ARGV[4]
+if not stampValid or not fenceValid then
+  record.state = 'canceled'
+  record.stateVersion = tonumber(record.stateVersion or 0) + 1
+  record.updatedAtMs = tonumber(ARGV[2])
+  persistTerminal()
+  return response('release_blocked')
+end
+record.state = 'submitting'
+record.stateVersion = tonumber(record.stateVersion or 0) + 1
+record.updatedAtMs = tonumber(ARGV[2])
+persistPersistent()
+return response('ready')
+`;
+
+const FINISH_PROVIDER_SUBMISSION_LUA = `
+-- AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V1
+-- KEYS: provider subrun metadata, encrypted provider reference, short execution lease
+-- ARGV: lease token, accepted|definitive_rejection|ambiguous, encrypted reference, now,
+--       terminal metadata ttl, reference ttl
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return false end
+local raw = redis.call('GET', KEYS[1])
+if not raw then return false end
+local ok, record = pcall(cjson.decode, raw)
+if not ok or type(record) ~= 'table' or record.state ~= 'submitting' then return false end
+if ARGV[2] == 'accepted' then
+  local referenceTtl = tonumber(ARGV[6])
+  if ARGV[3] == '' or not referenceTtl or referenceTtl < 1 or referenceTtl ~= math.floor(referenceTtl) then return false end
+  record.state = 'submitted'
+  record.stateVersion = tonumber(record.stateVersion or 0) + 1
+  record.updatedAtMs = tonumber(ARGV[4])
+  redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[6])
+  redis.call('SET', KEYS[1], cjson.encode(record))
+elseif ARGV[2] == 'definitive_rejection' then
+  record.state = 'definitive_rejection'
+  record.stateVersion = tonumber(record.stateVersion or 0) + 1
+  record.updatedAtMs = tonumber(ARGV[4])
+  redis.call('DEL', KEYS[2])
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[5])
+elseif ARGV[2] == 'ambiguous' then
+  record.state = 'submission_unknown'
+  record.stateVersion = tonumber(record.stateVersion or 0) + 1
+  record.updatedAtMs = tonumber(ARGV[4])
+  redis.call('SET', KEYS[1], cjson.encode(record))
+else
+  return false
+end
+redis.call('DEL', KEYS[3])
+return cjson.encode(record)
+`;
+
 function parseStored<T>(raw: string | null): T | null {
   if (raw === null) return null;
   try {
@@ -1672,6 +2052,99 @@ function parseStored<T>(raw: string | null): T | null {
   } catch {
     return null;
   }
+}
+
+function parseProviderSubmissionBeginResult(raw: string | null): StudioProviderSubmissionBeginResult {
+  const parsed = parseStored<{ readonly kind?: unknown; readonly subrun?: unknown }>(raw);
+  if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
+  if (parsed.kind === "lease_lost" || parsed.kind === "unavailable") return Object.freeze({ kind: parsed.kind });
+  if (!isProviderSubrunRecord(parsed.subrun)) return Object.freeze({ kind: "unavailable" });
+  const subrun = Object.freeze(parsed.subrun);
+  switch (parsed.kind) {
+    case "ready":
+    case "already_submitted":
+    case "definitive_rejection":
+    case "submission_unknown":
+    case "release_blocked":
+    case "canceled":
+      return Object.freeze({ kind: parsed.kind, subrun });
+    default:
+      return Object.freeze({ kind: "unavailable" });
+  }
+}
+
+function isExecutionSnapshotForJob(snapshot: StudioExecutionSnapshot, job: StudioJobRecord): boolean {
+  return snapshot.schemaVersion === 1
+    && snapshot.workflow.workflowVersion === 1
+    && snapshot.workflow.stepId === "provider-generation"
+    && isSafeRecordString(snapshot.workflow.workflowId, 160)
+    && snapshot.model.slug === job.modelSlug
+    && snapshot.model.provider === job.provider
+    && isSafeRecordString(snapshot.model.providerModelId, 512)
+    && snapshot.output.count === job.outputCount
+    && (snapshot.output.durationSeconds ?? undefined) === (job.durationSeconds ?? undefined)
+    && isValidReleaseStamp(snapshot.releaseStamp);
+}
+
+function isProviderSubrunRecord(value: unknown): value is StudioProviderSubrunRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<StudioProviderSubrunRecord>;
+  return candidate.schemaVersion === 1
+    && isOpaqueStudioIdentifier(candidate.subrunId)
+    // Existing Air job IDs are opaque in production, but accepting the
+    // bounded legacy shape here keeps reconciliation readable across the
+    // already-admitted v2 records created before this executor foundation.
+    && isSafeRecordString(candidate.jobId, 160)
+    && (candidate.provider === "gmi" || candidate.provider === "fal")
+    && isSafeRecordString(candidate.modelSlug, 80)
+    && isSafeRecordString(candidate.workflowId, 160)
+    && candidate.stepId === "provider-generation"
+    && isValidReleaseStamp(candidate.releaseStamp)
+    && isOpaqueStudioIdentifier(candidate.submissionIntentId)
+    && STUDIO_PROVIDER_SUBRUN_STATES.includes(candidate.state as StudioProviderSubrunState)
+    && typeof candidate.stateVersion === "number" && isPositiveSafeInteger(candidate.stateVersion)
+    && typeof candidate.createdAtMs === "number" && isNonnegativeSafeInteger(candidate.createdAtMs)
+    && typeof candidate.updatedAtMs === "number" && isNonnegativeSafeInteger(candidate.updatedAtMs);
+}
+
+function sameProviderSubrunIdentity(
+  left: StudioProviderSubrunRecord,
+  right: StudioProviderSubrunRecord,
+): boolean {
+  return left.subrunId === right.subrunId
+    && left.jobId === right.jobId
+    && left.provider === right.provider
+    && left.modelSlug === right.modelSlug
+    && left.workflowId === right.workflowId
+    && left.stepId === right.stepId
+    && left.submissionIntentId === right.submissionIntentId
+    && left.releaseStamp.generation === right.releaseStamp.generation
+    && left.releaseStamp.phase === right.releaseStamp.phase;
+}
+
+function isOpaqueStudioIdentifier(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+}
+
+function isSafeProviderRequestId(value: string): boolean {
+  return isSafeRecordString(value, 512);
+}
+
+function isSafeRecordString(value: unknown, maximumLength: number): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.length <= maximumLength
+    && value.trim() === value
+    && !/[\u0000\r\n]/u.test(value);
+}
+
+function isValidReleaseStamp(value: unknown): value is StudioReleaseStamp {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const stamp = value as Partial<StudioReleaseStamp>;
+  return Number.isSafeInteger(stamp.generation)
+    && (stamp.generation as number) >= 0
+    && (stamp.phase === "dark" || stamp.phase === "canary" || stamp.phase === "production")
+    && (stamp.phase === "dark" || (stamp.generation as number) >= 1);
 }
 
 function outboxMetadata(record: StudioOutboxRecord): Omit<StudioOutboxRecord, "encryptedPayload"> {

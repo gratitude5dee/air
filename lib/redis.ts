@@ -1185,6 +1185,12 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_TRANSITION_JOB_V3")) {
       return this.evalStudioTransitionJob(options.keys, options.arguments);
     }
+    if (script.includes("AIR_STUDIO_BEGIN_PROVIDER_SUBMISSION_V2")) {
+      return this.evalStudioBeginProviderSubmission(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V1")) {
+      return this.evalStudioFinishProviderSubmission(options.keys, options.arguments);
+    }
     throw new Error("MemoryRedis does not implement this Lua script");
   }
 
@@ -1814,6 +1820,114 @@ export class MemoryRedis implements RedisLike {
     } else {
       this.studioSetPersistentRecord(jobKey, record);
     }
+    return JSON.stringify(record);
+  }
+
+  private evalStudioBeginProviderSubmission(keys: readonly string[], args: readonly string[]): string {
+    this.assertStudioArity(keys, args, 4, 7);
+    const recordKey = this.studioKey(keys, 0);
+    const leaseKey = this.studioKey(keys, 1);
+    const releaseFenceKey = this.studioKey(keys, 2);
+    const jobKey = this.studioKey(keys, 3);
+    const token = this.studioArgument(args, 0);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
+    const releaseGeneration = this.studioPositiveInteger(this.studioArgument(args, 2));
+    const releasePhase = this.studioArgument(args, 3);
+    const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
+    const expectedJobId = this.studioArgument(args, 5);
+    const expectedJobVersion = this.studioPositiveInteger(this.studioArgument(args, 6));
+    if (releasePhase !== "canary" && releasePhase !== "production") {
+      return JSON.stringify({ kind: "unavailable" });
+    }
+    if (this.studioString(leaseKey) !== token) return JSON.stringify({ kind: "lease_lost" });
+    const record = this.studioRecord(recordKey);
+    if (!record) return JSON.stringify({ kind: "unavailable" });
+    const response = (kind: string): string => JSON.stringify({ kind, subrun: record });
+    const state = record.state;
+    if (state === "submitting") {
+      record.state = "submission_unknown";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetPersistentRecord(recordKey, record);
+      return response("submission_unknown");
+    }
+    if (state === "submitted") return response("already_submitted");
+    if (state === "definitive_rejection") return response("definitive_rejection");
+    if (state === "submission_unknown") return response("submission_unknown");
+    if (state === "canceled") return response("canceled");
+    if (state !== "reserved") return JSON.stringify({ kind: "unavailable" });
+
+    const job = this.studioRecord(jobKey);
+    if (
+      !job
+      || record.jobId !== expectedJobId
+      || job.jobId !== expectedJobId
+      || job.state !== "executing"
+      || this.studioStateVersion(job) !== expectedJobVersion
+    ) {
+      record.state = "canceled";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, terminalTtl);
+      return response("canceled");
+    }
+
+    const release = this.studioReleaseDispatchStatus(
+      record,
+      releaseFenceKey,
+      releaseGeneration,
+      releasePhase,
+    );
+    if (release !== 1) {
+      record.state = "canceled";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, terminalTtl);
+      return response("release_blocked");
+    }
+    record.state = "submitting";
+    record.stateVersion = this.studioStateVersion(record) + 1;
+    record.updatedAtMs = now;
+    this.studioSetPersistentRecord(recordKey, record);
+    return response("ready");
+  }
+
+  private evalStudioFinishProviderSubmission(keys: readonly string[], args: readonly string[]): string | false {
+    this.assertStudioArity(keys, args, 3, 6);
+    const recordKey = this.studioKey(keys, 0);
+    const referenceKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const token = this.studioArgument(args, 0);
+    const outcome = this.studioArgument(args, 1);
+    const encryptedReference = this.studioArgument(args, 2);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+    const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
+    const referenceTtl = this.studioNonnegativeInteger(this.studioArgument(args, 5));
+    if (this.studioString(leaseKey) !== token) return false;
+    const record = this.studioRecord(recordKey);
+    if (!record || record.state !== "submitting") return false;
+    record.stateVersion = this.studioStateVersion(record) + 1;
+    record.updatedAtMs = now;
+    switch (outcome) {
+      case "accepted":
+        if (!encryptedReference || referenceTtl < 1) return false;
+        record.state = "submitted";
+        this.studioSet(referenceKey, encryptedReference, referenceTtl * 1_000);
+        this.studioSetPersistentRecord(recordKey, record);
+        break;
+      case "definitive_rejection":
+        record.state = "definitive_rejection";
+        this.values.delete(referenceKey);
+        this.studioSetRecord(recordKey, record, terminalTtl);
+        break;
+      case "ambiguous":
+        record.state = "submission_unknown";
+        this.studioSetPersistentRecord(recordKey, record);
+        break;
+      default:
+        return false;
+    }
+    this.values.delete(leaseKey);
     return JSON.stringify(record);
   }
 

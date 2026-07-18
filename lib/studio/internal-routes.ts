@@ -94,6 +94,7 @@ export async function handleStudioReadiness(
     try {
       const freshness = await runtime.store.getCronFreshness(environment.deploymentMode);
       redis = "reachable";
+      if (!runtime.provider?.verified) problems.push("provider_unprovisioned");
       // Vercel only schedules Cron jobs on production deployments. Preview and
       // development readiness still verify Redis but must not claim a missed
       // scheduled invocation.

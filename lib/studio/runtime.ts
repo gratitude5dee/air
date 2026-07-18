@@ -2,6 +2,7 @@ import { createQueueCipher, type QueueCipher } from "../crypto.js";
 import { connectRedisFromUrl, type ConnectedRedis } from "../redis.js";
 import { loadStudioEnvironment, studioReadinessProblems, type StudioEnvironment } from "./config.js";
 import { UnverifiedPhotonTransport, type StudioIMessageTransport } from "./imessage-transport.js";
+import { UnprovisionedStudioProvider, type StudioProviderPort } from "./provider-port.js";
 import { StudioStore } from "./store.js";
 
 export const AIR_STUDIO_VERSION = "2";
@@ -11,6 +12,8 @@ export interface StudioRuntime {
   readonly cipher: QueueCipher;
   readonly store: StudioStore;
   readonly transport: StudioIMessageTransport;
+  /** Never live by default; the executor rejects this unverified provider. */
+  readonly provider: StudioProviderPort;
   readonly storageTransport: "rest" | "tcp";
   readiness(expectedRegistryVersion: string): readonly string[];
   close(): Promise<void>;
@@ -39,12 +42,13 @@ export async function getStudioRuntime(): Promise<StudioRuntime> {
 export async function createStudioRuntime(
   environment: StudioEnvironment = loadStudioEnvironment(),
   transport: StudioIMessageTransport = new UnverifiedPhotonTransport(),
+  provider: StudioProviderPort = new UnprovisionedStudioProvider(),
 ): Promise<StudioRuntime> {
   if (!environment.idHashSecret || !environment.queueEncryptionKey || environment.storageTransport === "unconfigured") {
     throw new Error("studio runtime configuration is incomplete");
   }
   const connection = await connectExistingRedis(environment);
-  return runtimeFromConnectedRedis(environment, connection, transport);
+  return runtimeFromConnectedRedis(environment, connection, transport, provider);
 }
 
 export function studioPublicStatusResponse(): Response {
@@ -79,6 +83,7 @@ function runtimeFromConnectedRedis(
   environment: StudioEnvironment,
   connection: ConnectedRedis,
   transport: StudioIMessageTransport,
+  provider: StudioProviderPort,
 ): StudioRuntime {
   const cipher = createQueueCipher(environment.queueEncryptionKey as string);
   const store = new StudioStore({
@@ -95,10 +100,12 @@ function runtimeFromConnectedRedis(
     cipher,
     store,
     transport,
+    provider,
     storageTransport: environment.storageTransport === "rest" ? "rest" : "tcp",
     readiness(expectedRegistryVersion: string): readonly string[] {
       const problems = [...studioReadinessProblems(environment, expectedRegistryVersion)];
       if (!transport.verified) problems.push("transport_unverified");
+      if (!provider.verified) problems.push("provider_unprovisioned");
       return Object.freeze(problems);
     },
     async close(): Promise<void> {

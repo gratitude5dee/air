@@ -6,6 +6,7 @@ import { hashSenderIdentifier, hashThreadIdentifier } from "../../lib/security.j
 import type { StudioEnvironment, StudioReleasePhase } from "../../lib/studio/config.js";
 import { drainStudioOutbox, drainStudioWithStats } from "../../lib/studio/engine.js";
 import type { IMessageThreadReference, StudioIMessageTransport, TransportOutcome } from "../../lib/studio/imessage-transport.js";
+import { UnprovisionedStudioProvider } from "../../lib/studio/provider-port.js";
 import { getStudioWorkflow, isSinglePaidStepWorkflow } from "../../lib/studio/workflows.js";
 import type { StudioRuntime } from "../../lib/studio/runtime.js";
 import {
@@ -105,6 +106,7 @@ function createDarkFixture(options: {
     cipher,
     store,
     transport,
+    provider: new UnprovisionedStudioProvider(),
     storageTransport: "rest",
     readiness: (_expectedRegistryVersion: string): readonly string[] => [],
     close: async (): Promise<void> => undefined,

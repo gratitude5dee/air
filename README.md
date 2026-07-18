@@ -119,9 +119,17 @@ and pending-assembly messages alike.
 It cannot revoke a transport call already authorized by an older worker, so a
 future real-line rollback drill must reconcile any such `send_unknown` record.
 
-The codebase has no enabled provider executor or provider intent record yet.
-Provider fencing, real transport proof, and a bounded rollback drill therefore
-remain mandatory canary gates; this outbox fence is not an activation approval.
+The codebase now contains a fake-backed, **unprovisioned** provider-submission
+foundation. It persists an encrypted admission snapshot and a durable
+submission intent before an injected provider port could be called; an
+ambiguous outcome becomes `submission_unknown` and is never replayed. The
+deployed runtime supplies an unverified provider port and does not invoke this
+executor from ingress or Cron, so it does not make a provider path live.
+
+Provider catalog/schema evidence, price authority, media upload/download,
+polling, output delivery, real transport proof, and a bounded rollback drill
+remain mandatory canary gates. The outbox and pre-submit fences are not an
+activation approval.
 
 ## Checks and dark-preview runbook
 

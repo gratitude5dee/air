@@ -46,9 +46,16 @@ acknowledgements.
   iMessage transport. The final guarded authorization is the documented
   commitment point; a stricter live policy needs a per-thread send barrier and
   a transport-aware rollback procedure.
-- There is no enabled provider executor or durable provider-submission intent
-  in this dark release. It would be inaccurate to claim provider fencing from
-  an outbox-only implementation.
+- The repository now has an unprovisioned, fake-tested provider-submission
+  foundation. It persists one encrypted admission snapshot and durable
+  `reserved → submitting` intent at a final durable pre-call boundary, then
+  fences that transition against the same shared release generation and current
+  `executing` job version. A rollback or cancellation that happens after this
+  Redis authorization cannot atomically revoke an external provider call and
+  must reconcile conservatively. It deliberately has no live adapter, catalog,
+  upload, polling, output, or recovery path, and no ingress/Cron path invokes
+  it. It would still be inaccurate to claim a production-ready provider
+  integration from this dark-only foundation.
 
 ## Required before canary
 
