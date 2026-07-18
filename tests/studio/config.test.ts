@@ -50,6 +50,7 @@ describe("Air studio configuration", () => {
   it("keeps a dark release closed even when all identity settings are present", () => {
     const environment = loadStudioEnvironment(configured({ VERCEL_ENV: "production" }));
     expect(environment.releasePhase).toBe("dark");
+    expect(environment.releaseGeneration).toBe(0);
     expect(environment.policy.acceptNewJobs).toBe(false);
     expect(environment.policy.allowProviderSubmit).toBe(false);
     expect(environment.storageTransport).toBe("tcp");
@@ -74,6 +75,8 @@ describe("Air studio configuration", () => {
       ...enabledSwitches,
       VERCEL_ENV: "production",
       AIR_RELEASE_PHASE: "production",
+      AIR_RELEASE_GENERATION: "1",
+      AIR_RELEASE_FENCE_SECRET: "release-fence-secret",
     }));
     expect(canAcceptStudioJobs(active)).toBe(true);
     expect(canSubmitStudioProvider(active)).toBe(true);
@@ -91,5 +94,41 @@ describe("Air studio configuration", () => {
 
   it("rejects a canary without explicit budget authorization", () => {
     expect(() => loadStudioEnvironment(configured({ AIR_RELEASE_PHASE: "canary" }))).toThrow(/canary phase/);
+  });
+
+  it("requires a strict, positive release generation and fence secret for active phases", () => {
+    const active = {
+      VERCEL_ENV: "production",
+      AIR_RELEASE_PHASE: "production",
+      AIR_RELEASE_GENERATION: "1",
+      AIR_RELEASE_FENCE_SECRET: "release-fence-secret",
+    };
+
+    expect(() => loadStudioEnvironment(configured({
+      ...active,
+      AIR_RELEASE_GENERATION: undefined,
+    }))).toThrow(/AIR_RELEASE_GENERATION/);
+    expect(() => loadStudioEnvironment(configured({
+      ...active,
+      AIR_RELEASE_GENERATION: "0",
+    }))).toThrow(/positive AIR_RELEASE_GENERATION/);
+    for (const invalid of ["-1", "1.5", "01", "9007199254740992"]) {
+      expect(() => loadStudioEnvironment(configured({
+        ...active,
+        AIR_RELEASE_GENERATION: invalid,
+      }))).toThrow(/AIR_RELEASE_GENERATION is invalid/);
+    }
+    expect(() => loadStudioEnvironment(configured({
+      ...active,
+      AIR_RELEASE_FENCE_SECRET: " \n",
+    }))).toThrow(/AIR_RELEASE_FENCE_SECRET/);
+
+    const environment = loadStudioEnvironment(configured(active));
+    expect(environment.releaseGeneration).toBe(1);
+    expect(environment.releaseFenceSecret).toBe("release-fence-secret");
+    expect(studioReadinessProblems({ ...environment, releaseGeneration: 0 }, "test-registry"))
+      .toContain("release_generation_unavailable");
+    expect(studioReadinessProblems({ ...environment, releaseFenceSecret: undefined }, "test-registry"))
+      .toContain("release_fence_unavailable");
   });
 });

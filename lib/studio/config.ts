@@ -28,6 +28,10 @@ export interface StudioSpendCaps {
 export interface StudioEnvironment {
   readonly deploymentMode: StudioDeploymentMode;
   readonly releasePhase: StudioReleasePhase;
+  /** Monotonic global release epoch; dark deployments intentionally use zero. */
+  readonly releaseGeneration: number;
+  /** Shared-secret material for authenticated release-fence advancement. */
+  readonly releaseFenceSecret?: string | undefined;
   readonly storageTransport: StorageTransport;
   readonly imessageProjectId?: string | undefined;
   readonly imessageProjectSecret?: string | undefined;
@@ -70,6 +74,8 @@ const PROTECTED_CONFIGURATION_NAMES = Object.freeze([
   "AIR_ALLOWED_SENDER_HASHES",
   "CRON_SECRET",
   "AIR_MODEL_REGISTRY_VERSION",
+  "AIR_RELEASE_GENERATION",
+  "AIR_RELEASE_FENCE_SECRET",
 ] as const);
 
 /** Names only, for operators and tests. Never use this list in a response body. */
@@ -125,10 +131,18 @@ export function loadStudioEnvironment(source: EnvironmentSource = process.env): 
       throw new Error("canary phase requires an approved budget and positive cap");
     }
   }
+  const releaseGeneration = parseReleaseGeneration(source.AIR_RELEASE_GENERATION, releasePhase);
+  const releaseFenceSecret = optional(source.AIR_RELEASE_FENCE_SECRET);
+  if (releaseFenceSecret !== undefined) validateSecretLikeValue(releaseFenceSecret, "AIR_RELEASE_FENCE_SECRET");
+  if (isReleasePhaseActive(releasePhase) && !releaseFenceSecret) {
+    throw new Error("an active release phase requires AIR_RELEASE_FENCE_SECRET");
+  }
 
   const environment = Object.freeze({
     deploymentMode,
     releasePhase,
+    releaseGeneration,
+    releaseFenceSecret,
     storageTransport,
     imessageProjectId: optional(source.IMESSAGE_PROJECT_ID),
     imessageProjectSecret: optional(source.IMESSAGE_PROJECT_SECRET),
@@ -160,7 +174,7 @@ export function loadStudioEnvironment(source: EnvironmentSource = process.env): 
 export function isStudioSideEffectPhaseActive(
   environment: Pick<StudioEnvironment, "releasePhase">,
 ): boolean {
-  return environment.releasePhase === "canary" || environment.releasePhase === "production";
+  return isReleasePhaseActive(environment.releasePhase);
 }
 
 export function canAcceptStudioJobs(environment: StudioSideEffectEnvironment): boolean {
@@ -202,6 +216,15 @@ export function studioReadinessProblems(
   }
   if (!environment.cronSecret) problems.push("operator_access_unavailable");
   if (environment.modelRegistryVersion !== expectedRegistryVersion) problems.push("registry_version_mismatch");
+  if (isStudioSideEffectPhaseActive(environment)) {
+    // `loadStudioEnvironment` rejects this configuration before a worker can
+    // start. Keeping the readiness check protects manually constructed test
+    // runtimes and future configuration sources as well.
+    if (!Number.isSafeInteger(environment.releaseGeneration) || environment.releaseGeneration < 1) {
+      problems.push("release_generation_unavailable");
+    }
+    if (!environment.releaseFenceSecret) problems.push("release_fence_unavailable");
+  }
   if (environment.deploymentMode === "production") {
     if (environment.releasePhase !== "production" && environment.releasePhase !== "canary" && environment.releasePhase !== "dark") {
       problems.push("release_phase_invalid");
@@ -243,6 +266,29 @@ function parseReleasePhase(value: string | undefined): StudioReleasePhase {
     default:
       throw new Error("AIR_RELEASE_PHASE is invalid");
   }
+}
+
+function parseReleaseGeneration(value: string | undefined, releasePhase: StudioReleasePhase): number {
+  const normalized = value?.trim();
+  if (!normalized) {
+    if (releasePhase === "dark") return 0;
+    throw new Error("an active release phase requires a positive AIR_RELEASE_GENERATION");
+  }
+  if (!/^(?:0|[1-9]\d*)$/.test(normalized)) {
+    throw new Error("AIR_RELEASE_GENERATION is invalid");
+  }
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed)) {
+    throw new Error("AIR_RELEASE_GENERATION is invalid");
+  }
+  if (isReleasePhaseActive(releasePhase) && parsed < 1) {
+    throw new Error("an active release phase requires a positive AIR_RELEASE_GENERATION");
+  }
+  return parsed;
+}
+
+function isReleasePhaseActive(releasePhase: StudioReleasePhase): boolean {
+  return releasePhase === "canary" || releasePhase === "production";
 }
 
 /** Missing/invalid monetary limits intentionally become zero, never unlimited. */

@@ -916,6 +916,33 @@ type MemoryValue =
   | { kind: "string"; value: string; expiresAt: number | null }
   | { kind: "zset"; value: Map<string, number>; expiresAt: number | null };
 
+type MemoryStudioPendingState = "active" | "cleared" | "maintenance" | "expired";
+
+interface MemoryStudioPendingControl {
+  readonly schemaVersion: 1;
+  readonly state: MemoryStudioPendingState;
+  readonly receiptId: string;
+  readonly scopeSequence: number;
+  readonly revision: number;
+  readonly token?: string | undefined;
+  readonly expiresAtMs?: number | undefined;
+}
+
+interface MemoryStudioPendingGuard {
+  readonly threadHash: string;
+  readonly receiptId: string;
+  readonly scopeSequence: number;
+  readonly revision: number;
+  readonly token: string;
+  readonly expiresAtMs: number;
+}
+
+interface MemoryStudioReleaseFence {
+  readonly schemaVersion: 1;
+  readonly generation: number;
+  readonly phase: "dark" | "canary" | "production";
+}
+
 /**
  * Deterministic in-memory implementation for isolated tests.  It is not a
  * production fallback: deployed Air must provide a real Redis adapter.
@@ -1110,100 +1137,355 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_RATE_LIMIT_V1")) {
       return this.evalRateLimit(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_ADMIT_JOB_V2")) {
+    if (script.includes("AIR_STUDIO_PERSIST_PENDING_V3")) {
+      return this.evalStudioPersistPending(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_FENCE_PENDING_V3")) {
+      return this.evalStudioFencePending(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_READ_PENDING_V3")) {
+      return this.evalStudioReadPending(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_PERSIST_PENDING_GUARDED_OUTBOX_V5")) {
+      return this.evalStudioPersistPendingGuardedOutbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_ADVANCE_RELEASE_FENCE_V1")) {
+      return this.evalStudioAdvanceReleaseFence(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_ADMIT_JOB_V3")) {
       return this.evalStudioAdmitJob(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_PERSIST_INBOX_V2")) {
+    if (script.includes("AIR_STUDIO_PERSIST_INBOX_V4")) {
       return this.evalStudioPersistInbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_PERSIST_OUTBOX_V2")) {
+    if (script.includes("AIR_STUDIO_PERSIST_OUTBOX_V4")) {
       return this.evalStudioPersistOutbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_CLAIM_INBOX_V2")) {
+    if (script.includes("AIR_STUDIO_CLAIM_INBOX_V3")) {
       return this.evalStudioClaimInbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_FINISH_INBOX_V2")) {
+    if (script.includes("AIR_STUDIO_FINISH_INBOX_V3")) {
       return this.evalStudioFinishInbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_RETRY_INBOX_V2")) {
+    if (script.includes("AIR_STUDIO_RETRY_INBOX_V3")) {
       return this.evalStudioRetryInbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_CLAIM_OUTBOX_V2")) {
+    if (script.includes("AIR_STUDIO_CLAIM_OUTBOX_V5")) {
       return this.evalStudioClaimOutbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_FINISH_OUTBOX_V2")) {
+    if (script.includes("AIR_STUDIO_AUTHORIZE_OUTBOX_DELIVERY_V5")) {
+      return this.evalStudioAuthorizeOutboxDelivery(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_FINISH_OUTBOX_V3")) {
       return this.evalStudioFinishOutbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V2")) {
+    if (script.includes("AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V3")) {
       return this.evalStudioReconcileExpiredOutbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_TRANSITION_JOB_V2")) {
+    if (script.includes("AIR_STUDIO_TRANSITION_JOB_V3")) {
       return this.evalStudioTransitionJob(options.keys, options.arguments);
     }
     throw new Error("MemoryRedis does not implement this Lua script");
   }
 
   /** Deterministic mirrors for the Air v2 studio Lua primitives. */
-  private evalStudioPersistInbox(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 2, 4);
-    const recordKey = this.studioKey(keys, 0);
-    const readyKey = this.studioKey(keys, 1);
-    const record = this.studioArgument(args, 0);
-    const ttl = this.studioPositiveInteger(this.studioArgument(args, 1));
-    const score = this.studioNonnegativeInteger(this.studioArgument(args, 2));
-    const member = this.studioArgument(args, 3);
-    this.assertStringOrMissing(recordKey);
-    this.assertZSetOrMissing(readyKey);
-    if (this.getEntry(recordKey)) return 0;
-    this.values.set(recordKey, { kind: "string", value: record, expiresAt: this.now() + ttl * 1_000 });
-    this.getZSet(readyKey, true).value.set(member, score);
+  private evalStudioPersistPending(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 2, 6);
+    const payloadKey = this.studioKey(keys, 0);
+    const controlKey = this.studioKey(keys, 1);
+    const encrypted = this.studioArgument(args, 0);
+    const receiptId = this.studioArgument(args, 1);
+    const scopeSequence = this.studioPositiveInteger(this.studioArgument(args, 2));
+    const expiresAtMs = this.studioPositiveInteger(this.studioArgument(args, 3));
+    const token = this.studioArgument(args, 4);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 5));
+    this.assertStringOrMissing(payloadKey);
+    this.assertStringOrMissing(controlKey);
+    let control = this.studioPendingControl(controlKey);
+    if (control === "invalid") return -6;
+    if (control?.state === "active" && (!control.expiresAtMs || control.expiresAtMs <= now || this.studioString(payloadKey) === null)) {
+      control = this.studioExpirePendingControl(payloadKey, controlKey, control);
+    }
+    if (control) {
+      if (scopeSequence < control.scopeSequence) return this.studioPendingOutcome(control.state);
+      if (scopeSequence === control.scopeSequence) {
+        if (control.state !== "active") return this.studioPendingOutcome(control.state);
+        if (
+          control.receiptId !== receiptId
+          || control.token !== token
+          || control.expiresAtMs !== expiresAtMs
+        ) return -6;
+        return 2;
+      }
+    }
+    const revision = control ? control.revision + 1 : 1;
+    if (expiresAtMs <= now) {
+      this.values.delete(payloadKey);
+      this.studioSetPendingControl(controlKey, {
+        schemaVersion: 1,
+        state: "expired",
+        receiptId,
+        scopeSequence,
+        revision,
+        expiresAtMs,
+      });
+      return -4;
+    }
+    this.studioSet(payloadKey, encrypted, expiresAtMs - now);
+    this.studioSetPendingControl(controlKey, {
+      schemaVersion: 1,
+      state: "active",
+      receiptId,
+      scopeSequence,
+      revision,
+      token,
+      expiresAtMs,
+    });
     return 1;
   }
 
-  private evalStudioPersistOutbox(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 3, 5);
-    const recordKey = this.studioKey(keys, 0);
-    const readyKey = this.studioKey(keys, 1);
-    const laneKey = this.studioKey(keys, 2);
-    const record = this.studioArgument(args, 0);
-    const ttl = this.studioPositiveInteger(this.studioArgument(args, 1));
-    const score = this.studioNonnegativeInteger(this.studioArgument(args, 2));
-    const member = this.studioArgument(args, 3);
-    const sequence = this.studioNonnegativeInteger(this.studioArgument(args, 4));
-    this.assertStringOrMissing(recordKey);
-    this.assertZSetOrMissing(readyKey);
-    this.assertZSetOrMissing(laneKey);
+  private evalStudioFencePending(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 2, 4);
+    const payloadKey = this.studioKey(keys, 0);
+    const controlKey = this.studioKey(keys, 1);
+    const receiptId = this.studioArgument(args, 0);
+    const scopeSequence = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const state = this.studioArgument(args, 2);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+    if (state !== "cleared" && state !== "maintenance") return 0;
+    this.assertStringOrMissing(payloadKey);
+    this.assertStringOrMissing(controlKey);
+    const control = this.studioPendingControl(controlKey);
+    if (control === "invalid") return 0;
+    if (control) {
+      if (scopeSequence < control.scopeSequence) return 0;
+      if (scopeSequence === control.scopeSequence) {
+        return control.receiptId === receiptId && control.state === state ? 2 : 0;
+      }
+    }
+    const canceled = Boolean(
+      control?.state === "active"
+      && control.expiresAtMs !== undefined
+      && control.expiresAtMs > now
+      && this.studioString(payloadKey) !== null,
+    );
+    this.values.delete(payloadKey);
+    this.studioSetPendingControl(controlKey, {
+      schemaVersion: 1,
+      state,
+      receiptId,
+      scopeSequence,
+      revision: control ? control.revision + 1 : 1,
+    });
+    return canceled ? 1 : 2;
+  }
+
+  private evalStudioReadPending(keys: readonly string[], args: readonly string[]): string | false {
+    this.assertStudioArity(keys, args, 2, 1);
+    const payloadKey = this.studioKey(keys, 0);
+    const controlKey = this.studioKey(keys, 1);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 0));
+    const control = this.studioPendingControl(controlKey);
+    if (control === null || control === "invalid" || control.state !== "active") return false;
+    if (!control.expiresAtMs || control.expiresAtMs <= now || this.studioString(payloadKey) === null) {
+      this.studioExpirePendingControl(payloadKey, controlKey, control);
+      return false;
+    }
+    return this.studioString(payloadKey) ?? false;
+  }
+
+  private evalStudioAdvanceReleaseFence(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 1, 3);
+    const fenceKey = this.studioKey(keys, 0);
+    const previous = this.studioArgument(args, 0);
+    const target = this.studioArgument(args, 1);
+    const phase = this.studioArgument(args, 2);
+    if (!/^-?(?:0|[1-9]\d*)$/.test(previous) || !/^(?:0|[1-9]\d*)$/.test(target)) return -2;
+    const previousGeneration = Number(previous);
+    const targetGeneration = Number(target);
+    if (
+      !Number.isSafeInteger(previousGeneration) || previousGeneration < -1
+      || !Number.isSafeInteger(targetGeneration) || targetGeneration < 0
+      || (phase !== "dark" && phase !== "canary" && phase !== "production")
+    ) return -2;
+    const current = this.studioReleaseFence(fenceKey);
+    if (current === "invalid") return -2;
+    if (current === null) {
+      if (previousGeneration !== -1 || targetGeneration !== 0 || phase !== "dark") return -1;
+      this.values.set(fenceKey, {
+        kind: "string",
+        value: JSON.stringify({ schemaVersion: 1, generation: targetGeneration, phase }),
+        expiresAt: null,
+      });
+      return 1;
+    }
+    if (
+      current.generation === targetGeneration
+      && current.phase === phase
+      && (previousGeneration === targetGeneration || previousGeneration === targetGeneration - 1)
+    ) return 2;
+    if (current.generation !== previousGeneration || targetGeneration !== previousGeneration + 1) return -1;
+    this.values.set(fenceKey, {
+      kind: "string",
+      value: JSON.stringify({ schemaVersion: 1, generation: targetGeneration, phase }),
+      expiresAt: null,
+    });
+    return 1;
+  }
+
+  private evalStudioPersistPendingGuardedOutbox(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 8, 14);
+    const payloadKey = this.studioKey(keys, 0);
+    const controlKey = this.studioKey(keys, 1);
+    const recordKey = this.studioKey(keys, 2);
+    const outboxPayloadKey = this.studioKey(keys, 3);
+    const readyKey = this.studioKey(keys, 4);
+    const laneKey = this.studioKey(keys, 5);
+    const scopeCounterKey = this.studioKey(keys, 6);
+    const releaseFenceKey = this.studioKey(keys, 7);
+    const receiptId = this.studioArgument(args, 0);
+    const scopeSequence = this.studioPositiveInteger(this.studioArgument(args, 1));
+    const revision = this.studioPositiveInteger(this.studioArgument(args, 2));
+    const token = this.studioArgument(args, 3);
+    const expiresAtMs = this.studioPositiveInteger(this.studioArgument(args, 4));
+    const record = this.studioArgument(args, 5);
+    const outboxPayload = this.studioArgument(args, 6);
+    const outboxPayloadTtl = this.studioPositiveInteger(this.studioArgument(args, 7));
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 8));
+    const member = this.studioArgument(args, 9);
+    const sequence = this.studioNonnegativeInteger(this.studioArgument(args, 10));
+    const dueAtMs = this.studioNonnegativeInteger(this.studioArgument(args, 11));
+    const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 12));
+    const releasePhase = this.studioArgument(args, 13);
+    if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") return -8;
+    const release = this.studioReleasePersistenceStatus(
+      this.studioRecordFromJson(record),
+      releaseFenceKey,
+      releaseGeneration,
+      releasePhase,
+    );
+    if (release === -1) return -7;
+    if (release === 0) return -8;
+    const control = this.studioPendingControl(controlKey);
+    if (control === null || control === "invalid") return -6;
+    if (control.state === "maintenance") return -2;
+    if (control.state === "cleared") return -3;
+    if (control.state === "expired") return -4;
+    if (!control.expiresAtMs || control.expiresAtMs <= now || this.studioString(payloadKey) === null) {
+      this.studioExpirePendingControl(payloadKey, controlKey, control);
+      return -4;
+    }
+    if (control.scopeSequence > scopeSequence) return -5;
+    if (
+      control.scopeSequence !== scopeSequence
+      || control.revision !== revision
+      || control.receiptId !== receiptId
+      || control.token !== token
+      || control.expiresAtMs !== expiresAtMs
+    ) return -6;
+    if (this.studioCounter(scopeCounterKey) !== scopeSequence) return -5;
     if (this.getEntry(recordKey)) return 0;
     const existingSequence = [...(this.getZSet(laneKey, false)?.value.entries() ?? [])]
       .some(([, scoreAtSequence]) => scoreAtSequence === sequence);
     if (existingSequence) return -1;
-    this.values.set(recordKey, { kind: "string", value: record, expiresAt: this.now() + ttl * 1_000 });
+    this.values.set(recordKey, { kind: "string", value: record, expiresAt: null });
+    this.values.set(outboxPayloadKey, { kind: "string", value: outboxPayload, expiresAt: this.now() + outboxPayloadTtl * 1_000 });
+    this.getZSet(readyKey, true).value.set(member, dueAtMs);
+    this.getZSet(laneKey, true).value.set(member, sequence);
+    return 1;
+  }
+
+  private evalStudioPersistInbox(keys: readonly string[], args: readonly string[]): string | number {
+    this.assertStudioArity(keys, args, 4, 5);
+    const recordKey = this.studioKey(keys, 0);
+    const envelopeKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const scopeCounterKey = this.studioKey(keys, 3);
+    const serializedRecord = this.studioArgument(args, 0);
+    const serializedEnvelope = this.studioArgument(args, 1);
+    const envelopeTtl = this.studioPositiveInteger(this.studioArgument(args, 2));
+    const score = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+    const member = this.studioArgument(args, 4);
+    this.assertStringOrMissing(recordKey);
+    this.assertStringOrMissing(envelopeKey);
+    this.assertStringOrMissing(scopeCounterKey);
+    this.assertZSetOrMissing(readyKey);
+    if (this.getEntry(recordKey)) return 0;
+    const record = this.studioRecordFromJson(serializedRecord);
+    const nextSequence = this.studioCounter(scopeCounterKey) + 1;
+    this.values.set(scopeCounterKey, { kind: "string", value: String(nextSequence), expiresAt: null });
+    record.scopeSequence = nextSequence;
+    delete record.encryptedEnvelope;
+    const stored = JSON.stringify(record);
+    this.values.set(recordKey, { kind: "string", value: stored, expiresAt: null });
+    this.values.set(envelopeKey, { kind: "string", value: serializedEnvelope, expiresAt: this.now() + envelopeTtl * 1_000 });
+    this.getZSet(readyKey, true).value.set(member, score);
+    return stored;
+  }
+
+  private evalStudioPersistOutbox(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 5, 8);
+    const recordKey = this.studioKey(keys, 0);
+    const outboxPayloadKey = this.studioKey(keys, 1);
+    const readyKey = this.studioKey(keys, 2);
+    const laneKey = this.studioKey(keys, 3);
+    const releaseFenceKey = this.studioKey(keys, 4);
+    const record = this.studioArgument(args, 0);
+    const outboxPayload = this.studioArgument(args, 1);
+    const outboxPayloadTtl = this.studioPositiveInteger(this.studioArgument(args, 2));
+    const score = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+    const member = this.studioArgument(args, 4);
+    const sequence = this.studioNonnegativeInteger(this.studioArgument(args, 5));
+    const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+    const releasePhase = this.studioArgument(args, 7);
+    if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") return -3;
+    this.assertStringOrMissing(recordKey);
+    this.assertStringOrMissing(outboxPayloadKey);
+    this.assertZSetOrMissing(readyKey);
+    this.assertZSetOrMissing(laneKey);
+    if (this.getEntry(recordKey)) return 0;
+    const release = this.studioReleasePersistenceStatus(
+      this.studioRecordFromJson(record),
+      releaseFenceKey,
+      releaseGeneration,
+      releasePhase,
+    );
+    if (release === -1) return -2;
+    if (release === 0) return -3;
+    const existingSequence = [...(this.getZSet(laneKey, false)?.value.entries() ?? [])]
+      .some(([, scoreAtSequence]) => scoreAtSequence === sequence);
+    if (existingSequence) return -1;
+    this.values.set(recordKey, { kind: "string", value: record, expiresAt: null });
+    this.values.set(outboxPayloadKey, { kind: "string", value: outboxPayload, expiresAt: this.now() + outboxPayloadTtl * 1_000 });
     this.getZSet(readyKey, true).value.set(member, score);
     this.getZSet(laneKey, true).value.set(member, sequence);
     return 1;
   }
 
   private evalStudioAdmitJob(keys: readonly string[], args: readonly string[]): readonly [string, string?] {
-    this.assertStudioArity(keys, args, 4, 8);
+    this.assertStudioArity(keys, args, 5, 8);
     const activeKey = this.studioKey(keys, 0);
     const userCountKey = this.studioKey(keys, 1);
     const spendKey = this.studioKey(keys, 2);
     const jobKey = this.studioKey(keys, 3);
+    const jobPayloadKey = this.studioKey(keys, 4);
     const jobId = this.studioArgument(args, 0);
-    const serializedJob = this.studioArgument(args, 1);
-    const dailyTtl = this.studioPositiveInteger(this.studioArgument(args, 2));
-    const jobTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
-    const userLimit = this.studioPositiveInteger(this.studioArgument(args, 4));
-    const spendCap = this.studioNonnegativeInteger(this.studioArgument(args, 5));
-    const cost = this.studioNonnegativeInteger(this.studioArgument(args, 6));
-    const activeTtl = this.studioPositiveInteger(this.studioArgument(args, 7));
+    const serializedMetadata = this.studioArgument(args, 1);
+    const serializedPayload = this.studioArgument(args, 2);
+    const dailyTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+    const payloadTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
+    const userLimit = this.studioPositiveInteger(this.studioArgument(args, 5));
+    const spendCap = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+    const cost = this.studioNonnegativeInteger(this.studioArgument(args, 7));
     this.assertStringOrMissing(activeKey);
     this.assertStringOrMissing(userCountKey);
     this.assertStringOrMissing(spendKey);
     this.assertStringOrMissing(jobKey);
+    this.assertStringOrMissing(jobPayloadKey);
 
     const existing = this.studioString(jobKey);
     if (existing !== null) return ["existing", existing];
+    if (this.getEntry(jobPayloadKey)) return ["storage_error"];
     if (this.studioString(activeKey) !== null) return ["active_job"];
     const userCount = this.studioCounter(userCountKey);
     if (userCount >= userLimit) return ["user_limit"];
@@ -1211,39 +1493,43 @@ export class MemoryRedis implements RedisLike {
     if (spend + cost > spendCap) return ["daily_cap"];
 
     const now = this.now();
-    this.values.set(activeKey, { kind: "string", value: jobId, expiresAt: now + activeTtl * 1_000 });
+    this.values.set(activeKey, { kind: "string", value: jobId, expiresAt: null });
     this.values.set(userCountKey, { kind: "string", value: String(userCount + 1), expiresAt: now + dailyTtl * 1_000 });
     this.values.set(spendKey, { kind: "string", value: String(spend + cost), expiresAt: now + dailyTtl * 1_000 });
-    this.values.set(jobKey, { kind: "string", value: serializedJob, expiresAt: now + jobTtl * 1_000 });
+    this.values.set(jobKey, { kind: "string", value: serializedMetadata, expiresAt: null });
+    this.values.set(jobPayloadKey, { kind: "string", value: serializedPayload, expiresAt: now + payloadTtl * 1_000 });
     return ["admitted"];
   }
 
   private evalStudioClaimInbox(keys: readonly string[], args: readonly string[]): string | false {
-    this.assertStudioArity(keys, args, 3, 5);
+    this.assertStudioArity(keys, args, 4, 4);
     const recordKey = this.studioKey(keys, 0);
-    const leaseKey = this.studioKey(keys, 1);
-    const readyKey = this.studioKey(keys, 2);
+    const envelopeKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const readyKey = this.studioKey(keys, 3);
     const token = this.studioArgument(args, 0);
     const leaseTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
-    const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
-    const member = this.studioArgument(args, 4);
+    const member = this.studioArgument(args, 3);
     const record = this.studioRecord(recordKey);
     if (!record || (record.state !== "received" && record.state !== "claimed")) return false;
     if (this.studioString(leaseKey) !== null) return false;
     this.studioSet(leaseKey, token, leaseTtl);
     record.state = "claimed";
     record.stateVersion = this.studioStateVersion(record) + 1;
-    this.studioSetRecord(recordKey, record, recordTtl);
+    this.studioSetPersistentRecord(recordKey, record);
     this.getZSet(readyKey, true).value.set(member, now + leaseTtl);
+    const envelope = this.studioString(envelopeKey);
+    if (envelope !== null) record.encryptedEnvelope = this.studioRecordFromJson(envelope);
     return JSON.stringify(record);
   }
 
   private evalStudioFinishInbox(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 3, 5);
+    this.assertStudioArity(keys, args, 4, 5);
     const recordKey = this.studioKey(keys, 0);
-    const leaseKey = this.studioKey(keys, 1);
-    const readyKey = this.studioKey(keys, 2);
+    const envelopeKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const readyKey = this.studioKey(keys, 3);
     const token = this.studioArgument(args, 0);
     const nextState = this.studioArgument(args, 1);
     const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
@@ -1254,17 +1540,22 @@ export class MemoryRedis implements RedisLike {
     if (!record || record.state !== "claimed") return 0;
     record.state = nextState;
     record.stateVersion = this.studioStateVersion(record) + 1;
+    // Mirror the production Lua terminal scrub: receipt metadata remains for
+    // idempotency, but the encrypted user envelope does not.
+    delete record.encryptedEnvelope;
     this.studioSetRecord(recordKey, record, recordTtl);
+    this.values.delete(envelopeKey);
     this.studioRemoveMember(readyKey, member);
     this.values.delete(leaseKey);
     return 1;
   }
 
   private evalStudioRetryInbox(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 3, 5);
+    this.assertStudioArity(keys, args, 4, 5);
     const recordKey = this.studioKey(keys, 0);
-    const leaseKey = this.studioKey(keys, 1);
-    const readyKey = this.studioKey(keys, 2);
+    const envelopeKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const readyKey = this.studioKey(keys, 3);
     const token = this.studioArgument(args, 0);
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
     const retryAfter = this.studioNonnegativeInteger(this.studioArgument(args, 2));
@@ -1273,26 +1564,42 @@ export class MemoryRedis implements RedisLike {
     if (this.studioString(leaseKey) !== token) return 0;
     const record = this.studioRecord(recordKey);
     if (!record || record.state !== "claimed") return 0;
+    if (this.studioString(envelopeKey) === null) {
+      record.state = "failed";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.studioRemoveMember(readyKey, member);
+      this.values.delete(leaseKey);
+      return 2;
+    }
     record.state = "received";
     record.stateVersion = this.studioStateVersion(record) + 1;
-    this.studioSetRecord(recordKey, record, recordTtl);
+    this.studioSetPersistentRecord(recordKey, record);
     this.getZSet(readyKey, true).value.set(member, now + retryAfter);
     this.values.delete(leaseKey);
     return 1;
   }
 
   private evalStudioClaimOutbox(keys: readonly string[], args: readonly string[]): string | false {
-    this.assertStudioArity(keys, args, 4, 6);
+    this.assertStudioArity(keys, args, 9, 8);
     const recordKey = this.studioKey(keys, 0);
-    const leaseKey = this.studioKey(keys, 1);
-    const readyKey = this.studioKey(keys, 2);
-    const laneKey = this.studioKey(keys, 3);
+    const outboxPayloadKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const readyKey = this.studioKey(keys, 3);
+    const laneKey = this.studioKey(keys, 4);
+    const controlKey = this.studioKey(keys, 5);
+    const payloadKey = this.studioKey(keys, 6);
+    const scopeCounterKey = this.studioKey(keys, 7);
+    const releaseFenceKey = this.studioKey(keys, 8);
     const token = this.studioArgument(args, 0);
     const leaseTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
     const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
     const member = this.studioArgument(args, 4);
     const maxAttempts = this.studioPositiveInteger(this.studioArgument(args, 5));
+    const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+    const releasePhase = this.studioArgument(args, 7);
+    if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") return false;
     const record = this.studioRecord(recordKey);
     if (!record || (record.state !== "intent" && record.state !== "retryable_failure")) return false;
     const laneHead = [...(this.getZSet(laneKey, false)?.value.entries() ?? [])]
@@ -1300,12 +1607,45 @@ export class MemoryRedis implements RedisLike {
         firstSequence === secondSequence ? firstMember.localeCompare(secondMember) : firstSequence - secondSequence,
       )[0];
     if (!laneHead || laneHead[0] !== member) return false;
+    const release = this.studioReleaseDispatchStatus(record, releaseFenceKey, releaseGeneration, releasePhase);
+    if (release === 0) return false;
+    if (release === -1) {
+      record.state = "canceled";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.values.delete(outboxPayloadKey);
+      this.studioRemoveMember(readyKey, member);
+      this.studioRemoveMember(laneKey, member);
+      return false;
+    }
+    const outboxPayload = this.studioString(outboxPayloadKey);
+    if (outboxPayload === null) {
+      record.state = "failed";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.studioRemoveMember(readyKey, member);
+      this.studioRemoveMember(laneKey, member);
+      return false;
+    }
+    if (!this.studioPendingGuardIsLive(record, controlKey, payloadKey, scopeCounterKey, now)) {
+      record.state = "canceled";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.values.delete(outboxPayloadKey);
+      this.studioRemoveMember(readyKey, member);
+      this.studioRemoveMember(laneKey, member);
+      return false;
+    }
     const attempts = this.studioAttempts(record);
     if (record.state === "retryable_failure" && attempts >= maxAttempts) {
       record.state = "failed";
       record.stateVersion = this.studioStateVersion(record) + 1;
       record.updatedAtMs = now;
       this.studioSetRecord(recordKey, record, recordTtl);
+      this.values.delete(outboxPayloadKey);
       this.studioRemoveMember(readyKey, member);
       this.studioRemoveMember(laneKey, member);
       return false;
@@ -1316,17 +1656,87 @@ export class MemoryRedis implements RedisLike {
     record.attempts = attempts + 1;
     record.stateVersion = this.studioStateVersion(record) + 1;
     record.updatedAtMs = now;
-    this.studioSetRecord(recordKey, record, recordTtl);
+    this.studioSetPersistentRecord(recordKey, record);
     this.getZSet(readyKey, true).value.set(member, now + leaseTtl);
+    record.encryptedPayload = this.studioRecordFromJson(outboxPayload);
     return JSON.stringify(record);
   }
 
-  private evalStudioFinishOutbox(keys: readonly string[], args: readonly string[]): string | false {
-    this.assertStudioArity(keys, args, 4, 7);
+  private evalStudioAuthorizeOutboxDelivery(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 9, 7);
     const recordKey = this.studioKey(keys, 0);
-    const leaseKey = this.studioKey(keys, 1);
-    const readyKey = this.studioKey(keys, 2);
-    const laneKey = this.studioKey(keys, 3);
+    const outboxPayloadKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const readyKey = this.studioKey(keys, 3);
+    const laneKey = this.studioKey(keys, 4);
+    const controlKey = this.studioKey(keys, 5);
+    const payloadKey = this.studioKey(keys, 6);
+    const scopeCounterKey = this.studioKey(keys, 7);
+    const releaseFenceKey = this.studioKey(keys, 8);
+    const token = this.studioArgument(args, 0);
+    const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
+    const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 2));
+    const member = this.studioArgument(args, 3);
+    const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 4));
+    const releasePhase = this.studioArgument(args, 5);
+    const backoff = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+    if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") return 0;
+    if (this.studioString(leaseKey) !== token) return 0;
+    const record = this.studioRecord(recordKey);
+    if (!record || record.state !== "sending") return 0;
+    const release = this.studioReleaseDispatchStatus(record, releaseFenceKey, releaseGeneration, releasePhase);
+    if (release === 0) {
+      record.state = "intent";
+      record.attempts = Math.max(0, this.studioAttempts(record) - 1);
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetPersistentRecord(recordKey, record);
+      this.values.delete(leaseKey);
+      this.getZSet(readyKey, true).value.set(member, now + backoff);
+      return 0;
+    }
+    if (release === -1) {
+      record.state = "canceled";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.values.delete(outboxPayloadKey);
+      this.values.delete(leaseKey);
+      this.studioRemoveMember(readyKey, member);
+      this.studioRemoveMember(laneKey, member);
+      return 0;
+    }
+    if (this.studioString(outboxPayloadKey) === null) {
+      record.state = "failed";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.values.delete(leaseKey);
+      this.studioRemoveMember(readyKey, member);
+      this.studioRemoveMember(laneKey, member);
+      return 0;
+    }
+    if (!this.studioPendingGuardIsLive(record, controlKey, payloadKey, scopeCounterKey, now)) {
+      record.state = "canceled";
+      record.stateVersion = this.studioStateVersion(record) + 1;
+      record.updatedAtMs = now;
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.values.delete(outboxPayloadKey);
+      this.values.delete(leaseKey);
+      this.studioRemoveMember(readyKey, member);
+      this.studioRemoveMember(laneKey, member);
+      return 0;
+    }
+    return 1;
+  }
+
+  private evalStudioFinishOutbox(keys: readonly string[], args: readonly string[]): string | false {
+    this.assertStudioArity(keys, args, 5, 7);
+    const recordKey = this.studioKey(keys, 0);
+    const outboxPayloadKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const readyKey = this.studioKey(keys, 3);
+    const laneKey = this.studioKey(keys, 4);
     const token = this.studioArgument(args, 0);
     let nextState = this.studioArgument(args, 1);
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
@@ -1343,7 +1753,12 @@ export class MemoryRedis implements RedisLike {
     record.state = nextState;
     record.stateVersion = this.studioStateVersion(record) + 1;
     record.updatedAtMs = now;
-    this.studioSetRecord(recordKey, record, recordTtl);
+    if (nextState === "sent" || nextState === "failed") {
+      this.studioSetRecord(recordKey, record, recordTtl);
+      this.values.delete(outboxPayloadKey);
+    } else {
+      this.studioSetPersistentRecord(recordKey, record);
+    }
     this.values.delete(leaseKey);
     if (nextState === "retryable_failure") {
       this.getZSet(readyKey, true).value.set(member, now + attempts * backoff);
@@ -1355,10 +1770,11 @@ export class MemoryRedis implements RedisLike {
   }
 
   private evalStudioReconcileExpiredOutbox(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 4, 3);
+    this.assertStudioArity(keys, args, 5, 3);
     const recordKey = this.studioKey(keys, 0);
-    const leaseKey = this.studioKey(keys, 1);
-    const readyKey = this.studioKey(keys, 2);
+    const _outboxPayloadKey = this.studioKey(keys, 1);
+    const leaseKey = this.studioKey(keys, 2);
+    const readyKey = this.studioKey(keys, 3);
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 0));
     const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
     const member = this.studioArgument(args, 2);
@@ -1368,15 +1784,16 @@ export class MemoryRedis implements RedisLike {
     record.state = "send_unknown";
     record.stateVersion = this.studioStateVersion(record) + 1;
     record.updatedAtMs = now;
-    this.studioSetRecord(recordKey, record, recordTtl);
+    this.studioSetPersistentRecord(recordKey, record);
     this.studioRemoveMember(readyKey, member);
     return 1;
   }
 
   private evalStudioTransitionJob(keys: readonly string[], args: readonly string[]): string | false {
-    this.assertStudioArity(keys, args, 2, 7);
+    this.assertStudioArity(keys, args, 3, 7);
     const jobKey = this.studioKey(keys, 0);
-    const activeKey = this.studioKey(keys, 1);
+    const jobPayloadKey = this.studioKey(keys, 1);
+    const activeKey = this.studioKey(keys, 2);
     const from = this.studioArgument(args, 0);
     const expectedVersion = this.studioPositiveInteger(this.studioArgument(args, 1));
     const to = this.studioArgument(args, 2);
@@ -1389,8 +1806,14 @@ export class MemoryRedis implements RedisLike {
     record.state = to;
     record.stateVersion = expectedVersion + 1;
     record.updatedAtMs = now;
-    this.studioSetRecord(jobKey, record, ttl);
-    if (terminal === "1" && this.studioString(activeKey) === jobId) this.values.delete(activeKey);
+    delete record.encryptedPayload;
+    if (terminal === "1") {
+      this.studioSetRecord(jobKey, record, ttl);
+      this.values.delete(jobPayloadKey);
+      if (this.studioString(activeKey) === jobId) this.values.delete(activeKey);
+    } else {
+      this.studioSetPersistentRecord(jobKey, record);
+    }
     return JSON.stringify(record);
   }
 
@@ -1440,6 +1863,10 @@ export class MemoryRedis implements RedisLike {
   private studioRecord(key: string): Record<string, unknown> | null {
     const raw = this.studioString(key);
     if (raw === null) return null;
+    return this.studioRecordFromJson(raw);
+  }
+
+  private studioRecordFromJson(raw: string): Record<string, unknown> {
     try {
       const parsed: unknown = JSON.parse(raw);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid studio record");
@@ -1447,6 +1874,176 @@ export class MemoryRedis implements RedisLike {
     } catch {
       throw new Error("invalid studio record");
     }
+  }
+
+  private studioReleaseFence(key: string): MemoryStudioReleaseFence | "invalid" | null {
+    const raw = this.studioString(key);
+    if (raw === null) return null;
+    let record: Record<string, unknown>;
+    try {
+      record = this.studioRecordFromJson(raw);
+    } catch {
+      // Fence corruption must be an operationally unavailable state, never a
+      // test-only exception that hides the deployed fail-closed behavior.
+      return "invalid";
+    }
+    const generation = record.generation;
+    const phase = record.phase;
+    if (
+      record.schemaVersion !== 1
+      || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0
+      || (phase !== "dark" && phase !== "canary" && phase !== "production")
+    ) return "invalid";
+    return { schemaVersion: 1, generation, phase };
+  }
+
+  /** -1 known stale/malformed, 0 unavailable/corrupt, 1 exact current. */
+  private studioReleaseDispatchStatus(
+    record: Record<string, unknown>,
+    fenceKey: string,
+    expectedGeneration: number,
+    expectedPhase: MemoryStudioReleaseFence["phase"],
+  ): -1 | 0 | 1 {
+    const stamp = record.releaseStamp;
+    if (!stamp || typeof stamp !== "object" || Array.isArray(stamp)) return -1;
+    const candidate = stamp as Record<string, unknown>;
+    if (candidate.generation !== expectedGeneration || candidate.phase !== expectedPhase) return -1;
+    const fence = this.studioReleaseFence(fenceKey);
+    if (fence === null) return expectedPhase === "dark" ? 1 : 0;
+    if (fence === "invalid") return 0;
+    return fence.generation === expectedGeneration && fence.phase === expectedPhase ? 1 : -1;
+  }
+
+  /** -1 known mismatch, 0 unavailable, 1 allowed (unarmed dark baseline). */
+  private studioReleasePersistenceStatus(
+    record: Record<string, unknown>,
+    fenceKey: string,
+    expectedGeneration: number,
+    expectedPhase: MemoryStudioReleaseFence["phase"],
+  ): -1 | 0 | 1 {
+    const stamp = record.releaseStamp;
+    if (!stamp || typeof stamp !== "object" || Array.isArray(stamp)) return -1;
+    const candidate = stamp as Record<string, unknown>;
+    if (candidate.generation !== expectedGeneration || candidate.phase !== expectedPhase) return -1;
+    const fence = this.studioReleaseFence(fenceKey);
+    if (fence === "invalid") return 0;
+    if (fence === null) return expectedPhase === "dark" ? 1 : 0;
+    return fence.generation === expectedGeneration && fence.phase === expectedPhase ? 1 : -1;
+  }
+
+  private studioPendingControl(key: string): MemoryStudioPendingControl | "invalid" | null {
+    const record = this.studioRecord(key);
+    if (record === null) return null;
+    const state = record.state;
+    const receiptId = record.receiptId;
+    const scopeSequence = record.scopeSequence;
+    const revision = record.revision;
+    const token = record.token;
+    const expiresAtMs = record.expiresAtMs;
+    if (
+      record.schemaVersion !== 1
+      || (state !== "active" && state !== "cleared" && state !== "maintenance" && state !== "expired")
+      || typeof receiptId !== "string" || receiptId.length < 1
+      || typeof scopeSequence !== "number" || !Number.isSafeInteger(scopeSequence) || scopeSequence < 1
+      || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1
+    ) return "invalid";
+    if (state === "active") {
+      if (
+        typeof token !== "string" || token.length < 1
+        || typeof expiresAtMs !== "number" || !Number.isSafeInteger(expiresAtMs) || expiresAtMs < 1
+      ) return "invalid";
+      return { schemaVersion: 1, state, receiptId, scopeSequence, revision, token, expiresAtMs };
+    }
+    if (
+      token !== undefined
+      || (expiresAtMs !== undefined && (typeof expiresAtMs !== "number" || !Number.isSafeInteger(expiresAtMs) || expiresAtMs < 1))
+    ) return "invalid";
+    return {
+      schemaVersion: 1,
+      state,
+      receiptId,
+      scopeSequence,
+      revision,
+      ...(expiresAtMs === undefined ? {} : { expiresAtMs }),
+    };
+  }
+
+  private studioSetPendingControl(key: string, control: MemoryStudioPendingControl): void {
+    this.assertStringOrMissing(key);
+    this.values.set(key, { kind: "string", value: JSON.stringify(control), expiresAt: null });
+  }
+
+  private studioExpirePendingControl(
+    payloadKey: string,
+    controlKey: string,
+    control: MemoryStudioPendingControl,
+  ): MemoryStudioPendingControl {
+    const expired: MemoryStudioPendingControl = {
+      schemaVersion: 1,
+      state: "expired",
+      receiptId: control.receiptId,
+      scopeSequence: control.scopeSequence,
+      revision: control.revision,
+      ...(control.expiresAtMs === undefined ? {} : { expiresAtMs: control.expiresAtMs }),
+    };
+    this.values.delete(payloadKey);
+    this.studioSetPendingControl(controlKey, expired);
+    return expired;
+  }
+
+  private studioPendingOutcome(state: MemoryStudioPendingState): -1 | -2 | -3 | -4 {
+    switch (state) {
+      case "active": return -1;
+      case "maintenance": return -2;
+      case "cleared": return -3;
+      case "expired": return -4;
+    }
+  }
+
+  private studioPendingGuard(record: Record<string, unknown>): MemoryStudioPendingGuard | "invalid" | null {
+    if (!("pendingGuard" in record)) return null;
+    const value = record.pendingGuard;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return "invalid";
+    const candidate = value as Record<string, unknown>;
+    const threadHash = candidate.threadHash;
+    const receiptId = candidate.receiptId;
+    const scopeSequence = candidate.scopeSequence;
+    const revision = candidate.revision;
+    const token = candidate.token;
+    const expiresAtMs = candidate.expiresAtMs;
+    if (
+      typeof threadHash !== "string" || threadHash.length < 1
+      || typeof receiptId !== "string" || receiptId.length < 1
+      || typeof scopeSequence !== "number" || !Number.isSafeInteger(scopeSequence) || scopeSequence < 1
+      || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1
+      || typeof token !== "string" || token.length < 1
+      || typeof expiresAtMs !== "number" || !Number.isSafeInteger(expiresAtMs) || expiresAtMs < 1
+    ) return "invalid";
+    return { threadHash, receiptId, scopeSequence, revision, token, expiresAtMs };
+  }
+
+  private studioPendingGuardIsLive(
+    record: Record<string, unknown>,
+    controlKey: string,
+    payloadKey: string,
+    scopeCounterKey: string,
+    now: number,
+  ): boolean {
+    const guard = this.studioPendingGuard(record);
+    if (guard === null) return true;
+    if (guard === "invalid") return false;
+    if (this.studioCounter(scopeCounterKey) !== guard.scopeSequence) return false;
+    const control = this.studioPendingControl(controlKey);
+    if (control === null || control === "invalid" || control.state !== "active") return false;
+    if (control.expiresAtMs === undefined || control.expiresAtMs <= now || this.studioString(payloadKey) === null) {
+      this.studioExpirePendingControl(payloadKey, controlKey, control);
+      return false;
+    }
+    return control.receiptId === guard.receiptId
+      && control.scopeSequence === guard.scopeSequence
+      && control.revision === guard.revision
+      && control.token === guard.token
+      && control.expiresAtMs === guard.expiresAtMs;
   }
 
   private studioSet(key: string, value: string, ttlMs: number): void {
@@ -1457,6 +2054,11 @@ export class MemoryRedis implements RedisLike {
 
   private studioSetRecord(key: string, record: Record<string, unknown>, ttlSeconds: number): void {
     this.studioSet(key, JSON.stringify(record), ttlSeconds * 1_000);
+  }
+
+  private studioSetPersistentRecord(key: string, record: Record<string, unknown>): void {
+    this.assertStringOrMissing(key);
+    this.values.set(key, { kind: "string", value: JSON.stringify(record), expiresAt: null });
   }
 
   private studioStateVersion(record: Record<string, unknown>): number {

@@ -27,10 +27,25 @@ export const STUDIO_OUTBOX_STATES = Object.freeze([
   "sent",
   "retryable_failure",
   "failed",
+  "canceled",
   "send_unknown",
   "confirmed_absent",
 ] as const);
 export type StudioOutboxState = (typeof STUDIO_OUTBOX_STATES)[number];
+
+/** An opaque deployment capability, advanced only by the protected operator route. */
+export type StudioReleasePhase = "dark" | "canary" | "production";
+
+export interface StudioReleaseStamp {
+  readonly generation: number;
+  readonly phase: StudioReleasePhase;
+}
+
+export type StudioReleaseFenceAdvanceResult =
+  | { readonly kind: "advanced" }
+  | { readonly kind: "current" }
+  | { readonly kind: "conflict" }
+  | { readonly kind: "invalid" };
 
 /**
  * A delivery attempt is only retried when the worker has established that no
@@ -49,8 +64,6 @@ export interface StudioAttachmentReference {
 export interface StudioInboundEnvelope {
   readonly chatGuid: string;
   readonly sendingLine: string;
-  readonly senderIdentifier: string;
-  readonly messageId: string;
   readonly text: string | null;
   readonly attachments: readonly StudioAttachmentReference[];
   readonly replyTargetId?: string | undefined;
@@ -61,10 +74,16 @@ export interface StudioInboxRecord {
   readonly receiptId: string;
   readonly senderHash: SenderHash;
   readonly threadHash: ThreadHash;
+  /**
+   * Monotonic durable receipt order for one `{project, sender, chat, line}`
+   * scope. It is allocated at ingress, never inferred from wall-clock time.
+   */
+  readonly scopeSequence: number;
   readonly receivedAtMs: number;
   readonly state: "received" | "claimed" | "processed" | "maintenance_rejected" | "failed";
   readonly stateVersion: number;
-  readonly encryptedEnvelope: EncryptedPayload;
+  /** Scrubbed atomically as soon as the receipt reaches a terminal state. */
+  readonly encryptedEnvelope?: EncryptedPayload | undefined;
 }
 
 export interface StudioJobPayload {
@@ -76,7 +95,7 @@ export interface StudioJobPayload {
 }
 
 export interface StudioJobRecord {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly jobId: string;
   readonly senderHash: SenderHash;
   readonly threadHash: ThreadHash;
@@ -90,8 +109,14 @@ export interface StudioJobRecord {
   readonly stateVersion: number;
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
-  readonly encryptedPayload: EncryptedPayload;
+  /** Hydrated only while its separately stored 24-hour payload remains available. */
+  readonly encryptedPayload?: EncryptedPayload | undefined;
 }
+
+/** New job admission always needs an encrypted snapshot to publish atomically. */
+export type StudioJobRecordWithPayload = StudioJobRecord & {
+  readonly encryptedPayload: EncryptedPayload;
+};
 
 export interface StudioOutboxPayload {
   readonly kind: "text" | "attachment" | "tapback";
@@ -107,7 +132,7 @@ export interface StudioOutboxPayload {
 }
 
 export interface StudioOutboxRecord {
-  readonly schemaVersion: 2;
+  readonly schemaVersion: 3;
   readonly outboxId: string;
   readonly jobId?: string | undefined;
   readonly senderHash: SenderHash;
@@ -116,10 +141,85 @@ export interface StudioOutboxRecord {
   readonly state: StudioOutboxState;
   readonly attempts: number;
   readonly stateVersion: number;
-  readonly encryptedPayload: EncryptedPayload;
+  /** Every user-visible intent is bound to one shared release generation. */
+  readonly releaseStamp: StudioReleaseStamp;
+  /**
+   * Present only for a media-first acknowledgement. The random guard ties the
+   * acknowledgement to the still-live pending intent so maintenance can
+   * revoke it before delivery without retaining any user content.
+   */
+  readonly pendingGuard?: PendingWriteGuard | undefined;
+  /**
+   * Present only while the encrypted delivery payload remains inside its
+   * immutable 24-hour privacy lifetime. Terminal/reconciliation metadata
+   * deliberately outlives this short-lived reference.
+   */
+  readonly encryptedPayload?: EncryptedPayload | undefined;
   readonly createdAtMs: number;
+  /** Durable not-before time. Media-first corrections use this for debounce. */
+  readonly dueAtMs: number;
   readonly updatedAtMs: number;
 }
+
+/** Opaque capability bound to one pending-assembly fencing transition. */
+export interface PendingWriteGuard {
+  readonly threadHash: ThreadHash;
+  readonly receiptId: string;
+  readonly scopeSequence: number;
+  readonly revision: number;
+  readonly token: string;
+  readonly expiresAtMs: number;
+}
+
+export type PendingWriteResult =
+  | { readonly kind: "active"; readonly guard: PendingWriteGuard }
+  | { readonly kind: "superseded" }
+  | { readonly kind: "maintenance" }
+  | { readonly kind: "cleared" }
+  | { readonly kind: "expired" }
+  | { readonly kind: "unavailable" };
+
+export type PendingFenceResult =
+  | { readonly kind: "canceled" }
+  | { readonly kind: "empty" }
+  | { readonly kind: "stale" };
+
+export type PendingGuardedOutboxResult =
+  | { readonly kind: "persisted"; readonly record: StudioOutboxRecord }
+  | { readonly kind: "maintenance" }
+  | { readonly kind: "superseded" }
+  | { readonly kind: "cleared" }
+  | { readonly kind: "expired" }
+  | { readonly kind: "unavailable" };
+
+type PendingControlState = "active" | "cleared" | "maintenance" | "expired";
+
+/**
+ * Deliberately unencrypted: every value is an opaque HMAC-derived ID or a
+ * monotonic counter. The encrypted payload remains the only pending record
+ * containing an attachment reference or user content.
+ */
+interface PendingControl {
+  readonly schemaVersion: 1;
+  readonly state: PendingControlState;
+  readonly receiptId: string;
+  readonly scopeSequence: number;
+  readonly revision: number;
+  readonly token?: string | undefined;
+  readonly expiresAtMs?: number | undefined;
+}
+
+type CreateStudioOutboxInput = Omit<StudioOutboxRecord,
+  "schemaVersion" | "releaseStamp" | "encryptedPayload" | "createdAtMs" | "dueAtMs" | "updatedAtMs" | "stateVersion" | "state" | "attempts" | "pendingGuard"
+> & {
+  readonly payload: StudioOutboxPayload;
+  /** Defaults to immediate dispatch; media-first corrections set a durable debounce. */
+  readonly dueAtMs?: number | undefined;
+  /** Accepted for backward-compatible callers, but always normalized to v3. */
+  readonly schemaVersion?: 3 | undefined;
+  readonly state?: "intent" | undefined;
+  readonly attempts?: 0 | undefined;
+};
 
 export type AdmissionResult =
   | { readonly admitted: true; readonly job: StudioJobRecord }
@@ -131,10 +231,12 @@ export interface StudioStoreOptions {
   readonly identityHashSecret: string;
   readonly prefix?: string | undefined;
   readonly clock?: (() => number) | undefined;
+  /** Defaults only to the non-delivering dark baseline. */
+  readonly releaseStamp?: StudioReleaseStamp | undefined;
 }
 
 export interface AdmitStudioJobInput {
-  readonly job: StudioJobRecord;
+  readonly job: StudioJobRecordWithPayload;
   readonly activeJobLimit: number;
   readonly dailyUserJobLimit: number;
   readonly perJobCapCents: number;
@@ -151,10 +253,17 @@ export const STUDIO_CRON_FRESHNESS_MS = 3 * 60 * 1_000;
 export type StudioCronFreshness = "fresh" | "stale" | "missing" | "invalid";
 export type StudioCronHeartbeatScope = "development" | "preview" | "production";
 
-const INBOX_TTL_SECONDS = 7 * 24 * 60 * 60;
-const JOB_TTL_SECONDS = 7 * 24 * 60 * 60;
+/** Terminal metadata is retained for idempotency/audit after terminalization. */
+const TERMINAL_METADATA_TTL_SECONDS = 7 * 24 * 60 * 60;
+const INBOX_TTL_SECONDS = TERMINAL_METADATA_TTL_SECONDS;
+/** Encrypted inbound content may include media references and never outlives one day. */
+const INBOX_ENVELOPE_TTL_SECONDS = 24 * 60 * 60;
+/** Prompts, media references, and thread data in a job payload never outlive one day. */
+const JOB_PAYLOAD_TTL_SECONDS = 24 * 60 * 60;
+const OUTBOX_PAYLOAD_TTL_SECONDS = 24 * 60 * 60;
 const SETTINGS_TTL_SECONDS = 90 * 24 * 60 * 60;
 const PENDING_TTL_SECONDS = 10 * 60;
+const PENDING_TTL_MS = PENDING_TTL_SECONDS * 1_000;
 const LEASE_TTL_MS = 90_000;
 const MAX_INBOX_RETRY_DELAY_MS = 24 * 60 * 60 * 1_000;
 const OUTBOX_RETRY_BACKOFF_MS = 30_000;
@@ -170,6 +279,7 @@ export class StudioStore {
   private readonly secret: string;
   private readonly prefix: string;
   private readonly now: () => number;
+  private readonly releaseStamp: StudioReleaseStamp;
 
   public constructor(options: StudioStoreOptions) {
     if (!options.identityHashSecret.trim()) throw new Error("identity hash secret is required");
@@ -178,6 +288,7 @@ export class StudioStore {
     this.secret = options.identityHashSecret;
     this.prefix = options.prefix ?? STUDIO_REDIS_PREFIX;
     this.now = options.clock ?? Date.now;
+    this.releaseStamp = normalizeReleaseStamp(options.releaseStamp ?? { generation: 0, phase: "dark" });
   }
 
   public receiptId(projectId: string, messageId: string): string {
@@ -216,6 +327,24 @@ export class StudioStore {
     return now - recordedAtMs <= maxAgeMs ? "fresh" : "stale";
   }
 
+  /**
+   * Explicitly advances the non-expiring shared release generation. Runtime
+   * construction and drains never call this: deployment is not activation.
+   */
+  public async advanceReleaseFence(previousGeneration: number): Promise<StudioReleaseFenceAdvanceResult> {
+    if (!Number.isSafeInteger(previousGeneration) || previousGeneration < -1) {
+      return Object.freeze({ kind: "invalid" });
+    }
+    const result = await this.redis.eval(ADVANCE_RELEASE_FENCE_LUA, {
+      keys: [this.releaseFenceKey()],
+      arguments: [String(previousGeneration), String(this.releaseStamp.generation), this.releaseStamp.phase],
+    });
+    if (result === 1 || result === "1") return Object.freeze({ kind: "advanced" });
+    if (result === 2 || result === "2") return Object.freeze({ kind: "current" });
+    if (result === -1 || result === "-1") return Object.freeze({ kind: "conflict" });
+    return Object.freeze({ kind: "invalid" });
+  }
+
   public async persistInbox(input: {
     readonly receiptId: string;
     readonly senderHash: SenderHash;
@@ -223,29 +352,41 @@ export class StudioStore {
     readonly envelope: StudioInboundEnvelope;
   }): Promise<{ readonly created: boolean; readonly record: StudioInboxRecord }> {
     const now = this.now();
-    const record: StudioInboxRecord = Object.freeze({
+    const encryptedEnvelope = this.cipher.encrypt(input.envelope, `inbox:${input.receiptId}`);
+    // Metadata deliberately never embeds user content. It remains durable
+    // while recovery is outstanding; the separately stored encrypted envelope
+    // has an immutable 24-hour privacy lifetime.
+    const metadata: StudioInboxRecord = Object.freeze({
       schemaVersion: 2,
       receiptId: input.receiptId,
       senderHash: input.senderHash,
       threadHash: input.threadHash,
+      // The Lua publication primitive assigns the durable source sequence
+      // atomically with dedupe and queue publication.
+      scopeSequence: 0,
       receivedAtMs: now,
       state: "received",
       stateVersion: 1,
-      encryptedEnvelope: this.cipher.encrypt(input.envelope, `inbox:${input.receiptId}`),
     });
+    const record = Object.freeze({ ...metadata, encryptedEnvelope });
     const key = this.inboxKey(input.receiptId);
     // Receipt + ready index must commit together. A separate SET followed by
     // ZADD could acknowledge a webhook and strand work after a crash.
     const result = await this.redis.eval(PERSIST_INBOX_LUA, {
-      keys: [key, this.readyInboxKey()],
-      arguments: [JSON.stringify(record), String(INBOX_TTL_SECONDS), String(now), input.receiptId],
+      keys: [key, this.inboxEnvelopeKey(input.receiptId), this.readyInboxKey(), this.inboxScopeSequenceKey(input.senderHash, input.threadHash)],
+      arguments: [JSON.stringify(metadata), JSON.stringify(encryptedEnvelope), String(INBOX_ENVELOPE_TTL_SECONDS), String(now), input.receiptId],
     });
-    if (result === 1 || result === "1") {
-      return Object.freeze({ created: true, record });
+    const persisted = parseStored<StudioInboxRecord>(typeof result === "string" ? result : null);
+    if (persisted && persisted.receiptId === input.receiptId && isPositiveSafeInteger(persisted.scopeSequence)) {
+      return Object.freeze({ created: true, record: Object.freeze({ ...persisted, encryptedEnvelope }) });
     }
-    const existing = await this.readInbox(input.receiptId);
-    if (!existing) throw new Error("durable inbox publication could not be confirmed");
-    return Object.freeze({ created: false, record: existing });
+    if (result === 0 || result === "0") {
+      const existing = await this.readInbox(input.receiptId);
+      if (existing && isPositiveSafeInteger(existing.scopeSequence)) {
+        return Object.freeze({ created: false, record: existing });
+      }
+    }
+    throw new Error("durable inbox publication could not be confirmed");
   }
 
   public async readInbox(receiptId: string): Promise<StudioInboxRecord | null> {
@@ -253,6 +394,7 @@ export class StudioStore {
   }
 
   public decryptInboxEnvelope(record: StudioInboxRecord): StudioInboundEnvelope {
+    if (!record.encryptedEnvelope) throw new Error("inbox envelope is unavailable");
     return this.cipher.decrypt<StudioInboundEnvelope>(record.encryptedEnvelope, `inbox:${record.receiptId}`);
   }
 
@@ -277,7 +419,7 @@ export class StudioStore {
 
   public async finishInbox(receiptId: string, leaseToken: string, state: "processed" | "maintenance_rejected" | "failed"): Promise<boolean> {
     const result = await this.redis.eval(FINISH_INBOX_LUA, {
-      keys: [this.inboxKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
+      keys: [this.inboxKey(receiptId), this.inboxEnvelopeKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
       arguments: [leaseToken, state, String(this.now()), String(INBOX_TTL_SECONDS), receiptId],
     });
     return result === 1 || result === "1";
@@ -293,7 +435,7 @@ export class StudioStore {
       throw new Error("inbox retry delay is invalid");
     }
     const result = await this.redis.eval(RETRY_INBOX_LUA, {
-      keys: [this.inboxKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
+      keys: [this.inboxKey(receiptId), this.inboxEnvelopeKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
       arguments: [leaseToken, String(this.now()), String(retryAfterMs), String(INBOX_TTL_SECONDS), receiptId],
     });
     return result === 1 || result === "1";
@@ -330,18 +472,116 @@ export class StudioStore {
   }
 
   public async getPending<T>(senderHash: SenderHash, threadHash: ThreadHash): Promise<T | null> {
-    const key = this.pendingKey(senderHash, threadHash);
-    const encrypted = parseStored<EncryptedPayload>(await this.redis.get(key));
+    // Read control and encrypted payload in one primitive. Two independent
+    // GETs could pair an older control record with a newer payload after an
+    // adjacent inbound receipt replaced the pending assembly.
+    const result = await this.redis.eval(READ_PENDING_LUA, {
+      keys: [this.pendingKey(senderHash, threadHash), this.pendingControlKey(senderHash, threadHash)],
+      arguments: [String(this.now())],
+    });
+    const encrypted = parseStored<EncryptedPayload>(typeof result === "string" ? result : null);
     return encrypted ? this.cipher.decrypt<T>(encrypted, `pending:${senderHash}:${threadHash}`) : null;
   }
 
-  public async putPending<T>(senderHash: SenderHash, threadHash: ThreadHash, value: T): Promise<void> {
-    const encrypted = this.cipher.encrypt(value, `pending:${senderHash}:${threadHash}`);
-    await this.redis.set(this.pendingKey(senderHash, threadHash), JSON.stringify(encrypted), { ex: PENDING_TTL_SECONDS });
+  public async putPending<T>(record: StudioInboxRecord, value: T): Promise<boolean> {
+    return (await this.putPendingWithGuard(record, value)).kind === "active";
   }
 
-  public async clearPending(senderHash: SenderHash, threadHash: ThreadHash): Promise<void> {
-    await this.redis.del(this.pendingKey(senderHash, threadHash));
+  /**
+   * Writes a pending intent alongside an opaque, short-lived guard. Only the
+   * media-first acknowledgement needs the guard, but every pending write gets
+   * one so a later overwrite or clear revokes any older acknowledgement.
+   */
+  public async putPendingWithGuard<T>(
+    record: StudioInboxRecord,
+    value: T,
+  ): Promise<PendingWriteResult> {
+    assertPendingSource(record);
+    const expiresAtMs = record.receivedAtMs + PENDING_TTL_MS;
+    if (!Number.isSafeInteger(expiresAtMs)) throw new Error("pending expiry is invalid");
+    const encrypted = this.cipher.encrypt(value, `pending:${record.senderHash}:${record.threadHash}`);
+    // The guard is derived solely from the durable source receipt. A crash
+    // retry sees the same capability and therefore cannot extend retention or
+    // revoke its own acknowledgement.
+    const token = deriveOpaqueId(
+      this.secret,
+      "studio-pending-guard",
+      `${record.senderHash}\u0000${record.threadHash}\u0000${record.receiptId}\u0000${record.scopeSequence}`,
+    );
+    const result = await this.redis.eval(PERSIST_PENDING_LUA, {
+      keys: [
+        this.pendingKey(record.senderHash, record.threadHash),
+        this.pendingControlKey(record.senderHash, record.threadHash),
+      ],
+      arguments: [
+        JSON.stringify(encrypted),
+        record.receiptId,
+        String(record.scopeSequence),
+        String(expiresAtMs),
+        token,
+        String(this.now()),
+      ],
+    });
+    if (result === 1 || result === "1" || result === 2 || result === "2") {
+      // The Lua control record increments revision only for a newer durable
+      // source. On idempotent retry it returns the already-stored revision.
+      const control = await this.readPendingControl(record.senderHash, record.threadHash);
+      if (
+        control?.state === "active"
+        && control.receiptId === record.receiptId
+        && control.scopeSequence === record.scopeSequence
+        && control.token === token
+        && control.expiresAtMs === expiresAtMs
+      ) {
+        return Object.freeze({
+          kind: "active",
+          guard: Object.freeze({
+            threadHash: record.threadHash,
+            receiptId: record.receiptId,
+            scopeSequence: record.scopeSequence,
+            revision: control.revision,
+            token,
+            expiresAtMs,
+          }),
+        });
+      }
+      return Object.freeze({ kind: "unavailable" });
+    }
+    if (result === -1 || result === "-1") return Object.freeze({ kind: "superseded" });
+    if (result === -2 || result === "-2") return Object.freeze({ kind: "maintenance" });
+    if (result === -3 || result === "-3") return Object.freeze({ kind: "cleared" });
+    if (result === -4 || result === "-4") return Object.freeze({ kind: "expired" });
+    return Object.freeze({ kind: "unavailable" });
+  }
+
+  public async clearPending(record: StudioInboxRecord): Promise<PendingFenceResult> {
+    return this.fencePending(record, "cleared");
+  }
+
+  /**
+   * Dark/rollback handling atomically removes pending media and advances the
+   * durable scope fence. A stale active-phase worker cannot repopulate the
+   * intent after a maintenance receipt has cleared it.
+   */
+  public async blockPendingForMaintenance(record: StudioInboxRecord): Promise<PendingFenceResult> {
+    return this.fencePending(record, "maintenance");
+  }
+
+  private async fencePending(
+    record: StudioInboxRecord,
+    state: "cleared" | "maintenance",
+  ): Promise<PendingFenceResult> {
+    assertPendingSource(record);
+    const result = await this.redis.eval(FENCE_PENDING_LUA, {
+      keys: [
+        this.pendingKey(record.senderHash, record.threadHash),
+        this.pendingControlKey(record.senderHash, record.threadHash),
+      ],
+      arguments: [record.receiptId, String(record.scopeSequence), state, String(this.now())],
+    });
+    if (result === 1 || result === "1") return Object.freeze({ kind: "canceled" });
+    if (result === 2 || result === "2") return Object.freeze({ kind: "empty" });
+    return Object.freeze({ kind: "stale" });
   }
 
   public async admitJob(input: AdmitStudioJobInput): Promise<AdmissionResult> {
@@ -356,18 +596,19 @@ export class StudioStore {
     const userCountKey = this.userDailyKey(input.job.senderHash, day);
     const dailySpendKey = this.dailySpendKey(day);
     const jobKey = this.jobKey(input.job.jobId);
+    const jobPayloadKey = this.jobPayloadKey(input.job.jobId);
     const ttl = secondsToUtcMidnight(this.now());
     const result = await this.redis.eval(ADMIT_JOB_LUA, {
-      keys: [activeKey, userCountKey, dailySpendKey, jobKey],
+      keys: [activeKey, userCountKey, dailySpendKey, jobKey, jobPayloadKey],
       arguments: [
         input.job.jobId,
-        JSON.stringify(input.job),
+        JSON.stringify(jobMetadata(input.job)),
+        JSON.stringify(requiredJobPayload(input.job)),
         String(ttl),
-        String(JOB_TTL_SECONDS),
+        String(JOB_PAYLOAD_TTL_SECONDS),
         String(input.dailyUserJobLimit),
         String(input.dailySpendCapCents),
         String(input.job.reservedCents),
-        String(JOB_TTL_SECONDS),
       ],
     });
     const code = Array.isArray(result) ? result[0] : result;
@@ -377,7 +618,7 @@ export class StudioStore {
       if (!existing || existing.jobId !== input.job.jobId || existing.senderHash !== input.job.senderHash) {
         return Object.freeze({ admitted: false, reason: "storage_error" });
       }
-      return Object.freeze({ admitted: true, job: existing });
+      return Object.freeze({ admitted: true, job: await this.hydrateJobPayload(existing) });
     }
     if (code === "active_job" || code === "user_limit" || code === "daily_cap") {
       return Object.freeze({ admitted: false, reason: code });
@@ -386,10 +627,12 @@ export class StudioStore {
   }
 
   public async getJob(jobId: string): Promise<StudioJobRecord | null> {
-    return parseStored<StudioJobRecord>(await this.redis.get(this.jobKey(jobId)));
+    const metadata = parseStored<StudioJobRecord>(await this.redis.get(this.jobKey(jobId)));
+    return metadata ? this.hydrateJobPayload(metadata) : null;
   }
 
   public decryptJobPayload(job: StudioJobRecord): StudioJobPayload {
+    if (!job.encryptedPayload) throw new Error("job payload is unavailable");
     return this.cipher.decrypt<StudioJobPayload>(job.encryptedPayload, `job:${job.jobId}`);
   }
 
@@ -397,27 +640,91 @@ export class StudioStore {
     const job = await this.getJob(jobId);
     if (!job || job.state !== from || !canTransitionJob(from, to)) return null;
     const result = await this.redis.eval(COMPARE_AND_TRANSITION_JOB_LUA, {
-      keys: [this.jobKey(jobId), this.activeJobKey(job.senderHash)],
-      arguments: [from, String(job.stateVersion), to, String(this.now()), String(JOB_TTL_SECONDS), job.jobId, isTerminalJobState(to) ? "1" : "0"],
+      keys: [this.jobKey(jobId), this.jobPayloadKey(jobId), this.activeJobKey(job.senderHash)],
+      arguments: [from, String(job.stateVersion), to, String(this.now()), String(TERMINAL_METADATA_TTL_SECONDS), job.jobId, isTerminalJobState(to) ? "1" : "0"],
     });
     const next = parseStored<StudioJobRecord>(typeof result === "string" ? result : null);
     if (!next) return null;
-    return next;
+    return this.hydrateJobPayload(next);
   }
 
-  public async createOutbox(input: Omit<StudioOutboxRecord, "schemaVersion" | "encryptedPayload" | "createdAtMs" | "updatedAtMs" | "stateVersion" | "state" | "attempts"> & {
-    readonly payload: StudioOutboxPayload;
-    /** Accepted for backward-compatible callers, but always normalized to v2. */
-    readonly schemaVersion?: 2 | undefined;
-    readonly state?: "intent" | undefined;
-    readonly attempts?: 0 | undefined;
-  }): Promise<StudioOutboxRecord> {
+  public async createOutbox(input: CreateStudioOutboxInput): Promise<StudioOutboxRecord> {
+    const record = this.buildOutboxRecord(input);
+    const result = await this.persistOutbox(record);
+    if (result === "created") return record;
+    if (result === "blocked") throw new Error("unfenced outbox was unexpectedly blocked");
+    return this.existingOutbox(record.outboxId);
+  }
+
+  /**
+   * Persists the only acknowledgement that claims a media-first attachment
+   * was saved. Both publication and later claim require the same live guard,
+   * so a dark/rollback receipt wins over a stale active worker.
+   */
+  public async createPendingGuardedOutbox(
+    guard: PendingWriteGuard,
+    input: CreateStudioOutboxInput,
+  ): Promise<PendingGuardedOutboxResult> {
+    const record = this.buildOutboxRecord(input, guard);
+    const result = await this.redis.eval(PERSIST_PENDING_GUARDED_OUTBOX_LUA, {
+      keys: [
+        this.pendingKey(record.senderHash, guard.threadHash),
+        this.pendingControlKey(record.senderHash, guard.threadHash),
+        this.outboxKey(record.outboxId),
+        this.outboxPayloadKey(record.outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(record),
+        this.inboxScopeSequenceKey(record.senderHash, guard.threadHash),
+        this.releaseFenceKey(),
+      ],
+      arguments: [
+        guard.receiptId,
+        String(guard.scopeSequence),
+        String(guard.revision),
+        guard.token,
+        String(guard.expiresAtMs),
+        JSON.stringify(outboxMetadata(record)),
+        JSON.stringify(requiredOutboxPayload(record)),
+        String(OUTBOX_PAYLOAD_TTL_SECONDS),
+        String(this.now()),
+        record.outboxId,
+        String(record.sequence),
+        String(record.dueAtMs),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+      ],
+    });
+    if (result === -2 || result === "-2") return Object.freeze({ kind: "maintenance" });
+    if (result === -3 || result === "-3") return Object.freeze({ kind: "cleared" });
+    if (result === -4 || result === "-4") return Object.freeze({ kind: "expired" });
+    if (result === -5 || result === "-5") return Object.freeze({ kind: "superseded" });
+    if (result === -6 || result === "-6" || result === -7 || result === "-7" || result === -8 || result === "-8") {
+      return Object.freeze({ kind: "unavailable" });
+    }
+    if (result === 1 || result === "1") return Object.freeze({ kind: "persisted", record });
+    if (result === -1 || result === "-1") {
+      throw new Error("outbox sequence is already in use for this sender lane");
+    }
+    const existing = await this.existingOutbox(record.outboxId);
+    return samePendingGuard(existing.pendingGuard, guard)
+      ? Object.freeze({ kind: "persisted", record: existing })
+      : Object.freeze({ kind: "unavailable" });
+  }
+
+  private buildOutboxRecord(
+    input: CreateStudioOutboxInput,
+    pendingGuard?: PendingWriteGuard,
+  ): StudioOutboxRecord {
     if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
       throw new Error("outbox sequence is invalid");
     }
     const now = this.now();
+    const dueAtMs = input.dueAtMs ?? now;
+    if (!Number.isSafeInteger(dueAtMs) || dueAtMs < 0) {
+      throw new Error("outbox due time is invalid");
+    }
     const record: StudioOutboxRecord = Object.freeze({
-      schemaVersion: 2,
+      schemaVersion: 3,
       outboxId: input.outboxId,
       ...(input.jobId === undefined ? {} : { jobId: input.jobId }),
       senderHash: input.senderHash,
@@ -428,30 +735,60 @@ export class StudioStore {
       state: "intent",
       attempts: 0,
       stateVersion: 1,
+      releaseStamp: this.releaseStamp,
+      ...(pendingGuard === undefined ? {} : { pendingGuard }),
       encryptedPayload: this.cipher.encrypt(input.payload, `outbox:${input.outboxId}`),
       createdAtMs: now,
+      dueAtMs,
       updatedAtMs: now,
     });
+    return record;
+  }
+
+  private async persistOutbox(record: StudioOutboxRecord): Promise<"created" | "existing" | "blocked"> {
     const result = await this.redis.eval(PERSIST_OUTBOX_LUA, {
-      keys: [this.outboxKey(record.outboxId), this.readyOutboxKey(), this.outboxLaneKey(record)],
-      arguments: [JSON.stringify(record), String(JOB_TTL_SECONDS), String(now), record.outboxId, String(record.sequence)],
+      keys: [this.outboxKey(record.outboxId), this.outboxPayloadKey(record.outboxId), this.readyOutboxKey(), this.outboxLaneKey(record), this.releaseFenceKey()],
+      arguments: [
+        JSON.stringify(outboxMetadata(record)),
+        JSON.stringify(requiredOutboxPayload(record)),
+        String(OUTBOX_PAYLOAD_TTL_SECONDS),
+        String(record.dueAtMs),
+        record.outboxId,
+        String(record.sequence),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+      ],
     });
     if (result === -1 || result === "-1") {
       throw new Error("outbox sequence is already in use for this sender lane");
     }
-    if (!(result === 1 || result === "1")) {
-      const existing = await this.getOutbox(record.outboxId);
-      if (!existing) throw new Error("outbox publication could not be confirmed");
-      return existing;
-    }
-    return record;
+    if (result === -2 || result === "-2" || result === -3 || result === "-3") return "blocked";
+    return result === 1 || result === "1" ? "created" : "existing";
+  }
+
+  private async existingOutbox(outboxId: string): Promise<StudioOutboxRecord> {
+    const existing = await this.getOutbox(outboxId);
+    if (!existing) throw new Error("outbox publication could not be confirmed");
+    return existing;
+  }
+
+  private async hydrateJobPayload(metadata: StudioJobRecord): Promise<StudioJobRecord> {
+    // New job metadata is deliberately content-free. Ignore any legacy inline
+    // field so a read cannot extend or re-expose an older retained snapshot.
+    const { encryptedPayload: _legacyEncryptedPayload, ...safeMetadata } = metadata;
+    const encryptedPayload = parseStored<EncryptedPayload>(await this.redis.get(this.jobPayloadKey(metadata.jobId)));
+    return encryptedPayload ? Object.freeze({ ...safeMetadata, encryptedPayload }) : Object.freeze(safeMetadata);
   }
 
   public async getOutbox(outboxId: string): Promise<StudioOutboxRecord | null> {
-    return parseStored<StudioOutboxRecord>(await this.redis.get(this.outboxKey(outboxId)));
+    const metadata = parseStored<StudioOutboxRecord>(await this.redis.get(this.outboxKey(outboxId)));
+    if (!metadata) return null;
+    const encryptedPayload = parseStored<EncryptedPayload>(await this.redis.get(this.outboxPayloadKey(outboxId)));
+    return encryptedPayload ? Object.freeze({ ...metadata, encryptedPayload }) : metadata;
   }
 
   public decryptOutboxPayload(record: StudioOutboxRecord): StudioOutboxPayload {
+    if (!record.encryptedPayload) throw new Error("outbox payload is unavailable");
     return this.cipher.decrypt<StudioOutboxPayload>(record.encryptedPayload, `outbox:${record.outboxId}`);
   }
 
@@ -484,55 +821,141 @@ export class StudioStore {
   public async finishOutbox(
     outboxId: string,
     leaseToken: string,
-    state: Exclude<StudioOutboxState, "intent" | "sending" | "confirmed_absent">,
+    state: Exclude<StudioOutboxState, "intent" | "sending" | "canceled" | "confirmed_absent">,
   ): Promise<boolean> {
     const record = await this.getOutbox(outboxId);
     if (!record) return false;
     const result = await this.redis.eval(FINISH_OUTBOX_LUA, {
-      keys: [this.outboxKey(outboxId), this.outboxLeaseKey(outboxId), this.readyOutboxKey(), this.outboxLaneKey(record)],
-      arguments: [leaseToken, state, String(this.now()), String(JOB_TTL_SECONDS), outboxId, String(STUDIO_MAX_OUTBOX_SEND_ATTEMPTS), String(OUTBOX_RETRY_BACKOFF_MS)],
+      keys: [this.outboxKey(outboxId), this.outboxPayloadKey(outboxId), this.outboxLeaseKey(outboxId), this.readyOutboxKey(), this.outboxLaneKey(record)],
+      arguments: [leaseToken, state, String(this.now()), String(TERMINAL_METADATA_TTL_SECONDS), outboxId, String(STUDIO_MAX_OUTBOX_SEND_ATTEMPTS), String(OUTBOX_RETRY_BACKOFF_MS)],
     });
     return typeof result === "string";
+  }
+
+  /**
+   * The delivery worker calls this immediately before any physical transport
+   * action. It gives a dark/rollback guard one last atomic chance to cancel a
+   * media acknowledgement that was claimed before the release changed.
+   */
+  public async authorizeOutboxDelivery(record: StudioOutboxRecord, leaseToken: string): Promise<boolean> {
+    const pendingGuard = record.pendingGuard;
+    const result = await this.redis.eval(AUTHORIZE_OUTBOX_DELIVERY_LUA, {
+      keys: [
+        this.outboxKey(record.outboxId),
+        this.outboxPayloadKey(record.outboxId),
+        this.outboxLeaseKey(record.outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(record),
+        pendingGuard === undefined
+          ? this.unusedPendingControlKey()
+          : this.pendingControlKey(record.senderHash, pendingGuard.threadHash),
+        pendingGuard === undefined
+          ? this.unusedPendingKey()
+          : this.pendingKey(record.senderHash, pendingGuard.threadHash),
+        pendingGuard === undefined
+          ? this.unusedInboxScopeSequenceKey()
+          : this.inboxScopeSequenceKey(record.senderHash, pendingGuard.threadHash),
+        this.releaseFenceKey(),
+      ],
+      arguments: [
+        leaseToken,
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        record.outboxId,
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+        String(OUTBOX_RETRY_BACKOFF_MS),
+      ],
+    });
+    return result === 1 || result === "1";
   }
 
   private async claimInbox(receiptId: string, leaseToken: string): Promise<StudioInboxRecord | null> {
     const now = this.now();
     const result = await this.redis.eval(CLAIM_INBOX_LUA, {
-      keys: [this.inboxKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
-      arguments: [leaseToken, String(LEASE_TTL_MS), String(now), String(INBOX_TTL_SECONDS), receiptId],
+      keys: [this.inboxKey(receiptId), this.inboxEnvelopeKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
+      arguments: [leaseToken, String(LEASE_TTL_MS), String(now), receiptId],
     });
     return parseStored<StudioInboxRecord>(typeof result === "string" ? result : null);
   }
 
   private async claimOutbox(outboxId: string, leaseToken: string, record: StudioOutboxRecord): Promise<StudioOutboxRecord | null> {
     const now = this.now();
+    const pendingGuard = record.pendingGuard;
     const result = await this.redis.eval(CLAIM_OUTBOX_LUA, {
-      keys: [this.outboxKey(outboxId), this.outboxLeaseKey(outboxId), this.readyOutboxKey(), this.outboxLaneKey(record)],
-      arguments: [leaseToken, String(LEASE_TTL_MS), String(now), String(JOB_TTL_SECONDS), outboxId, String(STUDIO_MAX_OUTBOX_SEND_ATTEMPTS)],
+      keys: [
+        this.outboxKey(outboxId),
+        this.outboxPayloadKey(outboxId),
+        this.outboxLeaseKey(outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(record),
+        pendingGuard === undefined
+          ? this.unusedPendingControlKey()
+          : this.pendingControlKey(record.senderHash, pendingGuard.threadHash),
+        pendingGuard === undefined
+          ? this.unusedPendingKey()
+          : this.pendingKey(record.senderHash, pendingGuard.threadHash),
+        pendingGuard === undefined
+          ? this.unusedInboxScopeSequenceKey()
+          : this.inboxScopeSequenceKey(record.senderHash, pendingGuard.threadHash),
+        this.releaseFenceKey(),
+      ],
+      arguments: [
+        leaseToken,
+        String(LEASE_TTL_MS),
+        String(now),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        outboxId,
+        String(STUDIO_MAX_OUTBOX_SEND_ATTEMPTS),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+      ],
     });
     return parseStored<StudioOutboxRecord>(typeof result === "string" ? result : null);
   }
 
   private async reconcileExpiredOutboxSend(outboxId: string, record: StudioOutboxRecord): Promise<void> {
     await this.redis.eval(RECONCILE_EXPIRED_OUTBOX_LUA, {
-      keys: [this.outboxKey(outboxId), this.outboxLeaseKey(outboxId), this.readyOutboxKey(), this.outboxLaneKey(record)],
-      arguments: [String(this.now()), String(JOB_TTL_SECONDS), outboxId],
+      keys: [this.outboxKey(outboxId), this.outboxPayloadKey(outboxId), this.outboxLeaseKey(outboxId), this.readyOutboxKey(), this.outboxLaneKey(record)],
+      arguments: [String(this.now()), String(TERMINAL_METADATA_TTL_SECONDS), outboxId],
     });
   }
 
+  private async readPendingControl(senderHash: SenderHash, threadHash: ThreadHash): Promise<PendingControl | null> {
+    const control = parseStored<PendingControl>(await this.redis.get(this.pendingControlKey(senderHash, threadHash)));
+    return control && isPendingControl(control) ? control : null;
+  }
+
   private inboxKey(receiptId: string): string { return `${this.prefix}:inbox:${receiptId}`; }
+  private inboxEnvelopeKey(receiptId: string): string { return `${this.prefix}:inbox:envelope:${receiptId}`; }
   private readyInboxKey(): string { return `${this.prefix}:inbox:ready`; }
   private inboxLeaseKey(receiptId: string): string { return `${this.prefix}:inbox:lease:${receiptId}`; }
+  private inboxScopeSequenceKey(senderHash: SenderHash, threadHash: ThreadHash): string {
+    return `${this.prefix}:inbox:scope-sequence:${senderHash}:${threadHash}`;
+  }
   private cronHeartbeatKey(scope: StudioCronHeartbeatScope): string {
     return `${this.prefix}:operations:cron-heartbeat:${scope}`;
   }
+  private releaseFenceKey(): string { return `${this.prefix}:operations:release-fence`; }
   private settingsKey(senderHash: SenderHash): string { return `${this.prefix}:settings:${senderHash}`; }
-  private pendingKey(senderHash: SenderHash, threadHash: ThreadHash): string { return `${this.prefix}:pending:${senderHash}:${threadHash}`; }
+  private pendingKey(senderHash: SenderHash, threadHash: ThreadHash): string {
+    return `${this.prefix}:pending:v3:payload:${senderHash}:${threadHash}`;
+  }
+  private pendingControlKey(senderHash: SenderHash, threadHash: ThreadHash): string {
+    return `${this.prefix}:pending:v3:control:${senderHash}:${threadHash}`;
+  }
+  /** Never written; keeps generic guarded-outbox Lua keys fixed without a wildcard. */
+  private unusedPendingKey(): string { return `${this.prefix}:pending:v3:payload:unused`; }
+  private unusedPendingControlKey(): string { return `${this.prefix}:pending:v3:control:unused`; }
+  /** Never written; keeps guarded-outbox Lua key arity fixed without a wildcard. */
+  private unusedInboxScopeSequenceKey(): string { return `${this.prefix}:inbox:scope-sequence:unused`; }
   private activeJobKey(senderHash: SenderHash): string { return `${this.prefix}:active:${senderHash}`; }
   private userDailyKey(senderHash: SenderHash, day: string): string { return `${this.prefix}:rate:${day}:${senderHash}`; }
   private dailySpendKey(day: string): string { return `${this.prefix}:spend:${day}`; }
   private jobKey(jobId: string): string { return `${this.prefix}:job:${jobId}`; }
+  private jobPayloadKey(jobId: string): string { return `${this.prefix}:job:payload:${jobId}`; }
   private outboxKey(outboxId: string): string { return `${this.prefix}:outbox:${outboxId}`; }
+  private outboxPayloadKey(outboxId: string): string { return `${this.prefix}:outbox:payload:${outboxId}`; }
   private readyOutboxKey(): string { return `${this.prefix}:outbox:ready`; }
   private outboxLeaseKey(outboxId: string): string { return `${this.prefix}:outbox:lease:${outboxId}`; }
   /**
@@ -556,10 +979,10 @@ export class StudioStore {
   }
 }
 
-export function createStudioJob(input: Omit<StudioJobRecord, "schemaVersion" | "state" | "stateVersion" | "createdAtMs" | "updatedAtMs" | "encryptedPayload"> & { readonly payload: StudioJobPayload; readonly cipher: QueueCipher; readonly now?: number | undefined }): StudioJobRecord {
+export function createStudioJob(input: Omit<StudioJobRecord, "schemaVersion" | "state" | "stateVersion" | "createdAtMs" | "updatedAtMs" | "encryptedPayload"> & { readonly payload: StudioJobPayload; readonly cipher: QueueCipher; readonly now?: number | undefined }): StudioJobRecordWithPayload {
   const now = input.now ?? Date.now();
   return Object.freeze({
-    schemaVersion: 2,
+    schemaVersion: 3,
     jobId: input.jobId,
     senderHash: input.senderHash,
     threadHash: input.threadHash,
@@ -588,7 +1011,9 @@ export function canTransitionOutbox(from: StudioOutboxState, to: StudioOutboxSta
 const JOB_TRANSITIONS: Readonly<Record<StudioJobState, readonly StudioJobState[]>> = Object.freeze({
   received: ["validating", "maintenance_rejected", "failed"],
   validating: ["admitted", "failed", "maintenance_rejected"],
-  admitted: ["executing", "canceled"],
+  // A recovered admission whose immutable encrypted snapshot has expired has
+  // not reached a provider. It may terminalize as a known privacy failure.
+  admitted: ["executing", "canceled", "failed"],
   executing: ["executing", "ready", "failed", "canceled", "reconciliation_required"],
   ready: ["delivering", "canceled"],
   delivering: ["delivered", "failed", "reconciliation_required"],
@@ -600,129 +1025,580 @@ const JOB_TRANSITIONS: Readonly<Record<StudioJobState, readonly StudioJobState[]
 });
 
 const OUTBOX_TRANSITIONS: Readonly<Record<StudioOutboxState, readonly StudioOutboxState[]>> = Object.freeze({
-  intent: ["sending"],
-  sending: ["sent", "retryable_failure", "failed", "send_unknown"],
-  retryable_failure: ["sending", "failed"],
+  intent: ["sending", "canceled"],
+  sending: ["sent", "retryable_failure", "failed", "canceled", "send_unknown"],
+  retryable_failure: ["sending", "failed", "canceled"],
   send_unknown: ["sent", "confirmed_absent"],
   confirmed_absent: ["intent", "failed"],
   sent: [],
   failed: [],
+  canceled: [],
 });
 
+const PERSIST_PENDING_LUA = `
+-- AIR_STUDIO_PERSIST_PENDING_V3
+-- KEYS: encrypted payload, opaque durable control record
+-- ARGV: payload, receiptId, scopeSequence, expiresAtMs, guard token, now
+local incomingSequence = tonumber(ARGV[3])
+local expiresAtMs = tonumber(ARGV[4])
+local now = tonumber(ARGV[6])
+if not incomingSequence or incomingSequence < 1 or not expiresAtMs or not now then return -6 end
+
+local raw = redis.call('GET', KEYS[2])
+local control = nil
+if raw then
+  control = cjson.decode(raw)
+  local currentSequence = tonumber(control.scopeSequence)
+  local currentRevision = tonumber(control.revision)
+  if not currentSequence or currentSequence < 1 or not currentRevision or currentRevision < 1 then return -6 end
+  if control.state == 'active' and (
+    not tonumber(control.expiresAtMs) or tonumber(control.expiresAtMs) <= now or redis.call('EXISTS', KEYS[1]) ~= 1
+  ) then
+    control.state = 'expired'
+    control.token = nil
+    redis.call('DEL', KEYS[1])
+    redis.call('SET', KEYS[2], cjson.encode(control))
+  end
+  if incomingSequence < currentSequence then
+    if control.state == 'maintenance' then return -2 end
+    if control.state == 'cleared' then return -3 end
+    if control.state == 'expired' then return -4 end
+    return -1
+  end
+  if incomingSequence == currentSequence then
+    if control.state == 'maintenance' then return -2 end
+    if control.state == 'cleared' then return -3 end
+    if control.state == 'expired' then return -4 end
+    if control.state ~= 'active' or control.receiptId ~= ARGV[2] or control.token ~= ARGV[5] or tonumber(control.expiresAtMs) ~= expiresAtMs then return -6 end
+    return 2
+  end
+end
+
+local revision = control and (tonumber(control.revision) + 1) or 1
+if expiresAtMs <= now then
+  redis.call('DEL', KEYS[1])
+  redis.call('SET', KEYS[2], cjson.encode({
+    schemaVersion = 1,
+    state = 'expired',
+    receiptId = ARGV[2],
+    scopeSequence = incomingSequence,
+    revision = revision,
+    expiresAtMs = expiresAtMs
+  }))
+  return -4
+end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', expiresAtMs - now)
+redis.call('SET', KEYS[2], cjson.encode({
+  schemaVersion = 1,
+  state = 'active',
+  receiptId = ARGV[2],
+  scopeSequence = incomingSequence,
+  revision = revision,
+  token = ARGV[5],
+  expiresAtMs = expiresAtMs
+}))
+return 1
+`;
+
+const FENCE_PENDING_LUA = `
+-- AIR_STUDIO_FENCE_PENDING_V3
+-- KEYS: encrypted payload, opaque durable control record
+-- ARGV: receiptId, scopeSequence, state(cleared|maintenance), now
+local incomingSequence = tonumber(ARGV[2])
+local now = tonumber(ARGV[4])
+if not incomingSequence or incomingSequence < 1 or not now or (ARGV[3] ~= 'cleared' and ARGV[3] ~= 'maintenance') then return 0 end
+local raw = redis.call('GET', KEYS[2])
+local control = nil
+local revision = 1
+local canceled = false
+if raw then
+  control = cjson.decode(raw)
+  local currentSequence = tonumber(control.scopeSequence)
+  local currentRevision = tonumber(control.revision)
+  if not currentSequence or currentSequence < 1 or not currentRevision or currentRevision < 1 then return 0 end
+  if incomingSequence < currentSequence then return 0 end
+  if incomingSequence == currentSequence then
+    if control.receiptId == ARGV[1] and control.state == ARGV[3] then return 2 end
+    return 0
+  end
+  revision = currentRevision + 1
+  canceled = control.state == 'active'
+    and tonumber(control.expiresAtMs) ~= nil
+    and tonumber(control.expiresAtMs) > now
+    and redis.call('EXISTS', KEYS[1]) == 1
+end
+redis.call('DEL', KEYS[1])
+redis.call('SET', KEYS[2], cjson.encode({
+  schemaVersion = 1,
+  state = ARGV[3],
+  receiptId = ARGV[1],
+  scopeSequence = incomingSequence,
+  revision = revision
+}))
+return canceled and 1 or 2
+`;
+
+const READ_PENDING_LUA = `
+-- AIR_STUDIO_READ_PENDING_V3
+-- KEYS: encrypted payload, opaque durable control record
+-- ARGV: now
+local now = tonumber(ARGV[1])
+if not now then return false end
+local raw = redis.call('GET', KEYS[2])
+if not raw then return false end
+local control = cjson.decode(raw)
+if control.state ~= 'active' then return false end
+if not tonumber(control.expiresAtMs) or tonumber(control.expiresAtMs) <= now then
+  control.state = 'expired'
+  control.token = nil
+  redis.call('DEL', KEYS[1])
+  redis.call('SET', KEYS[2], cjson.encode(control))
+  return false
+end
+local payload = redis.call('GET', KEYS[1])
+if not payload then
+  control.state = 'expired'
+  control.token = nil
+  redis.call('SET', KEYS[2], cjson.encode(control))
+  return false
+end
+return payload
+`;
+
 const ADMIT_JOB_LUA = `
--- AIR_STUDIO_ADMIT_JOB_V2
+-- AIR_STUDIO_ADMIT_JOB_V3
+-- KEYS: active sender fence, daily user count, daily spend, job metadata,
+--       encrypted job payload
+-- ARGV: job id, metadata, payload, daily ttl, payload ttl, user limit,
+--       spend cap, reserved cents
 local existing = redis.call('GET', KEYS[4])
 if existing then return {'existing', existing} end
+if redis.call('EXISTS', KEYS[5]) == 1 then return {'storage_error'} end
 local active = redis.call('GET', KEYS[1])
 if active then return {'active_job'} end
 local userCount = tonumber(redis.call('GET', KEYS[2]) or '0')
-if userCount >= tonumber(ARGV[5]) then return {'user_limit'} end
+if userCount >= tonumber(ARGV[6]) then return {'user_limit'} end
 local spend = tonumber(redis.call('GET', KEYS[3]) or '0')
-local cost = tonumber(ARGV[7])
-if spend + cost > tonumber(ARGV[6]) then return {'daily_cap'} end
--- An active-job lease must outlive the daily accounting window. Otherwise a
--- job that crosses UTC midnight could admit a second concurrent job.
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[8])
-redis.call('SET', KEYS[2], tostring(userCount + 1), 'EX', ARGV[3])
-redis.call('SET', KEYS[3], tostring(spend + cost), 'EX', ARGV[3])
-redis.call('SET', KEYS[4], ARGV[2], 'EX', ARGV[4])
+local cost = tonumber(ARGV[8])
+if spend + cost > tonumber(ARGV[7]) then return {'daily_cap'} end
+-- A nonterminal job never loses its active fence solely because time passed.
+-- Recovery/operator reconciliation must resolve it explicitly.
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('SET', KEYS[2], tostring(userCount + 1), 'EX', ARGV[4])
+redis.call('SET', KEYS[3], tostring(spend + cost), 'EX', ARGV[4])
+-- Keep opaque admission metadata indefinitely while nonterminal. The separate
+-- encrypted snapshot contains prompt/media/thread references and is never
+-- refreshed beyond its hard 24-hour privacy deadline.
+redis.call('SET', KEYS[4], ARGV[2])
+redis.call('SET', KEYS[5], ARGV[3], 'EX', ARGV[5])
 return {'admitted'}
 `;
 
 const PERSIST_INBOX_LUA = `
--- AIR_STUDIO_PERSIST_INBOX_V2
+-- AIR_STUDIO_PERSIST_INBOX_V4
+-- The scope counter deliberately has no expiry: it is a compact opaque
+-- fencing record and must outlive any recoverable inbox receipt.
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
-return 1
+local record = cjson.decode(ARGV[1])
+record.encryptedEnvelope = nil
+record.scopeSequence = redis.call('INCR', KEYS[4])
+-- A nonterminal receipt must remain recoverable until it is explicitly
+-- terminalized. Its encrypted envelope is kept separately with a hard,
+-- immutable 24-hour lifetime because it can contain media references.
+redis.call('SET', KEYS[1], cjson.encode(record))
+redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+return cjson.encode(record)
 `;
 
 const CLAIM_INBOX_LUA = `
--- AIR_STUDIO_CLAIM_INBOX_V2
+-- AIR_STUDIO_CLAIM_INBOX_V3
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local record = cjson.decode(raw)
 if record.state ~= 'received' and record.state ~= 'claimed' then return false end
-if redis.call('SET', KEYS[2], ARGV[1], 'NX', 'PX', ARGV[2]) ~= 'OK' then return false end
+if redis.call('SET', KEYS[3], ARGV[1], 'NX', 'PX', ARGV[2]) ~= 'OK' then return false end
 record.state = 'claimed'
 record.stateVersion = record.stateVersion + 1
-redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
-redis.call('ZADD', KEYS[3], tonumber(ARGV[3]) + tonumber(ARGV[2]), ARGV[5])
+redis.call('SET', KEYS[1], cjson.encode(record))
+redis.call('ZADD', KEYS[4], tonumber(ARGV[3]) + tonumber(ARGV[2]), ARGV[4])
+local envelope = redis.call('GET', KEYS[2])
+if envelope then record.encryptedEnvelope = cjson.decode(envelope) end
 return cjson.encode(record)
 `;
 
 const FINISH_INBOX_LUA = `
--- AIR_STUDIO_FINISH_INBOX_V2
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+-- AIR_STUDIO_FINISH_INBOX_V3
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return 0 end
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
 local record = cjson.decode(raw)
 if record.state ~= 'claimed' then return 0 end
+if ARGV[2] ~= 'processed' and ARGV[2] ~= 'maintenance_rejected' and ARGV[2] ~= 'failed' then return 0 end
 record.state = ARGV[2]
 record.stateVersion = record.stateVersion + 1
+-- Terminal receipt metadata is enough for idempotency and audit. Do not keep
+-- prompts, attachment GUIDs, or raw thread identifiers after processing.
+record.encryptedEnvelope = nil
 redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
-redis.call('ZREM', KEYS[3], ARGV[5])
 redis.call('DEL', KEYS[2])
+redis.call('ZREM', KEYS[4], ARGV[5])
+redis.call('DEL', KEYS[3])
 return 1
 `;
 
 const RETRY_INBOX_LUA = `
--- AIR_STUDIO_RETRY_INBOX_V2
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+-- AIR_STUDIO_RETRY_INBOX_V3
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return 0 end
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
 local record = cjson.decode(raw)
 if record.state ~= 'claimed' then return 0 end
+-- Privacy wins once the immutable encrypted envelope lifetime is over. The
+-- opaque receipt remains terminal for seven days rather than looping forever.
+if redis.call('EXISTS', KEYS[2]) ~= 1 then
+  record.state = 'failed'
+  record.stateVersion = record.stateVersion + 1
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
+  redis.call('ZREM', KEYS[4], ARGV[5])
+  redis.call('DEL', KEYS[3])
+  return 2
+end
 record.state = 'received'
 record.stateVersion = record.stateVersion + 1
-redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
-redis.call('ZADD', KEYS[3], tonumber(ARGV[2]) + tonumber(ARGV[3]), ARGV[5])
-redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[1], cjson.encode(record))
+redis.call('ZADD', KEYS[4], tonumber(ARGV[2]) + tonumber(ARGV[3]), ARGV[5])
+redis.call('DEL', KEYS[3])
+return 1
+`;
+
+const ADVANCE_RELEASE_FENCE_LUA = `
+-- AIR_STUDIO_ADVANCE_RELEASE_FENCE_V1
+-- KEYS: one non-expiring opaque global release record
+-- ARGV: expected previous generation, target generation, target phase
+local previous = tonumber(ARGV[1])
+local target = tonumber(ARGV[2])
+if not previous or not target or previous < -1 or target < 0
+  or previous ~= math.floor(previous) or target ~= math.floor(target)
+  or (ARGV[3] ~= 'dark' and ARGV[3] ~= 'canary' and ARGV[3] ~= 'production') then return -2 end
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+  if previous ~= -1 or target ~= 0 or ARGV[3] ~= 'dark' then return -1 end
+  redis.call('SET', KEYS[1], cjson.encode({ schemaVersion = 1, generation = target, phase = ARGV[3] }))
+  return 1
+end
+local ok, current = pcall(cjson.decode, raw)
+if not ok or type(current) ~= 'table' or current.schemaVersion ~= 1
+  or type(current.generation) ~= 'number' or current.generation < 0
+  or current.generation ~= math.floor(current.generation)
+  or (current.phase ~= 'dark' and current.phase ~= 'canary' and current.phase ~= 'production') then return -2 end
+if current.generation == target and current.phase == ARGV[3]
+  and (previous == target or previous == target - 1) then return 2 end
+if current.generation ~= previous or target ~= previous + 1 then return -1 end
+redis.call('SET', KEYS[1], cjson.encode({ schemaVersion = 1, generation = target, phase = ARGV[3] }))
 return 1
 `;
 
 const PERSIST_OUTBOX_LUA = `
--- AIR_STUDIO_PERSIST_OUTBOX_V2
+-- AIR_STUDIO_PERSIST_OUTBOX_V4
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
--- Sequence numbers are per sender/lane. Reject an ambiguous duplicate rather
--- than silently choosing an arbitrary order for two user-visible bubbles.
-if #redis.call('ZRANGEBYSCORE', KEYS[3], ARGV[5], ARGV[5]) > 0 then return -1 end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
-redis.call('ZADD', KEYS[3], ARGV[5], ARGV[4])
+local record = cjson.decode(ARGV[1])
+local stamp = record.releaseStamp
+if type(stamp) ~= 'table'
+  or type(stamp.generation) ~= 'number' or stamp.generation < 0
+  or stamp.generation ~= math.floor(stamp.generation)
+  or stamp.generation ~= tonumber(ARGV[7])
+  or stamp.phase ~= ARGV[8] then return -2 end
+local fenceRaw = redis.call('GET', KEYS[5])
+if fenceRaw then
+  local ok, fence = pcall(cjson.decode, fenceRaw)
+  if not ok or type(fence) ~= 'table' or type(fence.generation) ~= 'number'
+    or fence.generation < 0 or fence.generation ~= math.floor(fence.generation)
+    or (fence.phase ~= 'dark' and fence.phase ~= 'canary' and fence.phase ~= 'production') then return -3 end
+  if fence.generation ~= tonumber(ARGV[7]) or fence.phase ~= ARGV[8] then return -2 end
+elseif ARGV[8] ~= 'dark' then
+  return -3
+end
+if #redis.call('ZRANGEBYSCORE', KEYS[4], ARGV[6], ARGV[6]) > 0 then return -1 end
+redis.call('SET', KEYS[1], ARGV[1])
+redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+redis.call('ZADD', KEYS[4], ARGV[6], ARGV[5])
+return 1
+`;
+
+const PERSIST_PENDING_GUARDED_OUTBOX_LUA = `
+-- AIR_STUDIO_PERSIST_PENDING_GUARDED_OUTBOX_V5
+-- KEYS: pending payload, pending control, outbox metadata, outbox payload,
+--       ready index, lane index, durable inbound scope counter, release fence
+-- ARGV: receipt, sequence, revision, token, expires, metadata, payload,
+--       payload ttl, now, outboxId, laneSequence, dueAt
+local now = tonumber(ARGV[9])
+local guardSequence = tonumber(ARGV[2])
+local guardRevision = tonumber(ARGV[3])
+local guardExpiry = tonumber(ARGV[5])
+if not now or not guardSequence or not guardRevision or not guardExpiry then return -6 end
+local outbox = cjson.decode(ARGV[6])
+local stamp = outbox.releaseStamp
+if type(stamp) ~= 'table'
+  or type(stamp.generation) ~= 'number' or stamp.generation < 0
+  or stamp.generation ~= math.floor(stamp.generation)
+  or stamp.generation ~= tonumber(ARGV[13])
+  or stamp.phase ~= ARGV[14] then return -7 end
+local fenceRaw = redis.call('GET', KEYS[8])
+if fenceRaw then
+  local ok, fence = pcall(cjson.decode, fenceRaw)
+  if not ok or type(fence) ~= 'table' or type(fence.generation) ~= 'number'
+    or fence.generation < 0 or fence.generation ~= math.floor(fence.generation)
+    or (fence.phase ~= 'dark' and fence.phase ~= 'canary' and fence.phase ~= 'production') then return -8 end
+  if fence.generation ~= tonumber(ARGV[13]) or fence.phase ~= ARGV[14] then return -7 end
+elseif ARGV[14] ~= 'dark' then
+  return -8
+end
+local raw = redis.call('GET', KEYS[2])
+if not raw then return -6 end
+local control = cjson.decode(raw)
+if control.state == 'maintenance' then return -2 end
+if control.state == 'cleared' then return -3 end
+if control.state == 'expired' then return -4 end
+if control.state ~= 'active' then return -6 end
+if tonumber(control.expiresAtMs) == nil or tonumber(control.expiresAtMs) <= now or redis.call('EXISTS', KEYS[1]) ~= 1 then
+  control.state = 'expired'
+  control.token = nil
+  redis.call('DEL', KEYS[1])
+  redis.call('SET', KEYS[2], cjson.encode(control))
+  return -4
+end
+if tonumber(control.scopeSequence) > guardSequence then return -5 end
+if tonumber(control.scopeSequence) ~= guardSequence
+  or tonumber(control.revision) ~= guardRevision
+  or control.receiptId ~= ARGV[1]
+  or control.token ~= ARGV[4]
+  or tonumber(control.expiresAtMs) ~= guardExpiry then return -6 end
+if tonumber(redis.call('GET', KEYS[7])) ~= guardSequence then return -5 end
+if redis.call('EXISTS', KEYS[3]) == 1 then return 0 end
+if #redis.call('ZRANGEBYSCORE', KEYS[6], ARGV[11], ARGV[11]) > 0 then return -1 end
+redis.call('SET', KEYS[3], ARGV[6])
+redis.call('SET', KEYS[4], ARGV[7], 'EX', ARGV[8])
+redis.call('ZADD', KEYS[5], ARGV[12], ARGV[10])
+redis.call('ZADD', KEYS[6], ARGV[11], ARGV[10])
 return 1
 `;
 
 const CLAIM_OUTBOX_LUA = `
--- AIR_STUDIO_CLAIM_OUTBOX_V2
+-- AIR_STUDIO_CLAIM_OUTBOX_V5
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local record = cjson.decode(raw)
 if record.state ~= 'intent' and record.state ~= 'retryable_failure' then return false end
-local laneHead = redis.call('ZRANGE', KEYS[4], 0, 0)
+local function releaseFenceStatus()
+  local stamp = record.releaseStamp
+  if type(stamp) ~= 'table'
+    or type(stamp.generation) ~= 'number' or stamp.generation < 0
+    or stamp.generation ~= math.floor(stamp.generation)
+    or stamp.generation ~= tonumber(ARGV[7])
+    or stamp.phase ~= ARGV[8] then return -1 end
+  local fenceRaw = redis.call('GET', KEYS[9])
+  if not fenceRaw then return ARGV[8] == 'dark' and 1 or 0 end
+  local ok, fence = pcall(cjson.decode, fenceRaw)
+  if not ok or type(fence) ~= 'table' or type(fence.generation) ~= 'number'
+    or fence.generation < 0 or fence.generation ~= math.floor(fence.generation)
+    or (fence.phase ~= 'dark' and fence.phase ~= 'canary' and fence.phase ~= 'production') then return 0 end
+  if fence.generation == tonumber(ARGV[7]) and fence.phase == ARGV[8] then return 1 end
+  return -1
+end
+local releaseStatus = releaseFenceStatus()
+local laneHead = redis.call('ZRANGE', KEYS[5], 0, 0)
 if #laneHead ~= 1 or laneHead[1] ~= ARGV[5] then return false end
+if releaseStatus == 0 then return false end
+if releaseStatus == -1 then
+  record.state = 'canceled'
+  record.stateVersion = record.stateVersion + 1
+  record.updatedAtMs = tonumber(ARGV[3])
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
+  redis.call('DEL', KEYS[2])
+  redis.call('ZREM', KEYS[4], ARGV[5])
+  redis.call('ZREM', KEYS[5], ARGV[5])
+  return false
+end
+if redis.call('EXISTS', KEYS[2]) ~= 1 then
+  record.state = 'failed'
+  record.stateVersion = record.stateVersion + 1
+  record.updatedAtMs = tonumber(ARGV[3])
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
+  redis.call('ZREM', KEYS[4], ARGV[5])
+  redis.call('ZREM', KEYS[5], ARGV[5])
+  return false
+end
+local guardIsLive = true
+if record.pendingGuard ~= nil then
+  local guard = record.pendingGuard
+  guardIsLive = type(guard) == 'table'
+    and type(guard.receiptId) == 'string'
+    and type(guard.scopeSequence) == 'number'
+    and type(guard.revision) == 'number'
+    and type(guard.token) == 'string'
+    and type(guard.expiresAtMs) == 'number'
+  if guardIsLive then
+    local controlRaw = redis.call('GET', KEYS[6])
+    if not controlRaw then
+      guardIsLive = false
+    else
+      local control = cjson.decode(controlRaw)
+      guardIsLive = control.state == 'active'
+        and control.receiptId == guard.receiptId
+        and tonumber(control.scopeSequence) == guard.scopeSequence
+        and tonumber(control.revision) == guard.revision
+        and control.token == guard.token
+        and tonumber(control.expiresAtMs) == guard.expiresAtMs
+      if guardIsLive and (guard.expiresAtMs <= tonumber(ARGV[3]) or redis.call('EXISTS', KEYS[7]) ~= 1) then
+        control.state = 'expired'
+        control.token = nil
+        redis.call('DEL', KEYS[7])
+        redis.call('SET', KEYS[6], cjson.encode(control))
+        guardIsLive = false
+      end
+    end
+  end
+  if guardIsLive and tonumber(redis.call('GET', KEYS[8])) ~= guard.scopeSequence then guardIsLive = false end
+end
+if not guardIsLive then
+  record.state = 'canceled'
+  record.stateVersion = record.stateVersion + 1
+  record.updatedAtMs = tonumber(ARGV[3])
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
+  redis.call('DEL', KEYS[2])
+  redis.call('ZREM', KEYS[4], ARGV[5])
+  redis.call('ZREM', KEYS[5], ARGV[5])
+  return false
+end
 if record.state == 'retryable_failure' and record.attempts >= tonumber(ARGV[6]) then
   record.state = 'failed'
   record.stateVersion = record.stateVersion + 1
   record.updatedAtMs = tonumber(ARGV[3])
   redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
-  redis.call('ZREM', KEYS[3], ARGV[5])
+  redis.call('DEL', KEYS[2])
   redis.call('ZREM', KEYS[4], ARGV[5])
+  redis.call('ZREM', KEYS[5], ARGV[5])
   return false
 end
-if redis.call('SET', KEYS[2], ARGV[1], 'NX', 'PX', ARGV[2]) ~= 'OK' then return false end
+if redis.call('SET', KEYS[3], ARGV[1], 'NX', 'PX', ARGV[2]) ~= 'OK' then return false end
 record.state = 'sending'
 record.attempts = record.attempts + 1
 record.stateVersion = record.stateVersion + 1
 record.updatedAtMs = tonumber(ARGV[3])
-redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
-redis.call('ZADD', KEYS[3], tonumber(ARGV[3]) + tonumber(ARGV[2]), ARGV[5])
+redis.call('SET', KEYS[1], cjson.encode(record))
+record.encryptedPayload = cjson.decode(redis.call('GET', KEYS[2]))
+redis.call('ZADD', KEYS[4], tonumber(ARGV[3]) + tonumber(ARGV[2]), ARGV[5])
 return cjson.encode(record)
 `;
 
+const AUTHORIZE_OUTBOX_DELIVERY_LUA = `
+-- AIR_STUDIO_AUTHORIZE_OUTBOX_DELIVERY_V5
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return 0 end
+local raw = redis.call('GET', KEYS[1])
+if not raw then return 0 end
+local record = cjson.decode(raw)
+if record.state ~= 'sending' then return 0 end
+local function releaseFenceStatus()
+  local stamp = record.releaseStamp
+  if type(stamp) ~= 'table'
+    or type(stamp.generation) ~= 'number' or stamp.generation < 0
+    or stamp.generation ~= math.floor(stamp.generation)
+    or stamp.generation ~= tonumber(ARGV[5])
+    or stamp.phase ~= ARGV[6] then return -1 end
+  local fenceRaw = redis.call('GET', KEYS[9])
+  if not fenceRaw then return ARGV[6] == 'dark' and 1 or 0 end
+  local ok, fence = pcall(cjson.decode, fenceRaw)
+  if not ok or type(fence) ~= 'table' or type(fence.generation) ~= 'number'
+    or fence.generation < 0 or fence.generation ~= math.floor(fence.generation)
+    or (fence.phase ~= 'dark' and fence.phase ~= 'canary' and fence.phase ~= 'production') then return 0 end
+  if fence.generation == tonumber(ARGV[5]) and fence.phase == ARGV[6] then return 1 end
+  return -1
+end
+local releaseStatus = releaseFenceStatus()
+if releaseStatus == 0 then
+  -- No physical dispatch occurred. Requeue without consuming an attempt so a
+  -- temporary fence read failure cannot become send_unknown or failed.
+  record.state = 'intent'
+  record.attempts = math.max(0, tonumber(record.attempts) - 1)
+  record.stateVersion = record.stateVersion + 1
+  record.updatedAtMs = tonumber(ARGV[2])
+  redis.call('SET', KEYS[1], cjson.encode(record))
+  redis.call('DEL', KEYS[3])
+  redis.call('ZADD', KEYS[4], tonumber(ARGV[2]) + tonumber(ARGV[7]), ARGV[4])
+  return 0
+end
+if releaseStatus == -1 then
+  record.state = 'canceled'
+  record.stateVersion = record.stateVersion + 1
+  record.updatedAtMs = tonumber(ARGV[2])
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[3])
+  redis.call('DEL', KEYS[2])
+  redis.call('DEL', KEYS[3])
+  redis.call('ZREM', KEYS[4], ARGV[4])
+  redis.call('ZREM', KEYS[5], ARGV[4])
+  return 0
+end
+if redis.call('EXISTS', KEYS[2]) ~= 1 then
+  record.state = 'failed'
+  record.stateVersion = record.stateVersion + 1
+  record.updatedAtMs = tonumber(ARGV[2])
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[3])
+  redis.call('DEL', KEYS[3])
+  redis.call('ZREM', KEYS[4], ARGV[4])
+  redis.call('ZREM', KEYS[5], ARGV[4])
+  return 0
+end
+local guardIsLive = true
+if record.pendingGuard ~= nil then
+  local guard = record.pendingGuard
+  guardIsLive = type(guard) == 'table'
+    and type(guard.receiptId) == 'string'
+    and type(guard.scopeSequence) == 'number'
+    and type(guard.revision) == 'number'
+    and type(guard.token) == 'string'
+    and type(guard.expiresAtMs) == 'number'
+  if guardIsLive then
+    local controlRaw = redis.call('GET', KEYS[6])
+    if not controlRaw then
+      guardIsLive = false
+    else
+      local control = cjson.decode(controlRaw)
+      guardIsLive = control.state == 'active'
+        and control.receiptId == guard.receiptId
+        and tonumber(control.scopeSequence) == guard.scopeSequence
+        and tonumber(control.revision) == guard.revision
+        and control.token == guard.token
+        and tonumber(control.expiresAtMs) == guard.expiresAtMs
+      if guardIsLive and (guard.expiresAtMs <= tonumber(ARGV[2]) or redis.call('EXISTS', KEYS[7]) ~= 1) then
+        control.state = 'expired'
+        control.token = nil
+        redis.call('DEL', KEYS[7])
+        redis.call('SET', KEYS[6], cjson.encode(control))
+        guardIsLive = false
+      end
+    end
+  end
+  if guardIsLive and tonumber(redis.call('GET', KEYS[8])) ~= guard.scopeSequence then guardIsLive = false end
+end
+if not guardIsLive then
+  record.state = 'canceled'
+  record.stateVersion = record.stateVersion + 1
+  record.updatedAtMs = tonumber(ARGV[2])
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[3])
+  redis.call('DEL', KEYS[2])
+  redis.call('DEL', KEYS[3])
+  redis.call('ZREM', KEYS[4], ARGV[4])
+  redis.call('ZREM', KEYS[5], ARGV[4])
+  return 0
+end
+return 1
+`;
+
 const FINISH_OUTBOX_LUA = `
--- AIR_STUDIO_FINISH_OUTBOX_V2
-if redis.call('GET', KEYS[2]) ~= ARGV[1] then return false end
+-- AIR_STUDIO_FINISH_OUTBOX_V3
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return false end
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local record = cjson.decode(raw)
@@ -733,37 +1609,41 @@ if nextState == 'retryable_failure' and record.attempts >= tonumber(ARGV[6]) the
 record.state = nextState
 record.stateVersion = record.stateVersion + 1
 record.updatedAtMs = tonumber(ARGV[3])
-redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
-redis.call('DEL', KEYS[2])
-if nextState == 'retryable_failure' then
-  redis.call('ZADD', KEYS[3], tonumber(ARGV[3]) + (record.attempts * tonumber(ARGV[7])), ARGV[5])
+if nextState == 'sent' or nextState == 'failed' then
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
+  redis.call('DEL', KEYS[2])
 else
-  redis.call('ZREM', KEYS[3], ARGV[5])
-  -- An unknown send deliberately remains the lane head: allowing the next
-  -- bubble through would reorder a conversation around an ambiguous delivery.
-  if nextState ~= 'send_unknown' then redis.call('ZREM', KEYS[4], ARGV[5]) end
+  redis.call('SET', KEYS[1], cjson.encode(record))
+end
+redis.call('DEL', KEYS[3])
+if nextState == 'retryable_failure' then
+  redis.call('ZADD', KEYS[4], tonumber(ARGV[3]) + (record.attempts * tonumber(ARGV[7])), ARGV[5])
+else
+  redis.call('ZREM', KEYS[4], ARGV[5])
+  if nextState ~= 'send_unknown' then redis.call('ZREM', KEYS[5], ARGV[5]) end
 end
 return cjson.encode(record)
 `;
 
 const RECONCILE_EXPIRED_OUTBOX_LUA = `
--- AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V2
+-- AIR_STUDIO_RECONCILE_EXPIRED_OUTBOX_V3
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
-if redis.call('GET', KEYS[2]) then return 0 end
+if redis.call('GET', KEYS[3]) then return 0 end
 local record = cjson.decode(raw)
 if record.state ~= 'sending' then return 0 end
 record.state = 'send_unknown'
 record.stateVersion = record.stateVersion + 1
 record.updatedAtMs = tonumber(ARGV[1])
-redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[2])
-redis.call('ZREM', KEYS[3], ARGV[3])
--- Keep KEYS[4]'s lane head as a deliberate fail-closed pause.
+redis.call('SET', KEYS[1], cjson.encode(record))
+redis.call('ZREM', KEYS[4], ARGV[3])
+-- Keep KEYS[5]'s lane head as a deliberate fail-closed pause.
 return 1
 `;
 
 const COMPARE_AND_TRANSITION_JOB_LUA = `
--- AIR_STUDIO_TRANSITION_JOB_V2
+-- AIR_STUDIO_TRANSITION_JOB_V3
+-- KEYS: job metadata, encrypted job payload, active sender fence
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local record = cjson.decode(raw)
@@ -771,10 +1651,16 @@ if record.state ~= ARGV[1] or record.stateVersion ~= tonumber(ARGV[2]) then retu
 record.state = ARGV[3]
 record.stateVersion = record.stateVersion + 1
 record.updatedAtMs = tonumber(ARGV[4])
-redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[5])
--- Never delete a newer job's active marker after an old job's terminal
--- transition. The value is the fencing identity for this particular job.
-if ARGV[7] == '1' and redis.call('GET', KEYS[2]) == ARGV[6] then redis.call('DEL', KEYS[2]) end
+record.encryptedPayload = nil
+if ARGV[7] == '1' then
+  redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[5])
+  redis.call('DEL', KEYS[2])
+  -- Never delete a newer job's active marker after an old job's terminal
+  -- transition. The value is the fencing identity for this particular job.
+  if redis.call('GET', KEYS[3]) == ARGV[6] then redis.call('DEL', KEYS[3]) end
+else
+  redis.call('SET', KEYS[1], cjson.encode(record))
+end
 return cjson.encode(record)
 `;
 
@@ -788,6 +1674,77 @@ function parseStored<T>(raw: string | null): T | null {
   }
 }
 
+function outboxMetadata(record: StudioOutboxRecord): Omit<StudioOutboxRecord, "encryptedPayload"> {
+  const { encryptedPayload: _encryptedPayload, ...metadata } = record;
+  return metadata;
+}
+
+function jobMetadata(record: StudioJobRecordWithPayload): Omit<StudioJobRecord, "encryptedPayload"> {
+  const { encryptedPayload: _encryptedPayload, ...metadata } = record;
+  return metadata;
+}
+
+function requiredJobPayload(record: StudioJobRecordWithPayload): EncryptedPayload {
+  return record.encryptedPayload;
+}
+
+function requiredOutboxPayload(record: StudioOutboxRecord): EncryptedPayload {
+  if (!record.encryptedPayload) throw new Error("outbox payload is unavailable");
+  return record.encryptedPayload;
+}
+
+function normalizeReleaseStamp(stamp: StudioReleaseStamp): StudioReleaseStamp {
+  if (!Number.isSafeInteger(stamp.generation) || stamp.generation < 0) {
+    throw new Error("release generation is invalid");
+  }
+  if (stamp.phase !== "dark" && stamp.phase !== "canary" && stamp.phase !== "production") {
+    throw new Error("release phase is invalid");
+  }
+  if (stamp.phase !== "dark" && stamp.generation < 1) {
+    throw new Error("active release generation is invalid");
+  }
+  return Object.freeze({ generation: stamp.generation, phase: stamp.phase });
+}
+
+function assertPendingSource(record: StudioInboxRecord): void {
+  if (
+    !record.receiptId
+    || !record.senderHash
+    || !record.threadHash
+    || !isPositiveSafeInteger(record.scopeSequence)
+    || !Number.isSafeInteger(record.receivedAtMs)
+    || record.receivedAtMs < 0
+  ) {
+    throw new Error("pending source record is invalid");
+  }
+}
+
+function isPendingControl(value: PendingControl): boolean {
+  if (
+    value.schemaVersion !== 1
+    || !["active", "cleared", "maintenance", "expired"].includes(value.state)
+    || !value.receiptId
+    || !isPositiveSafeInteger(value.scopeSequence)
+    || !isPositiveSafeInteger(value.revision)
+  ) return false;
+  if (value.state === "active") {
+    return Boolean(value.token)
+      && Number.isSafeInteger(value.expiresAtMs)
+      && (value.expiresAtMs as number) > 0;
+  }
+  return value.token === undefined && (value.expiresAtMs === undefined || (Number.isSafeInteger(value.expiresAtMs) && value.expiresAtMs > 0));
+}
+
+function samePendingGuard(left: PendingWriteGuard | undefined, right: PendingWriteGuard): boolean {
+  return left !== undefined
+    && left.threadHash === right.threadHash
+    && left.receiptId === right.receiptId
+    && left.scopeSequence === right.scopeSequence
+    && left.revision === right.revision
+    && left.token === right.token
+    && left.expiresAtMs === right.expiresAtMs;
+}
+
 function hasValidAdmissionBounds(input: AdmitStudioJobInput): boolean {
   const { job } = input;
   return (
@@ -795,8 +1752,10 @@ function hasValidAdmissionBounds(input: AdmitStudioJobInput): boolean {
     && isPositiveSafeInteger(input.dailyUserJobLimit)
     && isNonnegativeSafeInteger(input.perJobCapCents)
     && isNonnegativeSafeInteger(input.dailySpendCapCents)
+    && job.schemaVersion === 3
     && job.state === "admitted"
     && job.stateVersion === 1
+    && Boolean(job.encryptedPayload)
     && isNonnegativeSafeInteger(job.reservedCents)
     && isPositiveSafeInteger(job.outputCount)
     && (job.durationSeconds === undefined || isPositiveSafeInteger(job.durationSeconds))

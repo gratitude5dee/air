@@ -8,6 +8,7 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/index.ts",
   "api/internal/drain-inbox.ts",
   "api/internal/readiness.ts",
+  "api/internal/release-fence.ts",
   "api/webhooks/imessage.ts",
 ]);
 const EXPECTED_REWRITES = Object.freeze([
@@ -16,6 +17,7 @@ const EXPECTED_REWRITES = Object.freeze([
   ["/webhooks/imessage", "/api/webhooks/imessage"],
   ["/internal/drain-inbox", "/api/internal/drain-inbox"],
   ["/internal/readiness", "/api/internal/readiness"],
+  ["/internal/release-fence", "/api/internal/release-fence"],
 ]);
 
 /** Packages which would put the retired framework or an LLM runtime on Air's request path. */
@@ -147,6 +149,10 @@ async function verifyRouteSources() {
   const drainSource = await readFile(resolve(ROOT, "api/internal/drain-inbox.ts"), "utf8");
   if (!drainSource.includes("handleStudioDrain")) {
     throw new Error("the cron route must use the Studio authorization handler");
+  }
+  const releaseFenceSource = await readFile(resolve(ROOT, "api/internal/release-fence.ts"), "utf8");
+  if (!releaseFenceSource.includes("handleStudioReleaseFence")) {
+    throw new Error("the release-fence route must use the Studio fence handler");
   }
 }
 

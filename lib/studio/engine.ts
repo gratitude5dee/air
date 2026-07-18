@@ -32,6 +32,7 @@ import type {
   StudioInboxRecord as InboxRecord,
   StudioOutboxPayload,
   StudioOutboxRecord,
+  PendingWriteGuard,
 } from "./store.js";
 import { getStudioWorkflow, isSinglePaidStepWorkflow } from "./workflows.js";
 
@@ -41,6 +42,7 @@ const DEFAULT_VIDEO_DURATION_SECONDS: StudioVideoDurationSeconds = 5;
 const MAX_INBOX_PER_DRAIN = 12;
 const MAX_OUTBOX_PER_DRAIN = 16;
 const TYPING_DWELL_MS = 300;
+const MEDIA_FIRST_CORRECTION_DELAY_MS = 500;
 
 const HELP_TEXT = [
   "Air commands:",
@@ -53,7 +55,7 @@ const HELP_TEXT = [
 
 const ONBOARDING_BUBBLES = Object.freeze([
   "Hey — I’m Air by WZRD ⚡ Your image + video studio in iMessage.",
-  "Create with /imagine, /animate, /edit-image, or /edit-video. Try: /imagine a chrome hummingbird at sunrise. Settings: /model-settings • Help: /help. Air keeps its own temporary media references for up to 24 hours; providers process media under their own retention terms.",
+  "Create with /imagine, /animate, /edit-image, or /edit-video. Try: /imagine a chrome hummingbird at sunrise. Settings: /model-settings • Help: /help. This dark deployment accepts no work; any later approved provider path will disclose its media-retention terms.",
 ] as const);
 
 type StoredModeSettings = {
@@ -91,7 +93,7 @@ type PendingIntent =
       readonly createdAtMs: number;
     };
 
-type InboxDisposition = "processed" | "maintenance_rejected";
+type InboxDisposition = "processed" | "maintenance_rejected" | "failed";
 
 export interface StudioDrainStats {
   readonly inbox: number;
@@ -146,8 +148,24 @@ export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number>
     const claim = await runtime.store.claimNextOutbox();
     if (!claim) break;
 
-    const payload = runtime.store.decryptOutboxPayload(claim.record);
-    const outcome = await dispatchOutboxEntry(runtime, claim.record, payload);
+    let payload: StudioOutboxPayload;
+    try {
+      // The claim verifies that a payload exists, but its independent 24-hour
+      // privacy TTL can still elapse (or a ciphertext can be found corrupt)
+      // between that atomic check and local decryption. No physical transport
+      // action has begun at this point, so terminalize it as a known failure
+      // rather than letting a later lease-expiry reconciliation mislabel it as
+      // an ambiguous send.
+      payload = runtime.store.decryptOutboxPayload(claim.record);
+    } catch {
+      await runtime.store.finishOutbox(claim.record.outboxId, claim.leaseToken, "failed");
+      continue;
+    }
+    const outcome = await dispatchOutboxEntry(runtime, claim.record, claim.leaseToken, payload);
+    // A dark/rollback guard can revoke a media acknowledgement after its
+    // queue claim but before the physical iMessage send. The store has already
+    // terminalized that intent as canceled, so there is nothing to finish.
+    if (outcome === null) continue;
     const finished = await runtime.store.finishOutbox(claim.record.outboxId, claim.leaseToken, outcome.kind);
     if (finished) delivered += 1;
 
@@ -160,6 +178,16 @@ export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number>
 }
 
 async function processInbox(runtime: StudioRuntime, record: StudioInboxRecord): Promise<InboxDisposition> {
+  // A record written by an older, unsequenced deployment cannot safely take
+  // part in pending assembly. Terminalize it without side effects rather than
+  // fabricating order from its wall-clock timestamp.
+  if (!Number.isSafeInteger(record.scopeSequence) || record.scopeSequence < 1) {
+    return "maintenance_rejected";
+  }
+  // The opaque receipt deliberately outlives its encrypted envelope. If the
+  // immutable 24-hour privacy window elapsed before recovery, terminalize
+  // safely rather than retaining or reconstructing a media reference.
+  if (!record.encryptedEnvelope) return "failed";
   const envelope = runtime.store.decryptInboxEnvelope(record);
   const initialized = await runtime.store.initializeSettingsIfAbsent(
     record.senderHash,
@@ -172,6 +200,23 @@ async function processInbox(runtime: StudioRuntime, record: StudioInboxRecord): 
     await runtime.store.putSettings(record.senderHash, settings);
     await enqueueText(runtime, record, envelope, "onboarding-1", "onboarding", 1, ONBOARDING_BUBBLES[0]);
     await enqueueText(runtime, record, envelope, "onboarding-2", "onboarding", 2, ONBOARDING_BUBBLES[1]);
+  }
+
+  // Fence pending assembly before branching on message shape. A dark/rollback
+  // receipt cancels any older intent and prevents a stale active-phase worker
+  // from recreating it after this receipt has completed.
+  if (!canAcceptStudioJobs(runtime.environment)) {
+    const pendingFence = await runtime.store.blockPendingForMaintenance(record);
+    if (pendingFence.kind === "canceled") {
+      await enqueueResponse(
+        runtime,
+        record,
+        envelope,
+        "pending-canceled-maintenance",
+        "Air is in maintenance mode; I canceled the pending request. No generation was submitted.",
+      );
+      return "maintenance_rejected";
+    }
   }
 
   if (envelope.attachments.length > 1) {
@@ -188,19 +233,60 @@ async function processInbox(runtime: StudioRuntime, record: StudioInboxRecord): 
   const attachment = envelope.attachments[0];
   if (envelope.text === null) {
     if (attachment) {
-      await runtime.store.putPending<PendingIntent>(record.senderHash, record.threadHash, Object.freeze({
+      // A dark/rollback release must not carry a media-first intent into a
+      // later active phase. The maintenance fence above makes a stale write
+      // impossible before this truthful response is persisted.
+      if (!canAcceptStudioJobs(runtime.environment)) {
+        await enqueueResponse(
+          runtime,
+          record,
+          envelope,
+          "media-first-maintenance",
+          "Air is in maintenance mode; I didn’t retain that attachment. No generation was submitted.",
+        );
+        return "maintenance_rejected";
+      }
+      const pendingWrite = await runtime.store.putPendingWithGuard<PendingIntent>(record, Object.freeze({
         schemaVersion: 1,
         kind: "media",
         attachment,
         createdAtMs: record.receivedAtMs,
       }));
-      await enqueueResponse(
+      if (pendingWrite.kind !== "active") {
+        const superseded = pendingWrite.kind === "superseded";
+        const maintenance = pendingWrite.kind === "maintenance";
+        await enqueueResponse(
+          runtime,
+          record,
+          envelope,
+          superseded ? "media-first-superseded" : "media-first-inactive",
+          superseded
+            ? "A newer attachment replaced that pending request. Send it again with an explicit command if you still want to use it."
+            : "That pending attachment is no longer active. Send it again with an explicit command.",
+        );
+        return maintenance ? "maintenance_rejected" : "processed";
+      }
+      const acknowledgement = await enqueuePendingMediaAcknowledgement(
         runtime,
         record,
         envelope,
-        "media-first",
+        pendingWrite.guard,
         "I saved that one attachment for 10 minutes. Send an explicit command such as /animate a slow orbit, /edit-image brighten the sky, or /edit-video trim the opening.",
       );
+      if (acknowledgement.kind !== "persisted") {
+        const superseded = acknowledgement.kind === "superseded";
+        const maintenance = acknowledgement.kind === "maintenance";
+        await enqueueResponse(
+          runtime,
+          record,
+          envelope,
+          superseded ? "media-first-superseded" : "media-first-inactive",
+          superseded
+            ? "A newer attachment replaced that pending request. Send it again with an explicit command if you still want to use it."
+            : "That pending attachment is no longer active. Send it again with an explicit command.",
+        );
+        return maintenance ? "maintenance_rejected" : "processed";
+      }
       return "processed";
     }
     await enqueueResponse(runtime, record, envelope, "empty-message", HELP_TEXT);
@@ -251,7 +337,7 @@ async function handleBareText(
   // enables admissions. In dark mode do not turn a follow-up bubble into a
   // paid job or silently preserve an intent that looks accepted.
   if (!canAcceptStudioJobs(runtime.environment)) {
-    await runtime.store.clearPending(record.senderHash, record.threadHash);
+    await runtime.store.clearPending(record);
     await enqueueMaintenanceNotice(runtime, record, envelope, "pending-prompt-maintenance");
     return "maintenance_rejected";
   }
@@ -291,10 +377,18 @@ async function handleCommand(
       );
       return "processed";
     case "cancel": {
-      const pending = await runtime.store.getPending<PendingIntent>(record.senderHash, record.threadHash);
-      if (pending) {
-        await runtime.store.clearPending(record.senderHash, record.threadHash);
+      // The dark pre-fence above has already made this same receipt the
+      // newest maintenance tombstone. Do not report that a truthful cancel is
+      // stale simply because a dark deployment has no live pending state.
+      if (!canAcceptStudioJobs(runtime.environment)) {
+        await enqueueResponse(runtime, record, envelope, "cancel-none-maintenance", "There is no pending request to cancel.");
+        return "maintenance_rejected";
+      }
+      const canceled = await runtime.store.clearPending(record);
+      if (canceled.kind === "canceled") {
         await enqueueResponse(runtime, record, envelope, "cancel-pending", "Canceled the pending request. No generation was submitted.");
+      } else if (canceled.kind === "stale") {
+        await enqueueResponse(runtime, record, envelope, "cancel-stale", "That cancellation command is no longer current. Send /cancel again to cancel the latest pending request.");
       } else {
         await enqueueResponse(runtime, record, envelope, "cancel-none", "There is no pending request to cancel.");
       }
@@ -623,7 +717,7 @@ function mediaKindFromAttachment(attachment: StudioAttachmentReference): "none" 
 }
 
 function privacyText(): string {
-  return "Air is private and allowlist-only. Air keeps encrypted pending media references for up to 10 minutes and Air-owned accepted-work references for up to 24 hours. No provider model is enabled in this dark deployment, so Air is not sending media to a generation provider. Avoid sending sensitive media; provider retention terms will be disclosed before any model is enabled.";
+  return "Air is private and allowlist-only. In this dark deployment, Air keeps encrypted pending media references for up to 10 minutes and accepts no generation work. No provider model is enabled, so Air is not sending media to a generation provider. Any later approved path must disclose provider retention terms and limit Air-owned accepted-work references to 24 hours. Avoid sending sensitive media.";
 }
 
 async function enqueueMaintenanceNotice(
@@ -651,6 +745,32 @@ async function enqueueResponse(
   await enqueueText(runtime, record, envelope, `response-${label}`, "request-response", 1, text);
 }
 
+/**
+ * The acknowledgement for a media-first message is the sole response that
+ * asserts retained pending state. It is therefore coupled to the opaque
+ * pending guard instead of a generic durable response.
+ */
+async function enqueuePendingMediaAcknowledgement(
+  runtime: StudioRuntime,
+  record: StudioInboxRecord,
+  envelope: ReturnType<StudioRuntime["store"]["decryptInboxEnvelope"]>,
+  pendingGuard: PendingWriteGuard,
+  text: string,
+): ReturnType<StudioRuntime["store"]["createPendingGuardedOutbox"]> {
+  if (!isSafeTransportText(text)) throw new Error("unsafe studio response text");
+  const payload = responsePayload(envelope, text);
+  return runtime.store.createPendingGuardedOutbox(pendingGuard, {
+    outboxId: stableRecordId(record.receiptId, "response-media-first"),
+    senderHash: record.senderHash,
+    lane: "request-response",
+    sequence: 1,
+    state: "intent",
+    attempts: 0,
+    dueAtMs: record.receivedAtMs + MEDIA_FIRST_CORRECTION_DELAY_MS,
+    payload,
+  });
+}
+
 async function enqueueText(
   runtime: StudioRuntime,
   record: StudioInboxRecord,
@@ -661,15 +781,7 @@ async function enqueueText(
   text: string,
 ): Promise<void> {
   if (!isSafeTransportText(text)) throw new Error("unsafe studio response text");
-  const payload: StudioOutboxPayload = Object.freeze({
-    kind: "text",
-    thread: Object.freeze({
-      chatGuid: envelope.chatGuid,
-      sendingLine: envelope.sendingLine,
-      ...(envelope.replyTargetId === undefined ? {} : { replyTargetId: envelope.replyTargetId }),
-    }),
-    text,
-  });
+  const payload = responsePayload(envelope, text);
   await runtime.store.createOutbox({
     outboxId: stableRecordId(record.receiptId, label),
     senderHash: record.senderHash,
@@ -681,6 +793,21 @@ async function enqueueText(
   });
 }
 
+function responsePayload(
+  envelope: ReturnType<StudioRuntime["store"]["decryptInboxEnvelope"]>,
+  text: string,
+): StudioOutboxPayload {
+  return Object.freeze({
+    kind: "text",
+    thread: Object.freeze({
+      chatGuid: envelope.chatGuid,
+      sendingLine: envelope.sendingLine,
+      ...(envelope.replyTargetId === undefined ? {} : { replyTargetId: envelope.replyTargetId }),
+    }),
+    text,
+  });
+}
+
 function stableRecordId(receiptId: string, purpose: string): string {
   return createHash("sha256").update(`air:v2:outbox:${receiptId}:${purpose}`, "utf8").digest("hex");
 }
@@ -688,13 +815,15 @@ function stableRecordId(receiptId: string, purpose: string): string {
 async function dispatchOutboxEntry(
   runtime: StudioRuntime,
   record: StudioOutboxRecord,
+  leaseToken: string,
   payload: StudioOutboxPayload,
-): Promise<TransportOutcome> {
+): Promise<TransportOutcome | null> {
   const thread: IMessageThreadReference = payload.thread;
   const idempotencyKey = `air-v2-outbox-${record.outboxId}`;
 
   if (payload.kind === "tapback") {
     if (!payload.targetMessageId) return Object.freeze({ kind: "failed", code: "missing_tapback_target" });
+    if (!await runtime.store.authorizeOutboxDelivery(record, leaseToken)) return null;
     try {
       return await runtime.transport.addLikeTapback(thread, payload.targetMessageId, idempotencyKey);
     } catch {
@@ -704,6 +833,7 @@ async function dispatchOutboxEntry(
 
   let typingStarted = false;
   try {
+    if (!await runtime.store.authorizeOutboxDelivery(record, leaseToken)) return null;
     try {
       await runtime.transport.showTyping(thread);
       typingStarted = true;
@@ -711,6 +841,10 @@ async function dispatchOutboxEntry(
       // Typing is strictly best-effort and never blocks a durable message.
     }
     await dwell(TYPING_DWELL_MS);
+    // This second check closes the typing-dwell interval. The successful
+    // authorization immediately below is the durable commitment point for
+    // the following non-transactional transport call.
+    if (!await runtime.store.authorizeOutboxDelivery(record, leaseToken)) return null;
     if (payload.kind === "text") {
       if (!payload.text || !isSafeTransportText(payload.text)) {
         return Object.freeze({ kind: "failed", code: "invalid_text_payload" });

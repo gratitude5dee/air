@@ -49,6 +49,10 @@ export async function createStudioRuntime(
 
 export function studioPublicStatusResponse(): Response {
   return Response.json(
+    // This branded, dependency-free shape is an external compatibility
+    // contract. The protected readiness route is the source of truth for the
+    // current dark/active release state; do not overload this public product
+    // description with deployment configuration.
     { name: "Air", status: "allowlisted iMessage image and video generation" },
     { headers: { "cache-control": "no-store", link: '</favicon.ico>; rel="icon"; type="image/x-icon"' } },
   );
@@ -81,6 +85,10 @@ function runtimeFromConnectedRedis(
     redis: connection.redis,
     cipher,
     identityHashSecret: environment.idHashSecret as string,
+    releaseStamp: {
+      generation: environment.releaseGeneration,
+      phase: environment.releasePhase,
+    },
   });
   return Object.freeze({
     environment,

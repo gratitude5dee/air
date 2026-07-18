@@ -12,7 +12,8 @@
     { "source": "/healthz", "destination": "/api/healthz" },
     { "source": "/webhooks/imessage", "destination": "/api/webhooks/imessage" },
     { "source": "/internal/drain-inbox", "destination": "/api/internal/drain-inbox" },
-    { "source": "/internal/readiness", "destination": "/api/internal/readiness" }
+    { "source": "/internal/readiness", "destination": "/api/internal/readiness" },
+    { "source": "/internal/release-fence", "destination": "/api/internal/release-fence" }
   ],
   "crons": [
     { "path": "/internal/drain-inbox", "schedule": "* * * * *" }

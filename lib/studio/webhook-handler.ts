@@ -97,7 +97,13 @@ export async function handleStudioIMessageWebhook(
   let threadHash;
   try {
     senderHash = createSenderIdentity(environment.idHashSecret, normalized.senderId).senderHash;
-    threadHash = hashThreadIdentifier(environment.idHashSecret, `${normalized.chatGuid}\u0000${normalized.phone}`);
+    // Namespace the conversation scope by the configured Photon project as
+    // well as chat and sending line. Shared Redis must never let identical
+    // chat identifiers from another project join this pending-assembly fence.
+    threadHash = hashThreadIdentifier(
+      environment.idHashSecret,
+      `${normalized.projectId}\u0000${normalized.chatGuid}\u0000${normalized.phone}`,
+    );
   } catch {
     // The signed payload passed the provider schema, but its identifiers
     // cannot safely enter Air's bounded pseudonymous key space.
@@ -116,8 +122,6 @@ export async function handleStudioIMessageWebhook(
   const envelope: StudioInboundEnvelope = Object.freeze({
     chatGuid: normalized.chatGuid,
     sendingLine: normalized.phone,
-    senderIdentifier: normalized.senderId,
-    messageId: normalized.messageId,
     // The signed inbound message is the only reply target we can safely
     // resolve without a separate, spike-verified Photon history lookup.
     // Retaining it encrypted lets a future verified transport use native

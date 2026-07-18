@@ -1,13 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 
 import type { StudioEnvironment } from "../../lib/studio/config.js";
-import { handleStudioDrain, handleStudioReadiness } from "../../lib/studio/internal-routes.js";
+import {
+  handleStudioDrain,
+  handleStudioReadiness,
+  handleStudioReleaseFence,
+} from "../../lib/studio/internal-routes.js";
 import type { StudioRuntime } from "../../lib/studio/runtime.js";
 
 function darkEnvironment(): StudioEnvironment {
   return {
     deploymentMode: "preview",
     releasePhase: "dark",
+    releaseGeneration: 0,
     storageTransport: "rest",
     imessageProjectId: "project",
     imessageProjectSecret: "project-secret",
@@ -43,6 +48,16 @@ function authorizedRequest(path: string, method: "GET" | "POST" = "POST"): Reque
     method,
     headers: { authorization: "Bearer cron-secret" },
   });
+}
+
+function releaseFenceEnvironment(): StudioEnvironment {
+  return { ...darkEnvironment(), releaseFenceSecret: "release-fence-secret" };
+}
+
+function releaseFenceRequest(ifMatch: string | undefined, method = "POST", token = "release-fence-secret"): Request {
+  const headers = new Headers({ authorization: `Bearer ${token}` });
+  if (ifMatch !== undefined) headers.set("if-match", ifMatch);
+  return new Request("https://air.example.test/internal/release-fence", { method, headers });
 }
 
 describe("Studio Vercel internal routes", () => {
@@ -302,5 +317,79 @@ describe("Studio Vercel internal routes", () => {
     expect(response.status).toBe(405);
     expect(response.headers.get("allow")).toBe("GET");
     expect(await response.text()).toBe("");
+  });
+
+  it("advances or confirms the release fence only with a POST, dedicated bearer, and strict CAS precondition", async () => {
+    const advanceReleaseFence = vi.fn(async (
+      _previousGeneration: number,
+    ): Promise<{ kind: "advanced" | "current" | "conflict" | "invalid" }> => ({ kind: "advanced" }));
+    const getRuntime = vi.fn(async () => ({ store: { advanceReleaseFence } }) as unknown as StudioRuntime);
+    const response = await handleStudioReleaseFence(releaseFenceRequest("-1"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime,
+    });
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({ accepted: true });
+    expect(advanceReleaseFence).toHaveBeenCalledWith(-1);
+
+    advanceReleaseFence.mockResolvedValueOnce({ kind: "current" });
+    const current = await handleStudioReleaseFence(releaseFenceRequest("0"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime,
+    });
+    expect(current.status).toBe(202);
+    await expect(current.json()).resolves.toEqual({ accepted: true });
+    expect(advanceReleaseFence).toHaveBeenLastCalledWith(0);
+  });
+
+  it("does not load a runtime for an unauthenticated or malformed release-fence request", async () => {
+    const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
+    for (const request of [
+      releaseFenceRequest("-1", "POST", "wrong-secret"),
+      new Request("https://air.example.test/internal/release-fence", { method: "POST", headers: { "if-match": "-1" } }),
+    ]) {
+      const response = await handleStudioReleaseFence(request, {
+        loadEnvironment: releaseFenceEnvironment,
+        getRuntime,
+      });
+      expect(response.status).toBe(401);
+      expect(await response.text()).toBe("");
+    }
+    for (const ifMatch of [undefined, "-2", "01", "1.0", "9007199254740992"]) {
+      const response = await handleStudioReleaseFence(releaseFenceRequest(ifMatch), {
+        loadEnvironment: releaseFenceEnvironment,
+        getRuntime,
+      });
+      expect(response.status).toBe(409);
+      expect(await response.text()).toBe("");
+    }
+    expect(getRuntime).not.toHaveBeenCalled();
+  });
+
+  it("returns only a conflict response for a mismatched or invalid persisted release fence", async () => {
+    for (const kind of ["conflict", "invalid"] as const) {
+      const advanceReleaseFence = vi.fn(async () => ({ kind }));
+      const response = await handleStudioReleaseFence(releaseFenceRequest("1"), {
+        loadEnvironment: releaseFenceEnvironment,
+        getRuntime: async () => ({ store: { advanceReleaseFence } }) as unknown as StudioRuntime,
+      });
+      expect(response.status).toBe(409);
+      expect(await response.text()).toBe("");
+      expect(advanceReleaseFence).toHaveBeenCalledWith(1);
+    }
+  });
+
+  it("exposes the release-fence route only through its POST contract", async () => {
+    const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
+    const response = await handleStudioReleaseFence(releaseFenceRequest("-1", "GET"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime,
+    });
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("POST");
+    expect(await response.text()).toBe("");
+    expect(getRuntime).not.toHaveBeenCalled();
   });
 });

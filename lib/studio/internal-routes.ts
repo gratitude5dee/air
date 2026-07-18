@@ -115,6 +115,50 @@ export async function handleStudioReadiness(
   return readinessResponse(environment, enabledModels, redis, cron, problems);
 }
 
+/**
+ * Authenticated compare-and-swap for the global release fence. This endpoint
+ * deliberately returns no fence generation, configuration state, or error
+ * detail: callers must already know the expected generation to advance it.
+ */
+export async function handleStudioReleaseFence(
+  request: Request,
+  options: StudioInternalRouteOptions = {},
+): Promise<Response> {
+  if (request.method !== "POST") return methodNotAllowedResponse("POST");
+
+  let environment: StudioEnvironment;
+  try {
+    environment = (options.loadEnvironment ?? loadStudioEnvironment)();
+  } catch {
+    return privateEmptyResponse(503);
+  }
+  // Reuse the constant-time bearer comparison used by the protected Cron
+  // route, but authenticate against the independent release-fence secret.
+  if (!authorizeStudioDrain(request, environment.releaseFenceSecret)) {
+    return privateEmptyResponse(401);
+  }
+
+  const previousGeneration = parseReleaseFenceIfMatch(request.headers.get("if-match"));
+  if (previousGeneration === undefined) return privateEmptyResponse(409);
+
+  let runtime: StudioRuntime;
+  try {
+    runtime = await (options.getRuntime ?? getStudioRuntime)();
+  } catch {
+    return privateEmptyResponse(503);
+  }
+
+  try {
+    const outcome = await runtime.store.advanceReleaseFence(previousGeneration);
+    if (outcome.kind === "advanced" || outcome.kind === "current") {
+      return Response.json({ accepted: true }, { status: 202, headers: { "cache-control": "no-store" } });
+    }
+    return privateEmptyResponse(409);
+  } catch {
+    return privateEmptyResponse(503);
+  }
+}
+
 function readinessResponse(
   environment: StudioEnvironment,
   enabledModels: number,
@@ -161,6 +205,21 @@ function loadAuthorizedEnvironment(
   return authorizeStudioDrain(request, environment.cronSecret) ? environment : "unauthorized";
 }
 
-function privateEmptyResponse(status: 401 | 503): Response {
+/** Accept only the literal CAS precondition; whitespace and HTTP-list syntax are invalid. */
+function parseReleaseFenceIfMatch(value: string | null): number | undefined {
+  if (value === "-1") return -1;
+  if (!value || !/^(?:0|[1-9]\d*)$/.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+function methodNotAllowedResponse(allowed: string): Response {
+  return new Response(null, {
+    status: 405,
+    headers: { allow: allowed, "cache-control": "no-store" },
+  });
+}
+
+function privateEmptyResponse(status: 401 | 409 | 503): Response {
   return new Response(null, { status, headers: { "cache-control": "no-store" } });
 }

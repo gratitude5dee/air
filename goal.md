@@ -32,7 +32,10 @@ by this document.
    cannot reach a provider path.
 3. Prompts, identifiers, attachment references, model settings, provider IDs,
    and outbox payloads are encrypted at rest. Logs and plaintext metadata must
-   not contain them.
+   not contain them. Terminal inbox receipts atomically scrub their encrypted
+   envelope and retain only pseudonymous receipt metadata. Nonterminal job
+   metadata is content-free and durable; its encrypted input snapshot has an
+   immutable 24-hour lifetime.
 4. A durable outbox intent is recorded before every user-visible reply.
    Ambiguous provider submission or iMessage delivery is reconciled manually,
    never blindly retried.
@@ -41,6 +44,11 @@ by this document.
    verifies Redis with a non-tenant operational key, reports a
    environment-scoped Cron heartbeat, and reports both configured and effective
    (release-phase-gated) kill-switch state without returning values.
+6. Pending assembly is scoped by Photon project, sender, chat, and sending
+   line. Durable receipt order fences every write, cancel, and maintenance
+   transition; retries cannot refresh the absolute 10-minute encrypted media
+   retention or resurrect an older pending item. Media-first correction is a
+   durable 500 ms `dueAt` entry, never an in-function debounce.
 
 ## Activation gates beyond dark deployment
 
@@ -52,6 +60,10 @@ A separate Fable approval must cover all of the following before a canary:
 - fixture tests covering the selected provider schema and ambiguity handling;
 - a real-line Photon send/fetch transport spike and allowlisted iPhone test;
 - explicit enablement of only the necessary kill switches.
+- an authenticated shared Redis release-generation fence operated with an
+  approved rollback procedure. The implemented outbox fence covers generic
+  responses outside pending assembly; the future provider executor must bind
+  its own intents before any provider enablement.
 
 Production remains blocked until the canary has completed, the limits are
 enforced by evidence, and the owner explicitly approves promotion.

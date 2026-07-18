@@ -9,9 +9,11 @@ import type { IMessageThreadReference, StudioIMessageTransport, TransportOutcome
 import { getStudioWorkflow, isSinglePaidStepWorkflow } from "../../lib/studio/workflows.js";
 import type { StudioRuntime } from "../../lib/studio/runtime.js";
 import {
+  STUDIO_REDIS_PREFIX,
   StudioStore,
   type StudioAttachmentReference,
   type StudioInboundEnvelope,
+  type StudioInboxRecord,
   type StudioOutboxRecord,
 } from "../../lib/studio/store.js";
 
@@ -31,11 +33,15 @@ function createDarkFixture(options: {
   const cipher = createQueueCipher(Buffer.alloc(32, 23).toString("base64"));
   const senderHash = hashSenderIdentifier(IDENTITY_SECRET, SENDER_IDENTIFIER);
   const threadHash = hashThreadIdentifier(IDENTITY_SECRET, CHAT_GUID);
+  const releasePhase = options.releasePhase ?? "dark";
+  const releaseGeneration = releasePhase === "dark" ? 0 : 1;
+  const redis = new MemoryRedis(() => now);
   const store = new StudioStore({
-    redis: new MemoryRedis(() => now),
+    redis,
     cipher,
     identityHashSecret: IDENTITY_SECRET,
     clock: () => now,
+    releaseStamp: { generation: releaseGeneration, phase: releasePhase },
   });
   const transport = {
     verified: options.transportVerified ?? false,
@@ -63,7 +69,9 @@ function createDarkFixture(options: {
   } satisfies StudioIMessageTransport;
   const environment: StudioEnvironment = {
     deploymentMode: "preview",
-    releasePhase: options.releasePhase ?? "dark",
+    releasePhase,
+    releaseGeneration,
+    ...(releasePhase === "dark" ? {} : { releaseFenceSecret: "test-release-fence-secret" }),
     storageTransport: "rest",
     imessageProjectId: "test-project",
     imessageProjectSecret: "test-project-secret",
@@ -102,7 +110,19 @@ function createDarkFixture(options: {
     close: async (): Promise<void> => undefined,
   };
 
-  return { runtime, store, transport, senderHash, threadHash };
+  return { runtime, store, transport, senderHash, threadHash, redis, cipher };
+}
+
+async function armFixtureReleaseFence(fixture: ReturnType<typeof createDarkFixture>): Promise<void> {
+  if (fixture.runtime.environment.releasePhase === "dark") return;
+  const baseline = new StudioStore({
+    redis: fixture.redis,
+    cipher: fixture.cipher,
+    identityHashSecret: IDENTITY_SECRET,
+    releaseStamp: { generation: 0, phase: "dark" },
+  });
+  expect(await baseline.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+  expect(await fixture.store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
 }
 
 async function persistInbound(
@@ -115,8 +135,6 @@ async function persistInbound(
   const envelope: StudioInboundEnvelope = {
     chatGuid: CHAT_GUID,
     sendingLine: SENDING_LINE,
-    senderIdentifier: SENDER_IDENTIFIER,
-    messageId,
     text,
     attachments,
     replyTargetId: `reply-${messageId}`,
@@ -129,6 +147,32 @@ async function persistInbound(
   });
   expect(persisted.created).toBe(true);
   return receiptId;
+}
+
+async function terminalPendingSource(
+  fixture: ReturnType<typeof createDarkFixture>,
+  messageId: string,
+): Promise<StudioInboxRecord> {
+  const receiptId = fixture.store.receiptId("test-project", messageId);
+  const persisted = await fixture.store.persistInbox({
+    receiptId,
+    senderHash: fixture.senderHash,
+    threadHash: fixture.threadHash,
+    envelope: {
+      chatGuid: CHAT_GUID,
+      sendingLine: SENDING_LINE,
+      text: null,
+      attachments: [],
+      replyTargetId: `reply-${messageId}`,
+    },
+  });
+  if (!persisted.created) throw new Error("expected pending source receipt");
+  const claim = await fixture.store.claimNextInbox();
+  if (!claim || claim.record.receiptId !== receiptId) throw new Error("expected source receipt claim");
+  if (!await fixture.store.finishInbox(receiptId, claim.leaseToken, "processed")) {
+    throw new Error("expected terminal source receipt");
+  }
+  return persisted.record;
 }
 
 async function durableOutboxRecords(
@@ -220,12 +264,251 @@ describe("Air studio dark engine", () => {
     expect(fixture.transport.sendText).not.toHaveBeenCalled();
   });
 
+  it("fails an outbox whose encrypted payload disappears after claim without treating it as a send", async () => {
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      deliveryEnabled: true,
+      transportVerified: true,
+    });
+    await armFixtureReleaseFence(fixture);
+    const outboxId = "payload-expired-after-claim";
+    await fixture.store.createOutbox({
+      outboxId,
+      senderHash: fixture.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: {
+        kind: "text",
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+        text: "This payload must never reach the transport after expiry.",
+      },
+    });
+    const claimNextOutbox = fixture.store.claimNextOutbox.bind(fixture.store);
+    vi.spyOn(fixture.store, "claimNextOutbox").mockImplementation(async () => {
+      const claim = await claimNextOutbox();
+      if (claim) await fixture.redis.del(`${STUDIO_REDIS_PREFIX}:outbox:payload:${outboxId}`);
+      return claim;
+    });
+
+    await expect(drainStudioOutbox(fixture.runtime)).resolves.toBe(0);
+
+    await expect(fixture.store.getOutbox(outboxId)).resolves.toMatchObject({
+      state: "failed",
+      attempts: 1,
+    });
+    expect(fixture.transport.showTyping).not.toHaveBeenCalled();
+    expect(fixture.transport.sendText).not.toHaveBeenCalled();
+  });
+
   it("defines every launch workflow as exactly one provider-generation paid step", () => {
     for (const mode of ["imagine", "animate", "edit-image", "edit-video"] as const) {
       const workflow = getStudioWorkflow(mode);
       expect(isSinglePaidStepWorkflow(workflow)).toBe(true);
       expect(workflow.workflowId).toBe(`air:${mode}:v1`);
       expect(workflow.paidSteps).toEqual([{ stepId: "provider-generation", kind: "provider-generation" }]);
+    }
+  });
+
+  it("cancels a pre-existing pending intent before a dark media-first receipt", async () => {
+    const fixture = createDarkFixture();
+    const createOutbox = vi.spyOn(fixture.store, "createOutbox");
+    const source = await terminalPendingSource(fixture, "older-pending-source");
+    await fixture.store.putPending(source, {
+      schemaVersion: 1,
+      kind: "media",
+      attachment: { id: "older-attachment", mimeType: "image/png", sizeBytes: 42 },
+      createdAtMs: source.receivedAtMs,
+    });
+    const receiptId = await persistInbound(
+      fixture,
+      "media-only-dark-001",
+      null,
+      [{ id: "new-attachment", mimeType: "image/png", sizeBytes: 42 }],
+    );
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "maintenance_rejected" });
+    await expect(fixture.store.getPending(fixture.senderHash, fixture.threadHash)).resolves.toBeNull();
+    const records = await durableOutboxRecords(
+      fixture,
+      createOutbox.mock.calls.map(([input]) => input.outboxId),
+    );
+    expect(records.map((record) => fixture.store.decryptOutboxPayload(record).text)).toEqual(expect.arrayContaining([
+      "Air is in maintenance mode; I canceled the pending request. No generation was submitted.",
+    ]));
+  });
+
+  it("does not retain a new media-first attachment in the dark phase", async () => {
+    const fixture = createDarkFixture();
+    const createOutbox = vi.spyOn(fixture.store, "createOutbox");
+    const receiptId = await persistInbound(
+      fixture,
+      "media-only-dark-no-pending-001",
+      null,
+      [{ id: "new-attachment", mimeType: "image/png", sizeBytes: 42 }],
+    );
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "maintenance_rejected" });
+    await expect(fixture.store.getPending(fixture.senderHash, fixture.threadHash)).resolves.toBeNull();
+    const records = await durableOutboxRecords(
+      fixture,
+      createOutbox.mock.calls.map(([input]) => input.outboxId),
+    );
+    expect(records.map((record) => fixture.store.decryptOutboxPayload(record).text)).toEqual(expect.arrayContaining([
+      "Air is in maintenance mode; I didn’t retain that attachment. No generation was submitted.",
+    ]));
+  });
+
+  it("does not publish or deliver a saved-media claim when pending acknowledgement persistence is revoked", async () => {
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      deliveryEnabled: true,
+      transportVerified: true,
+    });
+    await armFixtureReleaseFence(fixture);
+    // Keep the interleaving focused on the media acknowledgement rather than
+    // first-contact onboarding messages.
+    await fixture.store.putSettings(fixture.senderHash, {
+      schemaVersion: 1,
+      onboardingVersion: 1,
+      modes: {
+        imagine: { outputCount: 1 },
+        animate: { outputCount: 1, durationSeconds: 5 },
+        "edit-image": { outputCount: 1 },
+        "edit-video": { outputCount: 1, durationSeconds: 5 },
+      },
+    });
+    vi.spyOn(fixture.store, "createPendingGuardedOutbox").mockImplementation(async (guard, input) => {
+      // Model an intervening dark deployment. The storage primitive itself is
+      // exercised in store tests; this keeps the engine assertion focused on
+      // truthful copy for a revoked acknowledgement.
+      void guard;
+      void input;
+      return { kind: "maintenance" };
+    });
+    const receiptId = await persistInbound(
+      fixture,
+      "media-rollback-between-pending-and-ack-001",
+      null,
+      [{ id: "race-attachment", mimeType: "image/png", sizeBytes: 42 }],
+    );
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 1 });
+
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "maintenance_rejected" });
+    const deliveredTexts = fixture.transport.sendText.mock.calls.map(([, text]) => text);
+    expect(deliveredTexts).toEqual([
+      "That pending attachment is no longer active. Send it again with an explicit command.",
+    ]);
+    expect(deliveredTexts.join("\n")).not.toContain("I saved that one attachment");
+  });
+
+  it("never delivers a queued media acknowledgement after maintenance revokes its guard", async () => {
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      deliveryEnabled: true,
+      transportVerified: true,
+    });
+    await armFixtureReleaseFence(fixture);
+    const source = await terminalPendingSource(fixture, "queued-before-rollback-source");
+    const pending = await fixture.store.putPendingWithGuard(source, {
+      attachmentId: "queued-before-rollback",
+    });
+    if (pending.kind !== "active") throw new Error("expected a pending guard");
+    const acknowledgement = await fixture.store.createPendingGuardedOutbox(pending.guard, {
+      outboxId: "queued-media-ack-before-rollback",
+      senderHash: fixture.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: {
+        kind: "text",
+        text: "I saved that one attachment for 10 minutes.",
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+      },
+    });
+    expect(acknowledgement.kind).toBe("persisted");
+
+    const maintenance = await terminalPendingSource(fixture, "queued-before-rollback-maintenance");
+    await fixture.store.blockPendingForMaintenance(maintenance);
+    await expect(drainStudioOutbox(fixture.runtime)).resolves.toBe(0);
+
+    expect(fixture.transport.showTyping).not.toHaveBeenCalled();
+    expect(fixture.transport.sendText).not.toHaveBeenCalled();
+    await expect(fixture.store.getOutbox("queued-media-ack-before-rollback"))
+      .resolves.toMatchObject({ state: "canceled" });
+  });
+
+  it("rechecks a claimed media acknowledgement after typing before sending it", async () => {
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      deliveryEnabled: true,
+      transportVerified: true,
+    });
+    await armFixtureReleaseFence(fixture);
+    const source = await terminalPendingSource(fixture, "claimed-before-rollback-source");
+    const pending = await fixture.store.putPendingWithGuard(source, {
+      attachmentId: "claimed-before-rollback",
+    });
+    if (pending.kind !== "active") throw new Error("expected a pending guard");
+    await fixture.store.createPendingGuardedOutbox(pending.guard, {
+      outboxId: "claimed-media-ack-before-rollback",
+      senderHash: fixture.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: {
+        kind: "text",
+        text: "I saved that one attachment for 10 minutes.",
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+      },
+    });
+    fixture.transport.showTyping.mockImplementationOnce(async () => {
+      // This is after the queue claim and first authorization, but before the
+      // dwell-complete authorization directly preceding sendText.
+      const maintenance = await terminalPendingSource(fixture, "claimed-before-rollback-maintenance");
+      await fixture.store.blockPendingForMaintenance(maintenance);
+    });
+
+    await expect(drainStudioOutbox(fixture.runtime)).resolves.toBe(0);
+
+    expect(fixture.transport.showTyping).toHaveBeenCalledTimes(1);
+    expect(fixture.transport.stopTyping).toHaveBeenCalledTimes(1);
+    expect(fixture.transport.sendText).not.toHaveBeenCalled();
+    await expect(fixture.store.getOutbox("claimed-media-ack-before-rollback"))
+      .resolves.toMatchObject({ state: "canceled" });
+  });
+
+  it("cancels a pending intent before dark utility and multi-attachment branches", async () => {
+    for (const input of [
+      { id: "pending-help-dark-001", text: "/help", attachments: [] },
+      {
+        id: "pending-multi-dark-001",
+        text: null,
+        attachments: [
+          { id: "first-attachment", mimeType: "image/png", sizeBytes: 42 },
+          { id: "second-attachment", mimeType: "image/png", sizeBytes: 42 },
+        ],
+      },
+    ] as const) {
+      const fixture = createDarkFixture();
+      const source = await terminalPendingSource(fixture, `older-pending-${input.id}`);
+      await fixture.store.putPending(source, {
+        schemaVersion: 1,
+        kind: "media",
+        attachment: { id: "older-attachment", mimeType: "image/png", sizeBytes: 42 },
+        createdAtMs: source.receivedAtMs,
+      });
+      const receiptId = await persistInbound(fixture, input.id, input.text, input.attachments);
+
+      await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+      await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "maintenance_rejected" });
+      await expect(fixture.store.getPending(fixture.senderHash, fixture.threadHash)).resolves.toBeNull();
     }
   });
 

@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createSenderIdentity } from "../../lib/security.js";
+import { createSenderIdentity, hashThreadIdentifier } from "../../lib/security.js";
 import { authorizeStudioDrain, handleStudioIMessageWebhook } from "../../lib/studio/webhook-handler.js";
 import type { StudioRuntime } from "../../lib/studio/runtime.js";
 
@@ -16,8 +16,7 @@ type PersistInput = {
   readonly envelope: {
     readonly chatGuid: string;
     readonly sendingLine: string;
-    readonly senderIdentifier: string;
-    readonly messageId: string;
+    readonly replyTargetId?: string;
     readonly text: string | null;
     readonly attachments: readonly unknown[];
   };
@@ -129,15 +128,22 @@ describe("Air iMessage webhook", () => {
     expect(persistInbox).toHaveBeenCalledWith(expect.objectContaining({
       receiptId: "receipt:photon-project:message-001",
       senderHash: createSenderIdentity(identitySecret, senderId).senderHash,
+      threadHash: hashThreadIdentifier(
+        identitySecret,
+        "photon-project\u0000iMessage;-;+14155550123\u0000+14155550999",
+      ),
       envelope: expect.objectContaining({
         chatGuid: "iMessage;-;+14155550123",
         sendingLine: "+14155550999",
-        senderIdentifier: senderId,
-        messageId: "message-001",
+        replyTargetId: "message-001",
         text: "Make a rain-soaked cyberpunk alley.",
         attachments: [],
       }),
     }));
+    const persisted = persistInbox.mock.calls[0]?.[0];
+    if (!persisted) throw new Error("expected inbound persistence");
+    expect(persisted.envelope).not.toHaveProperty("senderIdentifier");
+    expect(persisted.envelope).not.toHaveProperty("messageId");
   });
 
   it("persists duplicate deliveries but only schedules a drain for a newly created receipt", async () => {
