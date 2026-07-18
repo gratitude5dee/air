@@ -92,7 +92,11 @@ export function loadStudioEnvironment(source: EnvironmentSource = process.env): 
   if (restToken !== undefined) validateSecretLikeValue(restToken, "Upstash Redis REST token");
 
   const redisUrl = optional(source.REDIS_URL);
-  if (redisUrl !== undefined) validateRedisUrl(redisUrl);
+  // A legacy deployment may retain a TCP URL with credentials/options that
+  // the V2 REST client neither parses nor uses. Validate it only when it is
+  // the selected Studio transport; otherwise an unrelated rollback setting
+  // must not prevent the explicit REST control plane from starting.
+  if (redisUrl !== undefined && restUrl === undefined) validateRedisUrl(redisUrl);
   // V2 selects the explicit Upstash REST pair whenever it is present. The
   // retained REDIS_URL can belong to the legacy deployment kept for rollback;
   // treating it as a second V2 store would make a production migration fail

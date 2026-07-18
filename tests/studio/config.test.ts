@@ -66,6 +66,13 @@ describe("Air studio configuration", () => {
       UPSTASH_REDIS_REST_TOKEN: "rest-token",
     }));
     expect(logicalDatabase.storageTransport).toBe("rest");
+
+    const legacyCredentialUrl = loadStudioEnvironment(configured({
+      REDIS_URL: "rediss://legacy-user:legacy-password@legacy-redis.example.test:6380/9",
+      UPSTASH_REDIS_REST_URL: "https://redis.example.test",
+      UPSTASH_REDIS_REST_TOKEN: "rest-token",
+    }));
+    expect(legacyCredentialUrl.storageTransport).toBe("rest");
   });
 
   it("keeps a dark release closed even when all identity settings are present", () => {
