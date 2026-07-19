@@ -85,11 +85,12 @@ has been verified by authenticated evidence. Consequently `/models` is empty
 and creation commands cannot reserve spend or call a provider.
 
 The existing Vercel project is `air` at `air.wzrd.tech`. As verified on
-2026-07-18, production deployment `dpl_Bm3MRMfdhewjvRDsWsPjRKyodegU` is the
-promoted delivery-only runtime. Its public health endpoint reports Air Studio
-version 2 and Vercel records a successful protected drain every minute. The
-shared release fence is production generation 1. The production smoke release
-enables only `AIR_DELIVERY_ENABLED`; it leaves every provider and
+2026-07-18, production deployment `dpl_5mUTyh6EsHJWpibszP8LrBLTTdSu` is the
+promoted delivery-only runtime (source through `5304722`). Its public health
+endpoint reports Air Studio version 2 and Vercel records a successful
+protected drain every minute. The shared release fence is production
+generation 1. The production smoke release enables only
+`AIR_DELIVERY_ENABLED`; it leaves every provider and
 paid-generation switch false, keeps the registry at zero enabled models, and
 does not configure GMI or fal credentials. Photon webhook binding and the real
 allowlisted `/help` response are intentionally not claimed until they are
