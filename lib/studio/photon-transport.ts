@@ -264,13 +264,16 @@ class CloudIMessagePort implements PhotonIMessagePort {
   private clientForInstance(instanceId: string, address: string): PhotonIMessageClient {
     const existing = this.clientsByInstance.get(instanceId);
     if (existing) return existing;
-    const client = createClient({
+    // Keep the narrow Air facade structurally checked against the installed
+    // Photon SDK. An unchecked cast here could silently drop the durable
+    // `clientMessageId` contract after a dependency update.
+    const client: PhotonIMessageClient = createClient({
       address,
       autoIdempotency: false,
       retry: false,
       tls: true,
       token: async () => this.tokenFor(instanceId),
-    }) as PhotonIMessageClient;
+    });
     this.clientsByInstance.set(instanceId, client);
     return client;
   }
