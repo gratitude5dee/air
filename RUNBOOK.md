@@ -5,18 +5,19 @@ iMessage smoke test. It does not authorize image/video generation, provider
 submission/recovery, uploads, polling, artifact delivery, or any paid action.
 The owner sends the test text; release automation never sends an iMessage.
 
-## Prior deployment baseline
+## Current delivery-only production baseline
 
-Before a subsequent verified release, Vercel production deployment
-`dpl_49byWqfH1UH9nwwsnVb6uuz6848F` from `dc4a8d6` is aliased to
-`air.wzrd.tech`. Its public health endpoint returns Air Studio version 2, the
-authenticated release fence is production generation 1, and the Vercel Cron
-has recorded successful minute drains. This is not a Photon-webhook or
-real-line acceptance record: the existing dashboard target and one owner-sent
-`/help` reply still need to be verified before claiming the smoke test passed.
-Record the new deployment identity in the release handoff after every
-production deployment; do not treat this baseline as proof that later code is
-live.
+As verified on 2026-07-18, Vercel production deployment
+`dpl_Bm3MRMfdhewjvRDsWsPjRKyodegU` is aliased to `air.wzrd.tech`. It contains
+the delivery-only runtime from `ba1f7c2`; later branch commits are
+documentation/test-only and do not change the deployed behavior. Its public
+health endpoint returns Air Studio version 2, the authenticated release fence
+is production generation 1, and the Vercel Cron has recorded successful
+minute drains. This is not a Photon-webhook or real-line acceptance record:
+the existing dashboard target and one owner-sent `/help` reply still need to
+be verified before claiming the smoke test passed. Record the new deployment
+identity in the release handoff after every production deployment; do not
+treat this baseline as proof that later code is live.
 
 ## Preconditions
 

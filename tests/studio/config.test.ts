@@ -114,7 +114,7 @@ describe("Air studio configuration", () => {
     expect(canDeliverStudioMessages(active)).toBe(true);
   });
 
-  it("treats zero caps, unset policy, and closed admission as paid-provider kill switches", () => {
+  it("keeps accepted provider work recoverable after rollback closes admission and submission", () => {
     const active = loadStudioEnvironment(configured({
       VERCEL_ENV: "production",
       AIR_RELEASE_PHASE: "production",
@@ -130,9 +130,23 @@ describe("Air studio configuration", () => {
 
     expect(canSubmitPaidStudioProvider(active)).toBe(true);
     expect(canRecoverPaidStudioProvider(active)).toBe(true);
-    expect(canSubmitPaidStudioProvider({
+
+    const rollback = {
       ...active,
-      policy: { ...active.policy, acceptNewJobs: false },
+      policy: {
+        ...active.policy,
+        acceptNewJobs: false,
+        allowProviderSubmit: false,
+        allowProviderRecovery: true,
+      },
+    };
+    expect(canAcceptStudioJobs(rollback)).toBe(false);
+    expect(canSubmitPaidStudioProvider(rollback)).toBe(false);
+    expect(canRecoverPaidStudioProvider(rollback)).toBe(true);
+
+    expect(canRecoverPaidStudioProvider({
+      ...active,
+      releasePhase: "dark",
     })).toBe(false);
     expect(canRecoverPaidStudioProvider({
       ...active,

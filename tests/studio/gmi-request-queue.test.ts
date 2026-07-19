@@ -136,17 +136,43 @@ describe("GMI request-queue client", () => {
     expect(calls).toBe(0);
   });
 
-  it("keeps submission, upload preparation, and recovery off without explicit accepted positive-budget policy", async () => {
+  it("allows recovery after rollback closes admissions and submissions", async () => {
+    let calls = 0;
+    const service = client(async () => {
+      calls += 1;
+      return json({ request_id: "gmi-request-123", status: "success" });
+    }, {
+      sideEffectEnvironment: {
+        ...ACTIVE_PROVIDER_POLICY,
+        policy: {
+          ...ACTIVE_PROVIDER_POLICY.policy,
+          acceptNewJobs: false,
+          allowProviderSubmit: false,
+          allowProviderRecovery: true,
+        },
+      },
+    });
+
+    await expect(service.submit({ model: "Veo3", payload: { prompt: "fixture" } })).rejects.toMatchObject({
+      code: "provider_submission_disabled",
+    });
+    await expect(service.createUploadUrl({ fileType: "png", storage })).rejects.toMatchObject({
+      code: "provider_submission_disabled",
+    });
+    await expect(service.getRequestStatus("gmi-request-123")).resolves.toMatchObject({
+      requestId: "gmi-request-123",
+      status: "success",
+    });
+    expect(calls).toBe(1);
+  });
+
+  it("keeps submission, upload preparation, and recovery off without explicit positive-budget policy", async () => {
     let calls = 0;
     const fetch = async (): Promise<Response> => {
       calls += 1;
       return json({ request_id: "must-not-be-called", status: "success" });
     };
     const blockedPolicies = [
-      {
-        ...ACTIVE_PROVIDER_POLICY,
-        policy: { ...ACTIVE_PROVIDER_POLICY.policy, acceptNewJobs: false },
-      },
       {
         ...ACTIVE_PROVIDER_POLICY,
         policyExplicit: false,

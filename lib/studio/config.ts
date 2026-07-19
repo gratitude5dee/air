@@ -226,13 +226,15 @@ export function canRecoverStudioProvider(environment: StudioSideEffectEnvironmen
 }
 
 /**
- * Polling, upload preparation, and any other provider recovery operation can
- * also incur provider-side work. Keep them behind the same explicit positive
- * budget and admission authorization as new submission.
+ * Polling, artifact retrieval, cancellation, and reconciliation can incur
+ * provider-side work, so they still require an explicit positive bounded
+ * policy. They deliberately do not require new-job admission or submission:
+ * rollback closes both of those switches while accepted work remains
+ * recoverable, unless the separate recovery switch is disabled for a provider
+ * safety incident.
  */
 export function canRecoverPaidStudioProvider(environment: StudioPaidProviderEnvironment): boolean {
   return hasExplicitPositiveSpendPolicy(environment)
-    && canAcceptStudioJobs(environment)
     && canRecoverStudioProvider(environment);
 }
 
