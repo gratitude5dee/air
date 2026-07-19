@@ -72,9 +72,11 @@ live.
 ## Owner smoke test
 
 From the existing allowlisted iMessage number, send `/help` to Air. Confirm
-one text response arrives. This may take one Cron interval after the signed
-webhook receipt is accepted. Do not send an image, video, attachment, or a
-generation command during this release.
+the text response arrives. On that number's first successful contact, Air also
+queues its two ordered welcome bubbles, so up to three text messages are
+expected; later `/help` requests have only the help response. This may take
+one Cron interval after the signed webhook receipt is accepted. Do not send an
+image, video, attachment, or a generation command during this release.
 
 ## Stop and rollback
 
