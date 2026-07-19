@@ -2,7 +2,8 @@
 
 This record describes the non-billable Air dark preview only. It is not a
 canary, production approval, provider test, or real-line iMessage acceptance
-record.
+record. The later delivery-only production deployment is recorded separately
+below so this historical preview evidence is not mistaken for current state.
 
 ## Deployed revision
 
@@ -31,9 +32,9 @@ record.
 - Vercel SSO protected the preview URL during automated fetches, returning
   `302` before the application routes; no protected endpoint, webhook, or
   provider endpoint was invoked.
-- The currently promoted production deployment remains
-  `dpl_ozYZFaMMGsbGYPCSbMjbmUwqLMLY` on the pre-studio baseline. It was not
-  modified by this preview deployment.
+- At the time of this preview, production remained
+  `dpl_ozYZFaMMGsbGYPCSbMjbmUwqLMLY` on the pre-studio baseline. That historical
+  state was superseded by the delivery-only production release below.
 
 ## Readiness contract added in this revision
 
@@ -48,3 +49,23 @@ The marker demonstrates an authorized GET drain, not cryptographic proof that
 Vercel scheduled it. Production Cron logs, entitlement, header behavior, and
 a controlled protected-readiness test remain required evidence before any
 enablement decision.
+
+## Subsequent delivery-only production release — 2026-07-18
+
+- Production deployment:
+  `dpl_49byWqfH1UH9nwwsnVb6uuz6848F`, Ready, from source revision `dc4a8d6`
+  (`feat: expose authenticated release fence status`).
+- The deployment aliases include `https://air.wzrd.tech`; the public health
+  check returns `200 {"ok":true,"version":"2"}` and the public status is the
+  private allowlisted Air Studio response.
+- The authenticated shared release-fence read confirmed production generation
+  1. No secret or user data was recorded.
+- Vercel's production Cron invoked `GET /internal/drain-inbox` successfully at
+  one-minute cadence, returning `202` in the recorded production logs.
+- A names-only production environment audit found the delivery, policy, and
+  spend controls and no `GMI_API_KEY`, `FAL_KEY`, or `FAL_*` name. Encrypted
+  values were not read.
+
+This is still a zero-spend, zero-model, text-only release. It does not prove
+the Photon webhook target, a real allowlisted inbound receipt, outbound
+iMessage delivery, any attachment behavior, or any provider capability.

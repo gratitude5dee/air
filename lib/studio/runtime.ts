@@ -2,8 +2,8 @@ import { createQueueCipher, type QueueCipher } from "../crypto.js";
 import { connectRedisFromUrl, type ConnectedRedis } from "../redis.js";
 import {
   canAcceptStudioJobs,
-  canRecoverStudioProvider,
-  canSubmitStudioProvider,
+  canRecoverPaidStudioProvider,
+  canSubmitPaidStudioProvider,
   loadStudioEnvironment,
   studioReadinessProblems,
   type StudioEnvironment,
@@ -140,7 +140,7 @@ function runtimeFromConnectedRedis(
       const problems = [...studioReadinessProblems(environment, expectedRegistryVersion)];
       if (!transport.verified) problems.push("transport_unverified");
       if (
-        (canAcceptStudioJobs(environment) || canSubmitStudioProvider(environment) || canRecoverStudioProvider(environment))
+        (canAcceptStudioJobs(environment) || canSubmitPaidStudioProvider(environment) || canRecoverPaidStudioProvider(environment))
         && !provider.verified
       ) problems.push("provider_unprovisioned");
       return Object.freeze(problems);

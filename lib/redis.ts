@@ -943,6 +943,18 @@ interface MemoryStudioReleaseFence {
   readonly phase: "dark" | "canary" | "production";
 }
 
+interface MemoryStudioOnboardingMarker {
+  readonly schemaVersion: 1;
+  readonly onboardingVersion: number;
+  readonly receiptId: string;
+  readonly firstOutboxId: string;
+  readonly secondOutboxId: string;
+}
+
+function isMemoryOpaqueStudioIdentifier(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+}
+
 /**
  * Deterministic in-memory implementation for isolated tests.  It is not a
  * production fallback: deployed Air must provide a real Redis adapter.
@@ -1160,6 +1172,9 @@ export class MemoryRedis implements RedisLike {
     }
     if (script.includes("AIR_STUDIO_PERSIST_INBOX_V4")) {
       return this.evalStudioPersistInbox(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_ENSURE_ONBOARDING_BUNDLE_V1")) {
+      return this.evalStudioEnsureOnboardingBundle(options.keys, options.arguments);
     }
     if (script.includes("AIR_STUDIO_PERSIST_OUTBOX_V4")) {
       return this.evalStudioPersistOutbox(options.keys, options.arguments);
@@ -1490,6 +1505,159 @@ export class MemoryRedis implements RedisLike {
     this.getZSet(readyKey, true).value.set(member, score);
     this.getZSet(laneKey, true).value.set(member, sequence);
     return 1;
+  }
+
+  /**
+   * Mirror the enrollment Lua as one unit. Do not compose the generic outbox
+   * primitive here: tests must reject the same partial-write states Redis
+   * rejects when a concurrent first contact races the onboarding lane.
+   */
+  private evalStudioEnsureOnboardingBundle(keys: readonly string[], args: readonly string[]): number {
+    try {
+      this.assertStudioArity(keys, args, 9, 16);
+      const settingsKey = this.studioKey(keys, 0);
+      const markerKey = this.studioKey(keys, 1);
+      const firstKey = this.studioKey(keys, 2);
+      const firstPayloadKey = this.studioKey(keys, 3);
+      const secondKey = this.studioKey(keys, 4);
+      const secondPayloadKey = this.studioKey(keys, 5);
+      const readyKey = this.studioKey(keys, 6);
+      const laneKey = this.studioKey(keys, 7);
+      const releaseFenceKey = this.studioKey(keys, 8);
+      const settings = this.studioArgument(args, 0);
+      const settingsTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
+      const marker = this.studioArgument(args, 2);
+      const firstRaw = this.studioArgument(args, 3);
+      const firstPayload = this.studioArgument(args, 4);
+      const firstId = this.studioArgument(args, 5);
+      const firstSequence = this.studioNonnegativeInteger(this.studioArgument(args, 6));
+      const firstDueAt = this.studioNonnegativeInteger(this.studioArgument(args, 7));
+      const secondRaw = this.studioArgument(args, 8);
+      const secondPayload = this.studioArgument(args, 9);
+      const secondId = this.studioArgument(args, 10);
+      const secondSequence = this.studioNonnegativeInteger(this.studioArgument(args, 11));
+      const secondDueAt = this.studioNonnegativeInteger(this.studioArgument(args, 12));
+      const outboxPayloadTtl = this.studioPositiveInteger(this.studioArgument(args, 13));
+      const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 14));
+      const releasePhase = this.studioArgument(args, 15);
+      if (
+        firstSequence !== 1
+        || secondSequence !== 2
+        || (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production")
+        || (releasePhase !== "dark" && releaseGeneration < 1)
+      ) return -3;
+
+      const candidateMarker = this.studioOnboardingMarkerFromJson(marker);
+      if (
+        !candidateMarker
+        || candidateMarker.firstOutboxId !== firstId
+        || candidateMarker.secondOutboxId !== secondId
+      ) return -3;
+
+      // A marker is proof of the whole atomic bundle and wins before current
+      // release checks, just as an existing job admission wins before a later
+      // rollout changes policy.
+      this.assertStringOrMissing(markerKey);
+      const existingMarkerRaw = this.studioString(markerKey);
+      if (existingMarkerRaw !== null) {
+        const existingMarker = this.studioOnboardingMarkerFromJson(existingMarkerRaw);
+        return existingMarker && existingMarker.onboardingVersion === candidateMarker.onboardingVersion ? 2 : -3;
+      }
+
+      // Validate all source values and key kinds before creating any zset or
+      // writing a string. This preserves Redis Lua's all-or-nothing boundary.
+      this.assertStringOrMissing(settingsKey);
+      this.assertStringOrMissing(firstKey);
+      this.assertStringOrMissing(firstPayloadKey);
+      this.assertStringOrMissing(secondKey);
+      this.assertStringOrMissing(secondPayloadKey);
+      this.assertStringOrMissing(releaseFenceKey);
+      this.assertZSetOrMissing(readyKey);
+      this.assertZSetOrMissing(laneKey);
+      if (
+        !this.studioEncryptedPayloadFromJson(settings)
+        || !this.studioEncryptedPayloadFromJson(firstPayload)
+        || !this.studioEncryptedPayloadFromJson(secondPayload)
+        || !isMemoryOpaqueStudioIdentifier(firstId)
+        || !isMemoryOpaqueStudioIdentifier(secondId)
+        || firstId === secondId
+      ) return -3;
+
+      const first = this.studioRecordFromJson(firstRaw);
+      const second = this.studioRecordFromJson(secondRaw);
+      const senderHash = first.senderHash;
+      if (
+        !isMemoryOpaqueStudioIdentifier(senderHash)
+        || senderHash !== second.senderHash
+        || !this.studioValidNewOnboardingOutbox(
+          first,
+          firstId,
+          senderHash,
+          firstSequence,
+          firstDueAt,
+          releaseGeneration,
+          releasePhase,
+        )
+        || !this.studioValidNewOnboardingOutbox(
+          second,
+          secondId,
+          senderHash,
+          secondSequence,
+          secondDueAt,
+          releaseGeneration,
+          releasePhase,
+        )
+      ) return -3;
+
+      const release = this.studioReleasePersistenceStatus(
+        first,
+        releaseFenceKey,
+        releaseGeneration,
+        releasePhase,
+      );
+      if (release === -1) return -2;
+      if (release === 0) return -3;
+
+      if (
+        this.getEntry(firstKey)
+        || this.getEntry(firstPayloadKey)
+        || this.getEntry(secondKey)
+        || this.getEntry(secondPayloadKey)
+      ) return -3;
+      const lane = this.getZSet(laneKey, false);
+      if ([...(lane?.value.values() ?? [])].some((sequence) => sequence === firstSequence || sequence === secondSequence)) {
+        return -3;
+      }
+
+      const now = this.now();
+      this.values.set(settingsKey, {
+        kind: "string",
+        value: settings,
+        expiresAt: now + settingsTtl * 1_000,
+      });
+      this.values.set(firstKey, { kind: "string", value: firstRaw, expiresAt: null });
+      this.values.set(firstPayloadKey, {
+        kind: "string",
+        value: firstPayload,
+        expiresAt: now + outboxPayloadTtl * 1_000,
+      });
+      this.values.set(secondKey, { kind: "string", value: secondRaw, expiresAt: null });
+      this.values.set(secondPayloadKey, {
+        kind: "string",
+        value: secondPayload,
+        expiresAt: now + outboxPayloadTtl * 1_000,
+      });
+      const ready = this.getZSet(readyKey, true);
+      ready.value.set(firstId, firstDueAt);
+      ready.value.set(secondId, secondDueAt);
+      const laneAfterCommit = this.getZSet(laneKey, true);
+      laneAfterCommit.value.set(firstId, firstSequence);
+      laneAfterCommit.value.set(secondId, secondSequence);
+      this.values.set(markerKey, { kind: "string", value: marker, expiresAt: null });
+      return 1;
+    } catch {
+      return -3;
+    }
   }
 
   private evalStudioAdmitJob(keys: readonly string[], args: readonly string[]): readonly [string, string?] {
@@ -2785,6 +2953,81 @@ export class MemoryRedis implements RedisLike {
       && this.studioValidReleaseStamp(right)
       && left.generation === right.generation
       && left.phase === right.phase;
+  }
+
+  private studioOnboardingMarkerFromJson(raw: string): MemoryStudioOnboardingMarker | null {
+    let value: Record<string, unknown>;
+    try {
+      value = this.studioRecordFromJson(raw);
+    } catch {
+      return null;
+    }
+    const onboardingVersion = value.onboardingVersion;
+    if (
+      value.schemaVersion !== 1
+      || typeof onboardingVersion !== "number"
+      || !Number.isSafeInteger(onboardingVersion)
+      || onboardingVersion < 1
+      || !isMemoryOpaqueStudioIdentifier(value.receiptId)
+      || !isMemoryOpaqueStudioIdentifier(value.firstOutboxId)
+      || !isMemoryOpaqueStudioIdentifier(value.secondOutboxId)
+      || value.firstOutboxId === value.secondOutboxId
+    ) return null;
+    return {
+      schemaVersion: 1,
+      onboardingVersion,
+      receiptId: value.receiptId,
+      firstOutboxId: value.firstOutboxId,
+      secondOutboxId: value.secondOutboxId,
+    };
+  }
+
+  private studioEncryptedPayloadFromJson(raw: string): boolean {
+    let value: Record<string, unknown>;
+    try {
+      value = this.studioRecordFromJson(raw);
+    } catch {
+      return false;
+    }
+    return value.version === 1
+      && value.algorithm === "aes-256-gcm"
+      && typeof value.iv === "string"
+      && typeof value.ciphertext === "string"
+      && typeof value.tag === "string";
+  }
+
+  private studioValidNewOnboardingOutbox(
+    record: Record<string, unknown>,
+    outboxId: string,
+    senderHash: string,
+    sequence: number,
+    dueAtMs: number,
+    releaseGeneration: number,
+    releasePhase: MemoryStudioReleaseFence["phase"],
+  ): boolean {
+    return record.schemaVersion === 3
+      && record.outboxId === outboxId
+      && record.senderHash === senderHash
+      && record.lane === "onboarding"
+      && record.jobId === undefined
+      && record.laneIdentity === undefined
+      && record.pendingGuard === undefined
+      && record.encryptedPayload === undefined
+      && record.sequence === sequence
+      && record.state === "intent"
+      && record.attempts === 0
+      && record.stateVersion === 1
+      && typeof record.createdAtMs === "number"
+      && Number.isSafeInteger(record.createdAtMs)
+      && record.createdAtMs >= 0
+      && record.dueAtMs === dueAtMs
+      && typeof record.updatedAtMs === "number"
+      && Number.isSafeInteger(record.updatedAtMs)
+      && record.updatedAtMs >= 0
+      && this.studioSameReleaseStamp(record.releaseStamp, {
+        generation: releaseGeneration,
+        phase: releasePhase,
+      });
   }
 
   private studioInitialNotificationManifestMatches(

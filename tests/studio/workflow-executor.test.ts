@@ -26,6 +26,9 @@ const THREAD = "iMessage;-;+14155550777";
 function fixture(options: {
   readonly phase?: StudioReleasePhase;
   readonly provider?: StudioProviderPort;
+  readonly policy?: Partial<StudioEnvironment["policy"]>;
+  readonly policyExplicit?: boolean;
+  readonly spendCaps?: Partial<StudioEnvironment["spendCaps"]>;
 } = {}) {
   let now = Date.UTC(2026, 6, 18, 12, 0, 0);
   const phase = options.phase ?? "canary";
@@ -67,13 +70,15 @@ function fixture(options: {
       allowProviderSubmit: phase !== "dark",
       allowProviderRecovery: false,
       deliveryEnabled: false,
+      ...options.policy,
     },
-    policyExplicit: true,
+    policyExplicit: options.policyExplicit ?? true,
     spendCaps: {
       perJobCents: 100,
       dailyCents: 100,
       canaryTotalCents: 100,
       canaryFalCents: 0,
+      ...options.spendCaps,
     },
   };
   const runtime: StudioRuntime = {
@@ -184,6 +189,26 @@ describe("Air provider submission executor", () => {
     await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "disabled" });
     expect(provider.submit).not.toHaveBeenCalled();
     await expect(setup.store.getJob(admitted.jobId)).resolves.toMatchObject({ state: "admitted" });
+  });
+
+  it("never crosses the provider boundary without explicit accepted positive-budget policy", async () => {
+    const blockedPolicies = [
+      { policy: { acceptNewJobs: false } },
+      { policy: { allowProviderSubmit: false } },
+      { policyExplicit: false },
+      { spendCaps: { perJobCents: 0 } },
+      { spendCaps: { dailyCents: 0 } },
+    ] as const;
+
+    for (const [index, blocked] of blockedPolicies.entries()) {
+      const provider = fakeProvider({ kind: "accepted", providerRequestId: `must-not-run-${index}` });
+      const setup = fixture({ provider, ...blocked });
+      const admitted = setup.job(`zero-spend-hard-gate-${index}`);
+      await setup.admit(admitted);
+
+      await expect(executeStudioProviderSubrun(setup.runtime, admitted.jobId)).resolves.toEqual({ kind: "disabled" });
+      expect(provider.submit).not.toHaveBeenCalled();
+    }
   });
 
   it("durably schedules admission through one submit and then a bounded recheck", async () => {

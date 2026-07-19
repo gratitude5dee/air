@@ -56,7 +56,7 @@ function messagePayload(overrides: {
   readonly content?: unknown;
 } = {}): Record<string, unknown> {
   const space = {
-    id: overrides.chatGuid ?? "iMessage;-;+14155550123",
+    id: overrides.chatGuid ?? "any;-;+14155550123",
     phone: overrides.phone ?? "+14155550999",
     type: overrides.spaceType ?? "dm",
   };
@@ -131,10 +131,10 @@ describe("Air iMessage webhook", () => {
       senderHash: createSenderIdentity(identitySecret, senderId).senderHash,
       threadHash: hashThreadIdentifier(
         identitySecret,
-        "photon-project\u0000iMessage;-;+14155550123\u0000+14155550999",
+        "photon-project\u0000any;-;+14155550123\u0000+14155550999",
       ),
       envelope: expect.objectContaining({
-        chatGuid: "iMessage;-;+14155550123",
+        chatGuid: "any;-;+14155550123",
         sendingLine: "+14155550999",
         replyTargetId: "message-001",
         text: "Make a rain-soaked cyberpunk alley.",
@@ -169,7 +169,7 @@ describe("Air iMessage webhook", () => {
     const getRuntime = vi.fn(async () => runtimeWith(async () => ({ created: true, record: {} })));
     const requests = [
       signedRequest(messagePayload({
-        chatGuid: "iMessage;+;+14155550123,+14155550456",
+        chatGuid: "any;+;+14155550123,+14155550456",
         spaceType: "group",
       }), { webhookId: "delivery-group" }),
       signedRequest(messagePayload({ direction: "outbound" }), { webhookId: "delivery-outbound" }),
@@ -229,7 +229,7 @@ describe("Air iMessage webhook", () => {
     configureEnvironment();
     const getRuntime = vi.fn(async () => runtimeWith(async () => ({ created: true, record: {} })));
     const response = await handleStudioIMessageWebhook(signedRequest(messagePayload({
-      chatGuid: `iMessage;-;${"x".repeat(1_100)}`,
+      chatGuid: `any;-;${"x".repeat(1_100)}`,
     })), { getRuntime });
 
     expect(response.status).toBe(400);

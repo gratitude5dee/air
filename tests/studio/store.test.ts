@@ -177,6 +177,47 @@ function initialNotifications(options: { readonly tapback?: boolean } = {}): {
   });
 }
 
+function onboardingBundleInput(
+  store: StudioStore,
+  senderHash: SenderHash,
+  messageId: string,
+  text: string,
+) {
+  const receiptId = store.receiptId("onboarding-project", messageId);
+  return Object.freeze({
+    senderHash,
+    receiptId,
+    onboardingVersion: 1,
+    settings: Object.freeze({ onboardingVersion: 1, preferredMode: "imagine" }),
+    bubbles: Object.freeze([
+      Object.freeze({
+        outboxId: deriveOpaqueId(identitySecret, "onboarding-outbox", `${receiptId}\u0000one`),
+        payload: Object.freeze({
+          kind: "text" as const,
+          text: `First ${text}`,
+          thread: Object.freeze({
+            chatGuid: "iMessage;-;+14155550199",
+            sendingLine: "+14155550000",
+            replyTargetId: "reply-target-guid",
+          }),
+        }),
+      }),
+      Object.freeze({
+        outboxId: deriveOpaqueId(identitySecret, "onboarding-outbox", `${receiptId}\u0000two`),
+        payload: Object.freeze({
+          kind: "text" as const,
+          text: `Second ${text}`,
+          thread: Object.freeze({
+            chatGuid: "iMessage;-;+14155550199",
+            sendingLine: "+14155550000",
+            replyTargetId: "reply-target-guid",
+          }),
+        }),
+      }),
+    ] as const),
+  });
+}
+
 describe("Air v2 studio durable store", () => {
   it("keeps Cron heartbeats scoped by deployment and classifies stale or malformed markers", async () => {
     const { redis, store, prefix, now, advance } = fixture();
@@ -258,6 +299,46 @@ describe("Air v2 studio durable store", () => {
     expect(await store.getSettings<typeof left>(senderHash)).toEqual(first.value);
     const raw = await redis.get(`${prefix}:settings:${senderHash}`);
     expect(raw ?? "").not.toContain("onboardingVersion");
+  });
+
+  it("atomically commits one receipt-idempotent onboarding pair across concurrent first contacts", async () => {
+    const { redis, store, prefix } = fixture();
+    const { senderHash } = identities();
+    const first = onboardingBundleInput(store, senderHash, "onboarding-a", "private first route");
+    const competing = onboardingBundleInput(store, senderHash, "onboarding-b", "private competing route");
+
+    const results = await Promise.all([
+      store.ensureOnboardingBundle(first),
+      store.ensureOnboardingBundle(first),
+      store.ensureOnboardingBundle(competing),
+    ]);
+    expect(results.filter((result) => result.kind === "created")).toHaveLength(1);
+    expect(results.filter((result) => result.kind === "existing")).toHaveLength(2);
+
+    const markerKey = `${prefix}:onboarding:marker:${senderHash}:v1`;
+    const markerRaw = await redis.get(markerKey);
+    expect(markerRaw).not.toBeNull();
+    for (const privateValue of ["private first route", "private competing route", "+14155550199", "iMessage;-;+14155550199"]) {
+      expect(markerRaw ?? "").not.toContain(privateValue);
+    }
+    const marker = JSON.parse(markerRaw ?? "{}") as { firstOutboxId?: string; secondOutboxId?: string };
+    expect(marker.firstOutboxId).toBeDefined();
+    expect(marker.secondOutboxId).toBeDefined();
+    const records = await Promise.all([
+      store.getOutbox(marker.firstOutboxId ?? "missing"),
+      store.getOutbox(marker.secondOutboxId ?? "missing"),
+    ]);
+    expect(records).toEqual([
+      expect.objectContaining({ lane: "onboarding", sequence: 1, state: "intent" }),
+      expect.objectContaining({ lane: "onboarding", sequence: 2, state: "intent" }),
+    ]);
+    expect(await store.getSettings<typeof first.settings>(senderHash)).toEqual(first.settings);
+
+    const bubbleOne = await store.claimNextOutbox();
+    expect(bubbleOne?.record.outboxId).toBe(marker.firstOutboxId);
+    if (!bubbleOne) throw new Error("expected first onboarding bubble");
+    await expect(store.finishOutbox(bubbleOne.record.outboxId, bubbleOne.leaseToken, "send_unknown")).resolves.toBe(true);
+    expect(await store.claimNextOutbox()).toBeNull();
   });
 
   it("assigns receipt order once and rejects A → B → retry-A without wall-clock ordering", async () => {

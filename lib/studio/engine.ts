@@ -10,7 +10,7 @@ import {
 import {
   canAcceptStudioJobs,
   canDeliverStudioMessages,
-  canSubmitStudioProvider,
+  canSubmitPaidStudioProvider,
 } from "./config.js";
 import {
   AIR_MODEL_REGISTRY,
@@ -154,7 +154,10 @@ export async function drainStudioWithStats(runtime: StudioRuntime): Promise<Stud
  * reviewed provider adapter must be explicitly active first.
  */
 export async function drainStudioJobs(runtime: StudioRuntime): Promise<number> {
-  if (!canSubmitStudioProvider(runtime.environment) || !runtime.provider.verified) return 0;
+  // A zero-dollar budget is a hard kill switch even if an operator has
+  // accidentally left a raw provider switch enabled. Do not claim or mutate
+  // a queued job until the explicit paid-provider predicate is satisfied.
+  if (!canSubmitPaidStudioProvider(runtime.environment) || !runtime.provider.verified) return 0;
 
   let advanced = 0;
   for (let index = 0; index < MAX_JOBS_PER_DRAIN; index += 1) {
@@ -251,17 +254,47 @@ async function processInbox(runtime: StudioRuntime, record: StudioInboxRecord): 
   // safely rather than retaining or reconstructing a media reference.
   if (!record.encryptedEnvelope) return "failed";
   const envelope = runtime.store.decryptInboxEnvelope(record);
-  const initialized = await runtime.store.initializeSettingsIfAbsent(
-    record.senderHash,
-    defaultSettings(ONBOARDING_VERSION),
-  );
-  let settings = normalizeSettings(initialized.value);
-
-  if (initialized.created || settings.onboardingVersion < ONBOARDING_VERSION) {
-    settings = Object.freeze({ ...settings, onboardingVersion: ONBOARDING_VERSION });
-    await runtime.store.putSettings(record.senderHash, settings);
-    await enqueueText(runtime, record, envelope, "onboarding-1", "onboarding", 1, ONBOARDING_BUBBLES[0]);
-    await enqueueText(runtime, record, envelope, "onboarding-2", "onboarding", 2, ONBOARDING_BUBBLES[1]);
+  // The onboarding cursor must never be advanced independently of the two
+  // first-contact delivery intents. `ensureOnboardingBundle` writes the
+  // settings, both ordered bubbles, and a non-expiring opaque marker in one
+  // Redis transaction. A crash or a concurrent first receipt therefore
+  // either retries the same bundle or observes the completed one—never a
+  // settings-only "onboarded" user with a missing welcome message.
+  const storedSettings = await runtime.store.getSettings<unknown>(record.senderHash);
+  let settings = normalizeSettings(storedSettings ?? defaultSettings());
+  if (storedSettings === null || settings.onboardingVersion < ONBOARDING_VERSION) {
+    const candidate = Object.freeze({ ...settings, onboardingVersion: ONBOARDING_VERSION });
+    const onboarding = await runtime.store.ensureOnboardingBundle({
+      senderHash: record.senderHash,
+      receiptId: record.receiptId,
+      onboardingVersion: ONBOARDING_VERSION,
+      settings: candidate,
+      bubbles: [
+        {
+          outboxId: stableRecordId(record.receiptId, "onboarding-1"),
+          payload: responsePayload(envelope, ONBOARDING_BUBBLES[0]),
+        },
+        {
+          outboxId: stableRecordId(record.receiptId, "onboarding-2"),
+          payload: responsePayload(envelope, ONBOARDING_BUBBLES[1]),
+        },
+      ],
+    });
+    if (onboarding.kind === "unavailable") {
+      // Leave the encrypted receipt leased/recoverable. The transaction
+      // either made no change or committed the whole idempotent bundle, so a
+      // later retry cannot create a partial first-contact sequence.
+      throw new Error("studio_onboarding_bundle_unavailable");
+    }
+    if (onboarding.kind === "created") {
+      settings = candidate;
+    } else {
+      // A concurrent receipt may have won enrollment. Read its committed
+      // settings rather than reusing this receipt's local defaults. A marker
+      // intentionally outlives settings TTL; falling back to `candidate` in
+      // that case still skips duplicate onboarding safely.
+      settings = normalizeSettings((await runtime.store.getSettings<unknown>(record.senderHash)) ?? candidate);
+    }
   }
 
   // Fence pending assembly before branching on message shape. A dark/rollback
@@ -598,7 +631,7 @@ async function handleCreation(
   // provider port; a reviewed adapter must be injected explicitly.
   if (
     !isSinglePaidStepWorkflow(getStudioWorkflow(mode))
-    || !canSubmitStudioProvider(runtime.environment)
+    || !canSubmitPaidStudioProvider(runtime.environment)
     || !runtime.provider.verified
   ) {
     await enqueueResponse(

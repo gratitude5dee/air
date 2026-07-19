@@ -1,4 +1,4 @@
-import { canSubmitStudioProvider } from "./config.js";
+import { canSubmitPaidStudioProvider } from "./config.js";
 import type { StudioProviderSubmitResult } from "./provider-port.js";
 import type { StudioRuntime } from "./runtime.js";
 import {
@@ -41,7 +41,7 @@ export async function executeStudioProviderSubrun(
 ): Promise<StudioProviderExecutionResult> {
   // Check before any job/subrun claim so a dark deployment cannot mutate a
   // future active queue simply because a worker route was invoked.
-  if (!canSubmitStudioProvider(runtime.environment) || !runtime.provider.verified) {
+  if (!canSubmitPaidStudioProvider(runtime.environment) || !runtime.provider.verified) {
     return Object.freeze({ kind: "disabled" });
   }
 

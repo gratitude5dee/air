@@ -4,11 +4,12 @@ import type { IMessageThreadReference } from "../../lib/studio/imessage-transpor
 import { assertNoPhotonTelemetryExporters } from "../../lib/studio/photon-telemetry.js";
 import {
   PhotonIMessageTransport,
+  resolvePhotonIMessageClientRoute,
   type PhotonIMessagePort,
 } from "../../lib/studio/photon-transport.js";
 
 const THREAD: IMessageThreadReference = Object.freeze({
-  chatGuid: "iMessage;-;+15555550101",
+  chatGuid: "any;-;+15555550101",
   sendingLine: "shared",
 });
 
@@ -35,6 +36,12 @@ function fixture(): {
 }
 
 describe("Photon iMessage text transport", () => {
+  it("uses the pooled client for a shared Cloud token while preserving dedicated-line routing", () => {
+    expect(resolvePhotonIMessageClientRoute("shared", "+15555550101")).toBe("shared");
+    expect(resolvePhotonIMessageClientRoute("dedicated", "+15555550101")).toBe("+15555550101");
+    expect(() => resolvePhotonIMessageClientRoute("shared", "bad\nline")).toThrow("invalid_photon_sending_line");
+  });
+
   it("requires the signed inbound webhook credential before marking delivery verified", () => {
     const port = { getClient: vi.fn() } as unknown as PhotonIMessagePort;
     expect(() => new PhotonIMessageTransport({
@@ -85,6 +92,16 @@ describe("Photon iMessage text transport", () => {
       .resolves.toEqual({ kind: "failed", code: "invalid_thread_reference" });
     await expect(transport.sendText(THREAD, "Air is ready.", "bad key"))
       .resolves.toEqual({ kind: "failed", code: "invalid_idempotency_key" });
+
+    expect(port.getClient).not.toHaveBeenCalled();
+    expect(client.messages.sendText).not.toHaveBeenCalled();
+  });
+
+  it("fails a legacy chat GUID locally before resolving a Photon client or attempting an RPC", async () => {
+    const { transport, port, client } = fixture();
+
+    await expect(transport.sendText({ ...THREAD, chatGuid: "iMessage;-;+15555550101" }, "Air is ready.", "stable-outbox-key"))
+      .resolves.toEqual({ kind: "failed", code: "invalid_thread_reference" });
 
     expect(port.getClient).not.toHaveBeenCalled();
     expect(client.messages.sendText).not.toHaveBeenCalled();

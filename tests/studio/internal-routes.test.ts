@@ -43,6 +43,23 @@ function darkEnvironment(): StudioEnvironment {
   };
 }
 
+function productionDeliveryEnvironment(): StudioEnvironment {
+  return {
+    ...darkEnvironment(),
+    deploymentMode: "production",
+    releasePhase: "production",
+    releaseGeneration: 1,
+    releaseFenceSecret: "release-fence-secret",
+    policy: {
+      acceptNewJobs: false,
+      allowProviderSubmit: false,
+      allowProviderRecovery: false,
+      deliveryEnabled: true,
+    },
+    policyExplicit: true,
+  };
+}
+
 function authorizedRequest(path: string, method: "GET" | "POST" = "POST"): Request {
   return new Request(`https://air.example.test${path}`, {
     method,
@@ -243,38 +260,122 @@ describe("Studio Vercel internal routes", () => {
   });
 
   it("reports a production delivery-only release as ready without enabling a model or provider", async () => {
-    const environment: StudioEnvironment = {
-      ...darkEnvironment(),
-      deploymentMode: "production",
-      releasePhase: "production",
-      releaseGeneration: 1,
-      releaseFenceSecret: "release-fence-secret",
-      policy: {
-        acceptNewJobs: false,
-        allowProviderSubmit: false,
-        allowProviderRecovery: false,
-        deliveryEnabled: true,
-      },
-      policyExplicit: true,
-    };
+    const environment = productionDeliveryEnvironment();
+    const getReleaseFenceStatus = vi.fn(async () => ({
+      kind: "current" as const,
+      stamp: { generation: environment.releaseGeneration, phase: environment.releasePhase },
+    }));
     const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
       loadEnvironment: () => environment,
       getRuntime: async () => ({
-        store: { getCronFreshness: vi.fn(async () => "fresh" as const) },
+        store: {
+          getCronFreshness: vi.fn(async () => "fresh" as const),
+          getReleaseFenceStatus,
+        },
         transport: { verified: true },
         provider: { verified: false },
       }) as unknown as StudioRuntime,
     });
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+    const body = await response.json() as Record<string, unknown>;
+    expect(body).toEqual(expect.objectContaining({
       ok: true,
       enabledModels: 0,
       redis: "reachable",
       cron: "fresh",
+      releaseFence: "current",
       effectiveSideEffects: environment.policy,
       problems: [],
     }));
+    expect(body).not.toHaveProperty("stamp");
+    expect(body).not.toHaveProperty("releaseGeneration");
+    expect(getReleaseFenceStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed for missing, mismatched, or invalid delivery release fences without disclosing their stamps", async () => {
+    const environment = productionDeliveryEnvironment();
+    const cases = [
+      {
+        status: { kind: "missing" as const },
+        releaseFence: "missing",
+        problem: "release_fence_missing",
+      },
+      {
+        status: {
+          kind: "current" as const,
+          stamp: { generation: 991337, phase: "canary" as const },
+        },
+        releaseFence: "mismatched",
+        problem: "release_fence_mismatched",
+      },
+      {
+        status: { kind: "invalid" as const },
+        releaseFence: "invalid",
+        problem: "release_fence_invalid",
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const getReleaseFenceStatus = vi.fn(async () => testCase.status);
+      const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+        loadEnvironment: () => environment,
+        getRuntime: async () => ({
+          store: {
+            getCronFreshness: vi.fn(async () => "fresh" as const),
+            getReleaseFenceStatus,
+          },
+          transport: { verified: true },
+          provider: { verified: false },
+        }) as unknown as StudioRuntime,
+      });
+
+      expect(response.status, testCase.releaseFence).toBe(503);
+      const body = await response.json() as Record<string, unknown>;
+      expect(body).toEqual(expect.objectContaining({
+        ok: false,
+        redis: "reachable",
+        cron: "fresh",
+        releaseFence: testCase.releaseFence,
+        problems: expect.arrayContaining([testCase.problem]),
+      }));
+      expect(body).not.toHaveProperty("stamp");
+      expect(body).not.toHaveProperty("releaseGeneration");
+      expect(body).not.toHaveProperty("releaseFenceGeneration");
+      expect(JSON.stringify(body)).not.toContain("991337");
+      expect(JSON.stringify(body)).not.toContain("\"canary\"");
+      expect(getReleaseFenceStatus).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("fails closed when a delivery release-fence probe is unreachable without disclosing its internals", async () => {
+    const environment = productionDeliveryEnvironment();
+    const getReleaseFenceStatus = vi.fn(async () => Promise.reject(new Error("redis unavailable")));
+    const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+      loadEnvironment: () => environment,
+      getRuntime: async () => ({
+        store: {
+          getCronFreshness: vi.fn(async () => "fresh" as const),
+          getReleaseFenceStatus,
+        },
+        transport: { verified: true },
+        provider: { verified: false },
+      }) as unknown as StudioRuntime,
+    });
+
+    expect(response.status).toBe(503);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body).toEqual(expect.objectContaining({
+      ok: false,
+      redis: "reachable",
+      cron: "fresh",
+      releaseFence: "unreachable",
+      problems: expect.arrayContaining(["release_fence_unavailable"]),
+    }));
+    expect(body).not.toHaveProperty("stamp");
+    expect(body).not.toHaveProperty("releaseGeneration");
+    expect(body).not.toHaveProperty("releaseFenceGeneration");
+    expect(getReleaseFenceStatus).toHaveBeenCalledTimes(1);
   });
 
   it("reports a stale production Cron heartbeat without exposing its timestamp", async () => {

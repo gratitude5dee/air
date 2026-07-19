@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   canAcceptStudioJobs,
   canDeliverStudioMessages,
+  canRecoverPaidStudioProvider,
   canRecoverStudioProvider,
+  canSubmitPaidStudioProvider,
   canSubmitStudioProvider,
   explicitBoolean,
   loadStudioEnvironment,
@@ -110,6 +112,40 @@ describe("Air studio configuration", () => {
     expect(canSubmitStudioProvider(active)).toBe(true);
     expect(canRecoverStudioProvider(active)).toBe(true);
     expect(canDeliverStudioMessages(active)).toBe(true);
+  });
+
+  it("treats zero caps, unset policy, and closed admission as paid-provider kill switches", () => {
+    const active = loadStudioEnvironment(configured({
+      VERCEL_ENV: "production",
+      AIR_RELEASE_PHASE: "production",
+      AIR_RELEASE_GENERATION: "1",
+      AIR_RELEASE_FENCE_SECRET: "release-fence-secret",
+      AIR_ACCEPT_NEW_JOBS: "true",
+      AIR_ALLOW_PROVIDER_SUBMIT: "true",
+      AIR_ALLOW_PROVIDER_RECOVERY: "true",
+      AIR_DELIVERY_ENABLED: "false",
+      AIR_JOB_SPEND_CAP_USD: "1",
+      AIR_DAILY_SPEND_CAP_USD: "1",
+    }));
+
+    expect(canSubmitPaidStudioProvider(active)).toBe(true);
+    expect(canRecoverPaidStudioProvider(active)).toBe(true);
+    expect(canSubmitPaidStudioProvider({
+      ...active,
+      policy: { ...active.policy, acceptNewJobs: false },
+    })).toBe(false);
+    expect(canRecoverPaidStudioProvider({
+      ...active,
+      policyExplicit: false,
+    })).toBe(false);
+    expect(canSubmitPaidStudioProvider({
+      ...active,
+      spendCaps: { ...active.spendCaps, perJobCents: 0 },
+    })).toBe(false);
+    expect(canRecoverPaidStudioProvider({
+      ...active,
+      spendCaps: { ...active.spendCaps, dailyCents: 0 },
+    })).toBe(false);
   });
 
   it("requires explicit side-effect switches for production readiness", () => {

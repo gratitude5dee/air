@@ -63,6 +63,17 @@ export interface StudioEnvironment {
  */
 export type StudioSideEffectEnvironment = Pick<StudioEnvironment, "releasePhase" | "policy">;
 
+/**
+ * The narrower capability needed before a paid provider operation may cross
+ * Air's process boundary. Keeping the budget and explicit-policy evidence in
+ * this type prevents a future caller from treating a bare submit switch as a
+ * spending authorization.
+ */
+export type StudioPaidProviderEnvironment = Pick<
+  StudioEnvironment,
+  "releasePhase" | "policy" | "policyExplicit" | "spendCaps"
+>;
+
 export type EnvironmentSource = Readonly<Record<string, string | undefined>>;
 
 const PROTECTED_CONFIGURATION_NAMES = Object.freeze([
@@ -194,6 +205,18 @@ export function canSubmitStudioProvider(environment: StudioSideEffectEnvironment
 }
 
 /**
+ * A paid provider submission needs an active release, explicit policy,
+ * admission enabled, an explicit submit switch, and a non-zero bounded
+ * budget.  In particular, a zero-dollar cap is a hard no-spend kill switch,
+ * including for an already-admitted job recovered by a later worker.
+ */
+export function canSubmitPaidStudioProvider(environment: StudioPaidProviderEnvironment): boolean {
+  return hasExplicitPositiveSpendPolicy(environment)
+    && canAcceptStudioJobs(environment)
+    && canSubmitStudioProvider(environment);
+}
+
+/**
  * Polling, artifact fetch, and cancellation are provider side effects too.
  * Keeping this separate from submission preserves the credential-compromise
  * kill switch without letting a dark release recover provider work.
@@ -202,8 +225,25 @@ export function canRecoverStudioProvider(environment: StudioSideEffectEnvironmen
   return isStudioSideEffectPhaseActive(environment) && environment.policy.allowProviderRecovery;
 }
 
+/**
+ * Polling, upload preparation, and any other provider recovery operation can
+ * also incur provider-side work. Keep them behind the same explicit positive
+ * budget and admission authorization as new submission.
+ */
+export function canRecoverPaidStudioProvider(environment: StudioPaidProviderEnvironment): boolean {
+  return hasExplicitPositiveSpendPolicy(environment)
+    && canAcceptStudioJobs(environment)
+    && canRecoverStudioProvider(environment);
+}
+
 export function canDeliverStudioMessages(environment: StudioSideEffectEnvironment): boolean {
   return isStudioSideEffectPhaseActive(environment) && environment.policy.deliveryEnabled;
+}
+
+function hasExplicitPositiveSpendPolicy(environment: StudioPaidProviderEnvironment): boolean {
+  return environment.policyExplicit
+    && environment.spendCaps.perJobCents > 0
+    && environment.spendCaps.dailyCents > 0;
 }
 
 /**

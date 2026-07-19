@@ -14,7 +14,7 @@ import {
 const secret = "spectrum-core-test-secret";
 
 function payload(): Record<string, unknown> {
-  const space = { id: "iMessage;-;+15555550123", phone: "+15555550124", type: "dm" };
+  const space = { id: "any;-;+15555550123", phone: "+15555550124", type: "dm" };
   return {
     event: "messages",
     space,

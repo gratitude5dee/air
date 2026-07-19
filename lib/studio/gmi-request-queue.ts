@@ -1,7 +1,7 @@
 import {
-  canRecoverStudioProvider,
-  canSubmitStudioProvider,
-  type StudioSideEffectEnvironment,
+  canRecoverPaidStudioProvider,
+  canSubmitPaidStudioProvider,
+  type StudioPaidProviderEnvironment,
 } from "./config.js";
 
 /**
@@ -78,7 +78,7 @@ export interface GmiRequestQueueClientOptions {
    * for read-only catalog discovery only; omission fails closed for all other
    * operations.
    */
-  readonly sideEffectEnvironment?: StudioSideEffectEnvironment | undefined;
+  readonly sideEffectEnvironment?: StudioPaidProviderEnvironment | undefined;
   readonly fetch?: typeof globalThis.fetch | undefined;
   readonly timeoutMs?: number | undefined;
   /** Primarily useful for deterministic overflow tests. Never raises the hard cap. */
@@ -186,7 +186,7 @@ type FetchLike = typeof globalThis.fetch;
 export class GmiRequestQueueClient {
   private readonly apiKey: string;
   private readonly organizationId: string | undefined;
-  private readonly sideEffectEnvironment: StudioSideEffectEnvironment | undefined;
+  private readonly sideEffectEnvironment: StudioPaidProviderEnvironment | undefined;
   private readonly fetch: FetchLike;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
@@ -320,13 +320,13 @@ export class GmiRequestQueueClient {
   }
 
   private requireProviderSubmission(): void {
-    if (!this.sideEffectEnvironment || !canSubmitStudioProvider(this.sideEffectEnvironment)) {
+    if (!this.sideEffectEnvironment || !canSubmitPaidStudioProvider(this.sideEffectEnvironment)) {
       throw new GmiRequestQueueError("provider_submission_disabled", false);
     }
   }
 
   private requireProviderRecovery(): void {
-    if (!this.sideEffectEnvironment || !canRecoverStudioProvider(this.sideEffectEnvironment)) {
+    if (!this.sideEffectEnvironment || !canRecoverPaidStudioProvider(this.sideEffectEnvironment)) {
       throw new GmiRequestQueueError("provider_recovery_disabled", false);
     }
   }

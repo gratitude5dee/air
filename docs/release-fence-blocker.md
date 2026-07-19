@@ -1,8 +1,9 @@
 # Global release fence — implemented, not an activation approval
 
-This record applies to future canary or production enablement. It does not
-change the current dark preview, where provider submission and iMessage
-delivery remain disabled.
+This record applies to future canary or production enablement. The current
+production delivery-only release has explicitly advanced the shared fence to
+generation 1 and permits text delivery only; it does not enable provider
+submission, provider recovery, media handling, or paid generation.
 
 ## What the current scoped guard covers
 
@@ -66,6 +67,8 @@ acknowledgements.
 Use the global fence only after an explicit owner approval, a deployment
 sequence that accounts for in-flight invocations, and a bounded real-line
 rollback drill. Before provider enablement, add and test a matching fence for
-each provider submission/recovery intent. Until transport evidence, provider
-evidence, and that drill exist, do not enable `AIR_DELIVERY_ENABLED`, accept
-paid work, or treat this branch as canary-ready.
+each provider submission/recovery intent. Until attachment/reply transport
+evidence, provider evidence, and that drill exist, do not accept paid work,
+enable media delivery, or treat this branch as canary-ready. The current
+text-only delivery switch is a separately fenced, zero-spend smoke path rather
+than canary evidence.

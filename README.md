@@ -4,8 +4,9 @@ Air is a private, allowlisted image-and-video studio operated entirely through
 iMessage. The source supports a narrowly scoped **delivery-only iMessage
 smoke release**: allowlisted users can receive bounded text help/status
 responses, while all image/video generation and every provider action remain
-disabled. The currently promoted production alias is still the legacy build
-until this direct-studio release is deployed and verified.
+disabled. The direct-studio delivery-only release is now promoted at
+`air.wzrd.tech`; Photon webhook binding and the owner-controlled real-line
+`/help` smoke remain the last verification steps.
 
 There is no Eve, Zap, chat adapter, or LLM runtime in the Air request path.
 When enabled in a later approved release, Air will use the direct GMI Request
@@ -32,8 +33,14 @@ Queue boundary; it does not delegate generation to another application.
   retry cannot overwrite a newer pending item, revive a cancellation, or
   extend that retention window. Media-first corrections are durable `dueAt`
   entries delayed 500 ms rather than an open-function debounce.
+- First-contact settings, both ordered welcome-message intents, and an opaque
+  non-expiring enrollment marker are committed in one Redis transaction. A
+  crash or duplicate webhook therefore cannot leave a user marked onboarded
+  with a missing bubble, or create a second welcome sequence.
 - The release starts with every side-effect switch explicitly `false`. Missing
   switches also fail closed.
+- A zero per-job or daily spend cap is a hard provider kill switch even if a
+  later operator accidentally enables a raw provider policy flag.
 - Provider ambiguity and iMessage delivery ambiguity are never retried
   blindly. The direct Photon transport supplies the durable outbox ID as the
   provider `clientMessageId`, disables client retry, and turns a failed send
@@ -48,8 +55,9 @@ flowchart LR
   P --> W["Raw-signature verification"]
   W --> R["Encrypted existing Redis inbox"]
   R --> D["Vercel drain and durable outbox"]
-  D -. "disabled in dark phase" .-> G["Direct GMI Request Queue"]
-  D -. "disabled until transport proof" .-> P
+  D -. "zero-model / zero-spend provider gate" .-> G["Direct GMI Request Queue"]
+  D --> T["Direct Photon transport (text only)"]
+  T --> I
 ```
 
 ## Route surface
@@ -76,12 +84,15 @@ intentional: no GMI catalog, model schema, input-hosting rule, or price quote
 has been verified by authenticated evidence. Consequently `/models` is empty
 and creation commands cannot reserve spend or call a provider.
 
-The intended existing Vercel project is `air` at `air.wzrd.tech`. A build-only
-preview with no protected configuration defaults to the dark, all-false policy
-and can verify only the public shell. The production smoke release may enable
-only `AIR_DELIVERY_ENABLED`; it must leave every provider and paid-generation
-switch false, keep the registry at zero enabled models, and never set a GMI
-credential as part of this rollout.
+The existing Vercel project is `air` at `air.wzrd.tech`. The release handoff
+records the exact promoted deployment identity; its public health endpoint
+must report Air Studio version 2 and Vercel must record a successful protected
+drain every minute. The shared release fence is production generation 1. The
+production smoke release enables only `AIR_DELIVERY_ENABLED`; it leaves every
+provider and paid-generation switch false, keeps the registry at zero enabled
+models, and does not configure GMI or fal credentials. Photon webhook binding
+and the real allowlisted `/help` response are intentionally not claimed until
+they are observed.
 
 ## Configuration
 

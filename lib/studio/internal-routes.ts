@@ -1,14 +1,15 @@
 import {
   canAcceptStudioJobs,
   canDeliverStudioMessages,
-  canRecoverStudioProvider,
-  canSubmitStudioProvider,
+  canRecoverPaidStudioProvider,
+  canSubmitPaidStudioProvider,
   loadStudioEnvironment,
   studioReadinessProblems,
   type StudioEnvironment,
 } from "./config.js";
 import { AIR_MODEL_REGISTRY, AIR_MODEL_REGISTRY_VERSION, listEnabledModels } from "./model-registry.js";
 import { getStudioRuntime, type StudioRuntime } from "./runtime.js";
+import type { StudioReleaseFenceStatus } from "./store.js";
 import { authorizeStudioDrain } from "./webhook-handler.js";
 
 export type StudioDrain = (runtime: StudioRuntime) => Promise<void>;
@@ -17,6 +18,8 @@ export interface StudioInternalRouteOptions {
   readonly loadEnvironment?: (() => StudioEnvironment) | undefined;
   readonly getRuntime?: (() => Promise<StudioRuntime>) | undefined;
 }
+
+type StudioReadinessReleaseFence = "not_required" | "current" | "missing" | "mismatched" | "invalid" | "unreachable" | "unknown";
 
 /**
  * Vercel cron and operator recovery endpoint. Authorization happens before a
@@ -76,14 +79,17 @@ export async function handleStudioReadiness(
   // selectable model. Requiring either before its policy is enabled would
   // misreport the safe, zero-provider iMessage smoke path as broken.
   const providerWorkEnabled = canAcceptStudioJobs(environment)
-    || canSubmitStudioProvider(environment)
-    || canRecoverStudioProvider(environment);
+    || canSubmitPaidStudioProvider(environment)
+    || canRecoverPaidStudioProvider(environment);
+  const activeSideEffectsEnabled = providerWorkEnabled || canDeliverStudioMessages(environment);
   if (canAcceptStudioJobs(environment) && enabledModels === 0) problems.push("no_enabled_models");
 
   let redis: "reachable" | "unreachable" | "unknown" = "unknown";
   let cron: "fresh" | "stale" | "missing" | "invalid" | "not_scheduled" | "unreachable" | "unknown" = "unknown";
+  let releaseFence: StudioReadinessReleaseFence = activeSideEffectsEnabled ? "unknown" : "not_required";
   if (!canProbeRedis(environment)) {
     problems.push("redis_reachability_unknown", "cron_freshness_unknown");
+    if (activeSideEffectsEnabled) problems.push("release_fence_unavailable");
   } else {
     let runtime: StudioRuntime;
     try {
@@ -91,8 +97,10 @@ export async function handleStudioReadiness(
     } catch {
       redis = "unreachable";
       cron = "unreachable";
+      releaseFence = activeSideEffectsEnabled ? "unreachable" : "not_required";
       problems.push("redis_unavailable", "cron_freshness_unknown");
-      return readinessResponse(environment, enabledModels, redis, cron, problems);
+      if (activeSideEffectsEnabled) problems.push("release_fence_unavailable");
+      return readinessResponse(environment, enabledModels, redis, cron, releaseFence, problems);
     }
     try {
       const freshness = await runtime.store.getCronFreshness(environment.deploymentMode);
@@ -110,14 +118,29 @@ export async function handleStudioReadiness(
       } else {
         cron = "not_scheduled";
       }
+
+      if (activeSideEffectsEnabled) {
+        try {
+          releaseFence = releaseFenceReadinessStatus(
+            await runtime.store.getReleaseFenceStatus(),
+            environment,
+          );
+          if (releaseFence !== "current") problems.push(`release_fence_${releaseFence}`);
+        } catch {
+          releaseFence = "unreachable";
+          problems.push("release_fence_unavailable");
+        }
+      }
     } catch {
       redis = "unreachable";
       cron = "unreachable";
+      releaseFence = activeSideEffectsEnabled ? "unreachable" : "not_required";
       problems.push("redis_unavailable", "cron_freshness_unknown");
+      if (activeSideEffectsEnabled) problems.push("release_fence_unavailable");
     }
   }
 
-  return readinessResponse(environment, enabledModels, redis, cron, problems);
+  return readinessResponse(environment, enabledModels, redis, cron, releaseFence, problems);
 }
 
 /**
@@ -183,6 +206,7 @@ function readinessResponse(
   enabledModels: number,
   redis: "reachable" | "unreachable" | "unknown",
   cron: "fresh" | "stale" | "missing" | "invalid" | "not_scheduled" | "unreachable" | "unknown",
+  releaseFence: StudioReadinessReleaseFence,
   problems: readonly string[],
 ): Response {
   return Response.json(
@@ -194,16 +218,28 @@ function readinessResponse(
       sideEffects: environment.policy,
       effectiveSideEffects: {
         acceptNewJobs: canAcceptStudioJobs(environment),
-        allowProviderSubmit: canSubmitStudioProvider(environment),
-        allowProviderRecovery: canRecoverStudioProvider(environment),
+        allowProviderSubmit: canSubmitPaidStudioProvider(environment),
+        allowProviderRecovery: canRecoverPaidStudioProvider(environment),
         deliveryEnabled: canDeliverStudioMessages(environment),
       },
       redis,
       cron,
+      releaseFence,
       problems,
     },
     { status: problems.length === 0 ? 200 : 503, headers: { "cache-control": "no-store" } },
   );
+}
+
+/** Readiness exposes no fence generation or phase, only whether it matches this deployment. */
+function releaseFenceReadinessStatus(
+  status: StudioReleaseFenceStatus,
+  environment: Pick<StudioEnvironment, "releaseGeneration" | "releasePhase">,
+): Exclude<StudioReadinessReleaseFence, "not_required" | "unreachable" | "unknown"> {
+  if (status.kind === "missing" || status.kind === "invalid") return status.kind;
+  return status.stamp.generation === environment.releaseGeneration && status.stamp.phase === environment.releasePhase
+    ? "current"
+    : "mismatched";
 }
 
 function canProbeRedis(environment: StudioEnvironment): boolean {

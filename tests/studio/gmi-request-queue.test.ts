@@ -4,7 +4,7 @@ import {
   createGmiRequestQueueClientFromEnv,
   GmiRequestQueueError,
 } from "../../lib/studio/gmi-request-queue.js";
-import type { StudioSideEffectEnvironment } from "../../lib/studio/config.js";
+import type { StudioPaidProviderEnvironment } from "../../lib/studio/config.js";
 
 const ACTIVE_PROVIDER_POLICY = {
   releasePhase: "production",
@@ -14,7 +14,14 @@ const ACTIVE_PROVIDER_POLICY = {
     allowProviderRecovery: true,
     deliveryEnabled: true,
   },
-} satisfies StudioSideEffectEnvironment;
+  policyExplicit: true,
+  spendCaps: {
+    perJobCents: 100,
+    dailyCents: 100,
+    canaryTotalCents: 100,
+    canaryFalCents: 0,
+  },
+} satisfies StudioPaidProviderEnvironment;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -28,7 +35,7 @@ function client(
   options?: {
     readonly maxResponseBytes?: number;
     readonly timeoutMs?: number;
-    readonly sideEffectEnvironment?: StudioSideEffectEnvironment;
+    readonly sideEffectEnvironment?: StudioPaidProviderEnvironment;
   },
 ): ReturnType<typeof createGmiRequestQueueClient> {
   return createGmiRequestQueueClient({
@@ -126,6 +133,46 @@ describe("GMI request-queue client", () => {
     await expect(recoveryDisabled.getRequest("gmi-request-123")).rejects.toMatchObject({
       code: "provider_recovery_disabled",
     });
+    expect(calls).toBe(0);
+  });
+
+  it("keeps submission, upload preparation, and recovery off without explicit accepted positive-budget policy", async () => {
+    let calls = 0;
+    const fetch = async (): Promise<Response> => {
+      calls += 1;
+      return json({ request_id: "must-not-be-called", status: "success" });
+    };
+    const blockedPolicies = [
+      {
+        ...ACTIVE_PROVIDER_POLICY,
+        policy: { ...ACTIVE_PROVIDER_POLICY.policy, acceptNewJobs: false },
+      },
+      {
+        ...ACTIVE_PROVIDER_POLICY,
+        policyExplicit: false,
+      },
+      {
+        ...ACTIVE_PROVIDER_POLICY,
+        spendCaps: { ...ACTIVE_PROVIDER_POLICY.spendCaps, perJobCents: 0 },
+      },
+      {
+        ...ACTIVE_PROVIDER_POLICY,
+        spendCaps: { ...ACTIVE_PROVIDER_POLICY.spendCaps, dailyCents: 0 },
+      },
+    ] as const;
+
+    for (const sideEffectEnvironment of blockedPolicies) {
+      const service = client(fetch, { sideEffectEnvironment });
+      await expect(service.submit({ model: "Veo3", payload: { prompt: "fixture" } })).rejects.toMatchObject({
+        code: "provider_submission_disabled",
+      });
+      await expect(service.createUploadUrl({ fileType: "png", storage })).rejects.toMatchObject({
+        code: "provider_submission_disabled",
+      });
+      await expect(service.getRequestStatus("must-not-be-called")).rejects.toMatchObject({
+        code: "provider_recovery_disabled",
+      });
+    }
     expect(calls).toBe(0);
   });
 

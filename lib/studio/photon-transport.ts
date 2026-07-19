@@ -34,6 +34,11 @@ export interface PhotonIMessageClient {
 }
 
 export interface PhotonIMessagePort {
+  /**
+   * The caller always supplies the encrypted inbound sending line. Shared
+   * Cloud tokens intentionally collapse that value to their one pooled client;
+   * dedicated tokens retain the exact per-line lookup.
+   */
   getClient(sendingLine: string): Promise<PhotonIMessageClient>;
 }
 
@@ -200,7 +205,12 @@ class CloudIMessagePort implements PhotonIMessagePort {
 
   public async getClient(sendingLine: string): Promise<PhotonIMessageClient> {
     await this.refreshIfNeeded();
-    const client = this.clientsByLine.get(sendingLine);
+    // A shared Cloud project has no dedicated sending-line token. The signed
+    // webhook still gives Air the real line for encrypted scope/audit data,
+    // but every shared inbound line must use the single pooled client. A
+    // dedicated project remains exact-line-only so multi-line delivery cannot
+    // silently cross a caller's recorded route.
+    const client = this.clientsByLine.get(resolvePhotonIMessageClientRoute(this.tokenData.type, sendingLine));
     if (!client) throw new Error("photon_sending_line_unavailable");
     return client;
   }
@@ -273,8 +283,31 @@ function expiryFromToken(tokenData: Awaited<ReturnType<typeof cloud.issueImessag
   return Date.now() + tokenData.expiresIn * 1_000;
 }
 
+/**
+ * A shared Photon token represents exactly one pooled sending capability, not
+ * a phone-number-specific credential. Keep the original inbound line in the
+ * encrypted Air thread reference, while selecting the pooled client only at
+ * the direct SDK boundary. Dedicated client selection remains strict.
+ */
+export function resolvePhotonIMessageClientRoute(
+  tokenMode: "shared" | "dedicated",
+  sendingLine: string,
+): string {
+  if (!isSafeOpaqueValue(sendingLine, 320)) throw new Error("invalid_photon_sending_line");
+  return tokenMode === "shared" ? PHOTON_SHARED_LINE : sendingLine;
+}
+
 function isSafeThreadReference(thread: IMessageThreadReference): boolean {
-  return isSafeOpaqueValue(thread.chatGuid, 4_096) && isSafeOpaqueValue(thread.sendingLine, 320);
+  // The direct Photon SDK accepts only the structured chat GUID it issues
+  // (`any;-;…` for direct conversations or `any;+;…` for groups). Air stores
+  // an inbound GUID verbatim for auditability, but must fail before its send
+  // RPC rather than let an unrecognized legacy/provider-shaped value become
+  // an ambiguous physical-delivery failure.
+  return isSafePhotonChatGuid(thread.chatGuid) && isSafeOpaqueValue(thread.sendingLine, 320);
+}
+
+function isSafePhotonChatGuid(value: string): boolean {
+  return isSafeOpaqueValue(value, 4_096) && /^any;[-+];.+$/u.test(value);
 }
 
 function isSafeIdempotencyKey(value: string): boolean {

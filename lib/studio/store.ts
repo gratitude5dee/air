@@ -393,6 +393,43 @@ export type PendingGuardedOutboxResult =
   | { readonly kind: "expired" }
   | { readonly kind: "unavailable" };
 
+/**
+ * The two text payloads which make up a first-contact onboarding sequence.
+ * Their IDs are derived from the inbound receipt by the caller, so a retry
+ * cannot create a second physical-message intent for the same receipt.
+ */
+export interface StudioOnboardingBubbleInput {
+  readonly outboxId: string;
+  readonly payload: StudioOutboxPayload;
+}
+
+export interface EnsureStudioOnboardingBundleInput<T> {
+  readonly senderHash: SenderHash;
+  readonly receiptId: string;
+  readonly onboardingVersion: number;
+  /** The settings value encrypted and committed with the enrollment marker. */
+  readonly settings: T;
+  readonly bubbles: readonly [StudioOnboardingBubbleInput, StudioOnboardingBubbleInput];
+}
+
+/** A failed bundle never advances the settings-only onboarding marker. */
+export type StudioOnboardingBundleResult =
+  | { readonly kind: "created" }
+  | { readonly kind: "existing" }
+  | { readonly kind: "unavailable" };
+
+/**
+ * Opaque, non-expiring proof that settings and both onboarding intents were
+ * committed together. It deliberately contains no thread or message content.
+ */
+interface StudioOnboardingMarker {
+  readonly schemaVersion: 1;
+  readonly onboardingVersion: number;
+  readonly receiptId: string;
+  readonly firstOutboxId: string;
+  readonly secondOutboxId: string;
+}
+
 type PendingControlState = "active" | "cleared" | "maintenance" | "expired";
 
 /**
@@ -733,6 +770,98 @@ export class StudioStore {
       // than replacing a concurrent first-contact write blindly.
     }
     throw new Error("settings initialization could not be confirmed");
+  }
+
+  /**
+   * Commits first-contact settings and the complete two-bubble onboarding
+   * sequence as one Redis transaction. A settings record is therefore never
+   * evidence of onboarding unless both durable outbox intents exist too.
+   *
+   * The marker is intentionally non-expiring: terminal outbox metadata and
+   * encrypted settings can expire independently, but neither event should
+   * make an already-onboarded sender receive a duplicate sequence.
+   */
+  public async ensureOnboardingBundle<T>(
+    input: EnsureStudioOnboardingBundleInput<T>,
+  ): Promise<StudioOnboardingBundleResult> {
+    if (
+      !isOpaqueStudioIdentifier(input.senderHash)
+      || !isOpaqueStudioIdentifier(input.receiptId)
+      || !isPositiveSafeInteger(input.onboardingVersion)
+      || input.bubbles.length !== 2
+    ) return Object.freeze({ kind: "unavailable" });
+
+    const [firstInput, secondInput] = input.bubbles;
+    if (
+      !firstInput
+      || !secondInput
+      || !isOpaqueStudioIdentifier(firstInput.outboxId)
+      || !isOpaqueStudioIdentifier(secondInput.outboxId)
+      || firstInput.outboxId === secondInput.outboxId
+      || firstInput.payload.kind !== "text"
+      || secondInput.payload.kind !== "text"
+      || typeof firstInput.payload.text !== "string"
+      || !firstInput.payload.text
+      || typeof secondInput.payload.text !== "string"
+      || !secondInput.payload.text
+    ) return Object.freeze({ kind: "unavailable" });
+
+    const first = this.buildOutboxRecord({
+      outboxId: firstInput.outboxId,
+      senderHash: input.senderHash,
+      lane: "onboarding",
+      sequence: 1,
+      payload: firstInput.payload,
+    });
+    const second = this.buildOutboxRecord({
+      outboxId: secondInput.outboxId,
+      senderHash: input.senderHash,
+      lane: "onboarding",
+      sequence: 2,
+      payload: secondInput.payload,
+    });
+    const marker: StudioOnboardingMarker = Object.freeze({
+      schemaVersion: 1,
+      onboardingVersion: input.onboardingVersion,
+      receiptId: input.receiptId,
+      firstOutboxId: first.outboxId,
+      secondOutboxId: second.outboxId,
+    });
+    const encryptedSettings = this.cipher.encrypt(input.settings, `settings:${input.senderHash}`);
+    const result = await this.redis.eval(ENSURE_ONBOARDING_BUNDLE_LUA, {
+      keys: [
+        this.settingsKey(input.senderHash),
+        this.onboardingMarkerKey(input.senderHash, input.onboardingVersion),
+        this.outboxKey(first.outboxId),
+        this.outboxPayloadKey(first.outboxId),
+        this.outboxKey(second.outboxId),
+        this.outboxPayloadKey(second.outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(first),
+        this.releaseFenceKey(),
+      ],
+      arguments: [
+        JSON.stringify(encryptedSettings),
+        String(SETTINGS_TTL_SECONDS),
+        JSON.stringify(marker),
+        JSON.stringify(outboxMetadata(first)),
+        JSON.stringify(requiredOutboxPayload(first)),
+        first.outboxId,
+        String(first.sequence),
+        String(first.dueAtMs),
+        JSON.stringify(outboxMetadata(second)),
+        JSON.stringify(requiredOutboxPayload(second)),
+        second.outboxId,
+        String(second.sequence),
+        String(second.dueAtMs),
+        String(OUTBOX_PAYLOAD_TTL_SECONDS),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+      ],
+    });
+    if (result === 1 || result === "1") return Object.freeze({ kind: "created" });
+    if (result === 2 || result === "2") return Object.freeze({ kind: "existing" });
+    return Object.freeze({ kind: "unavailable" });
   }
 
   public async getPending<T>(senderHash: SenderHash, threadHash: ThreadHash): Promise<T | null> {
@@ -2017,6 +2146,9 @@ export class StudioStore {
   }
   private releaseFenceKey(): string { return `${this.prefix}:operations:release-fence`; }
   private settingsKey(senderHash: SenderHash): string { return `${this.prefix}:settings:${senderHash}`; }
+  private onboardingMarkerKey(senderHash: SenderHash, onboardingVersion: number): string {
+    return `${this.prefix}:onboarding:marker:${senderHash}:v${onboardingVersion}`;
+  }
   private pendingKey(senderHash: SenderHash, threadHash: ThreadHash): string {
     return `${this.prefix}:pending:v3:payload:${senderHash}:${threadHash}`;
   }
@@ -2724,6 +2856,180 @@ redis.call('SET', KEYS[1], ARGV[1])
 redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
 redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
 redis.call('ZADD', KEYS[4], ARGV[6], ARGV[5])
+return 1
+`;
+
+const ENSURE_ONBOARDING_BUNDLE_LUA = `
+-- AIR_STUDIO_ENSURE_ONBOARDING_BUNDLE_V1
+-- KEYS: encrypted settings, opaque enrollment marker, first metadata/payload,
+--       second metadata/payload, ready-outbox index, onboarding lane, fence
+-- ARGV: encrypted settings, settings ttl, marker, first metadata/payload/id/
+--       sequence/due, second metadata/payload/id/sequence/due, payload ttl,
+--       release generation/phase
+local function keyType(key)
+  local response = redis.call('TYPE', key)
+  return response and response.ok or ''
+end
+
+local function isStringOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'string'
+end
+
+local function isZsetOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'zset'
+end
+
+local function opaqueId(value)
+  return type(value) == 'string' and #value == 64 and string.match(value, '^[a-f0-9]+$') ~= nil
+end
+
+local function positiveInteger(value)
+  return type(value) == 'number' and value >= 1 and value == math.floor(value)
+end
+
+local function nonnegativeInteger(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+
+local function validStamp(stamp)
+  return type(stamp) == 'table'
+    and nonnegativeInteger(stamp.generation)
+    and (stamp.phase == 'dark' or stamp.phase == 'canary' or stamp.phase == 'production')
+    and (stamp.phase == 'dark' or stamp.generation >= 1)
+end
+
+local function sameStamp(left, right)
+  return validStamp(left) and validStamp(right)
+    and left.generation == right.generation and left.phase == right.phase
+end
+
+local function validMarker(marker, expectedVersion)
+  return type(marker) == 'table'
+    and marker.schemaVersion == 1
+    and marker.onboardingVersion == expectedVersion
+    and positiveInteger(marker.onboardingVersion)
+    and opaqueId(marker.receiptId)
+    and opaqueId(marker.firstOutboxId)
+    and opaqueId(marker.secondOutboxId)
+    and marker.firstOutboxId ~= marker.secondOutboxId
+end
+
+local function validNewOutbox(record, outboxId, senderHash, sequence, stamp, dueAt)
+  return type(record) == 'table'
+    and record.schemaVersion == 3
+    and record.outboxId == outboxId
+    and record.senderHash == senderHash
+    and record.lane == 'onboarding'
+    and record.jobId == nil
+    and record.laneIdentity == nil
+    and record.pendingGuard == nil
+    and record.encryptedPayload == nil
+    and record.sequence == sequence
+    and record.state == 'intent'
+    and record.attempts == 0
+    and record.stateVersion == 1
+    and nonnegativeInteger(record.createdAtMs)
+    and record.dueAtMs == dueAt
+    and nonnegativeInteger(record.updatedAtMs)
+    and sameStamp(record.releaseStamp, stamp)
+end
+
+local function validEncrypted(value)
+  return type(value) == 'table'
+    and value.version == 1
+    and value.algorithm == 'aes-256-gcm'
+    and type(value.iv) == 'string'
+    and type(value.ciphertext) == 'string'
+    and type(value.tag) == 'string'
+end
+
+local settingsTtl = tonumber(ARGV[2])
+local firstSequence = tonumber(ARGV[7])
+local firstDueAt = tonumber(ARGV[8])
+local secondSequence = tonumber(ARGV[12])
+local secondDueAt = tonumber(ARGV[13])
+local outboxPayloadTtl = tonumber(ARGV[14])
+local generation = tonumber(ARGV[15])
+local phase = ARGV[16]
+if not positiveInteger(settingsTtl)
+  or firstSequence ~= 1 or not nonnegativeInteger(firstDueAt)
+  or secondSequence ~= 2 or not nonnegativeInteger(secondDueAt)
+  or not positiveInteger(outboxPayloadTtl)
+  or not nonnegativeInteger(generation)
+  or (phase ~= 'dark' and phase ~= 'canary' and phase ~= 'production')
+  or (phase ~= 'dark' and generation < 1) then return -3 end
+
+local markerOk, candidateMarker = pcall(cjson.decode, ARGV[3])
+if not markerOk or type(candidateMarker) ~= 'table' then return -3 end
+local candidateVersion = candidateMarker.onboardingVersion
+if not validMarker(candidateMarker, candidateVersion)
+  or candidateMarker.firstOutboxId ~= ARGV[6]
+  or candidateMarker.secondOutboxId ~= ARGV[11] then return -3 end
+
+-- A prior atomic enrollment is authoritative even if a later deployment has
+-- changed the release fence. Retrying it must never recreate stale bubbles.
+if not isStringOrMissing(KEYS[2]) then return -3 end
+local existingMarkerRaw = redis.call('GET', KEYS[2])
+if existingMarkerRaw then
+  local existingMarkerOk, existingMarker = pcall(cjson.decode, existingMarkerRaw)
+  if not existingMarkerOk or not validMarker(existingMarker, candidateMarker.onboardingVersion) then return -3 end
+  return 2
+end
+
+-- Validate every key and payload before the first mutation. Redis does not
+-- roll back a Lua script after a runtime error, so partial enrollment is not
+-- an acceptable fallback path.
+if not isStringOrMissing(KEYS[1])
+  or not isStringOrMissing(KEYS[3]) or not isStringOrMissing(KEYS[4])
+  or not isStringOrMissing(KEYS[5]) or not isStringOrMissing(KEYS[6])
+  or not isStringOrMissing(KEYS[9])
+  or not isZsetOrMissing(KEYS[7]) or not isZsetOrMissing(KEYS[8]) then return -3 end
+
+local settingsOk, settings = pcall(cjson.decode, ARGV[1])
+local firstOk, first = pcall(cjson.decode, ARGV[4])
+local firstPayloadOk, firstPayload = pcall(cjson.decode, ARGV[5])
+local secondOk, second = pcall(cjson.decode, ARGV[9])
+local secondPayloadOk, secondPayload = pcall(cjson.decode, ARGV[10])
+if not settingsOk or not validEncrypted(settings)
+  or not firstOk or type(first) ~= 'table'
+  or not secondOk or type(second) ~= 'table'
+  or not firstPayloadOk or not validEncrypted(firstPayload)
+  or not secondPayloadOk or not validEncrypted(secondPayload) then return -3 end
+
+if not opaqueId(ARGV[6]) or not opaqueId(ARGV[11]) or ARGV[6] == ARGV[11] then return -3 end
+local senderHash = first.senderHash
+if not opaqueId(senderHash) or senderHash ~= second.senderHash then return -3 end
+local stamp = { generation = generation, phase = phase }
+if not validNewOutbox(first, ARGV[6], senderHash, firstSequence, stamp, firstDueAt)
+  or not validNewOutbox(second, ARGV[11], senderHash, secondSequence, stamp, secondDueAt) then return -3 end
+
+local fenceRaw = redis.call('GET', KEYS[9])
+if fenceRaw then
+  local fenceOk, fence = pcall(cjson.decode, fenceRaw)
+  if not fenceOk or not validStamp(fence) then return -3 end
+  if not sameStamp(fence, stamp) then return -2 end
+elseif phase ~= 'dark' then
+  return -3
+end
+
+if redis.call('EXISTS', KEYS[3]) == 1 or redis.call('EXISTS', KEYS[4]) == 1
+  or redis.call('EXISTS', KEYS[5]) == 1 or redis.call('EXISTS', KEYS[6]) == 1 then return -3 end
+if #redis.call('ZRANGEBYSCORE', KEYS[8], firstSequence, firstSequence, 'LIMIT', 0, 1) > 0
+  or #redis.call('ZRANGEBYSCORE', KEYS[8], secondSequence, secondSequence, 'LIMIT', 0, 1) > 0 then return -3 end
+
+redis.call('SET', KEYS[1], ARGV[1], 'EX', settingsTtl)
+redis.call('SET', KEYS[3], ARGV[4])
+redis.call('SET', KEYS[4], ARGV[5], 'EX', outboxPayloadTtl)
+redis.call('SET', KEYS[5], ARGV[9])
+redis.call('SET', KEYS[6], ARGV[10], 'EX', outboxPayloadTtl)
+redis.call('ZADD', KEYS[7], firstDueAt, ARGV[6])
+redis.call('ZADD', KEYS[7], secondDueAt, ARGV[11])
+redis.call('ZADD', KEYS[8], firstSequence, ARGV[6])
+redis.call('ZADD', KEYS[8], secondSequence, ARGV[11])
+-- A valid marker is written last; it proves the whole enrollment bundle.
+redis.call('SET', KEYS[2], ARGV[3])
 return 1
 `;
 

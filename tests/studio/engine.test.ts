@@ -246,9 +246,17 @@ describe("Air studio dark engine", () => {
       state: "maintenance_rejected",
     });
     expect(admitJob).not.toHaveBeenCalled();
-    expect(createOutbox).toHaveBeenCalledTimes(3);
+    // The welcome pair is published by one atomic onboarding transaction;
+    // the separate generic maintenance response is the only direct
+    // `createOutbox` call made by this receipt.
+    expect(createOutbox).toHaveBeenCalledTimes(1);
 
-    const outboxIds = createOutbox.mock.calls.map(([input]) => input.outboxId);
+    const outboxIds = await fixture.redis.zRangeByScore(
+      `${STUDIO_REDIS_PREFIX}:outbox:ready`,
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    expect(outboxIds).toHaveLength(3);
     const records = await durableOutboxRecords(fixture, outboxIds);
     expect(records.every((record) => record.state === "intent" && record.attempts === 0)).toBe(true);
 
@@ -261,6 +269,26 @@ describe("Air studio dark engine", () => {
     expect(fixture.transport.showTyping).not.toHaveBeenCalled();
     expect(fixture.transport.sendText).not.toHaveBeenCalled();
     expect(fixture.transport.sendAttachment).not.toHaveBeenCalled();
+  });
+
+  it("keeps a first-contact receipt recoverable when its atomic onboarding bundle cannot commit", async () => {
+    const fixture = createDarkFixture();
+    const ensureOnboardingBundle = vi.spyOn(fixture.store, "ensureOnboardingBundle")
+      .mockResolvedValueOnce({ kind: "unavailable" });
+    const createOutbox = vi.spyOn(fixture.store, "createOutbox");
+    const receiptId = await persistInbound(fixture, "onboarding-bundle-unavailable-001", "/help");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 0, outbox: 0 });
+
+    // The inbound envelope remains leased/recoverable and neither a settings
+    // cursor nor a one-bubble partial has been written by the engine.
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({
+      receiptId,
+      state: "claimed",
+    });
+    await expect(fixture.store.getSettings<unknown>(fixture.senderHash)).resolves.toBeNull();
+    expect(createOutbox).not.toHaveBeenCalled();
+    expect(ensureOnboardingBundle).toHaveBeenCalledTimes(1);
   });
 
   it("does not claim or invoke a verified transport while delivery is disabled", async () => {
@@ -574,6 +602,44 @@ describe("Air studio dark engine", () => {
     expect(admitJob).not.toHaveBeenCalled();
     expect(fixture.transport.sendText).not.toHaveBeenCalled();
     expect(fixture.transport.sendAttachment).not.toHaveBeenCalled();
+  });
+
+  it("treats zero spend caps as a no-paid-generation kill switch even if provider switches are true", async () => {
+    const provider = {
+      verified: true,
+      submit: vi.fn(async () => Object.freeze({ kind: "accepted" as const, providerRequestId: "must-not-submit" })),
+    } satisfies StudioProviderPort;
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      allowProviderSubmit: true,
+      provider,
+      registry: reviewedImagineRegistry(),
+      perJobCents: 0,
+      dailyCents: 0,
+    });
+    await armFixtureReleaseFence(fixture);
+    const admit = vi.spyOn(fixture.store, "admitJobWithInitialNotifications");
+    const receiptId = await persistInbound(fixture, "zero-spend-paid-kill-switch-001", "/imagine a paper lantern");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "processed" });
+    await expect(fixture.store.getActiveJob(fixture.senderHash)).resolves.toBeNull();
+    expect(admit).not.toHaveBeenCalled();
+    await expect(drainStudioJobs(fixture.runtime)).resolves.toBe(0);
+    expect(provider.submit).not.toHaveBeenCalled();
+
+    const outboxIds = await fixture.redis.zRangeByScore(
+      `${STUDIO_REDIS_PREFIX}:outbox:ready`,
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    const payloads = await Promise.all(outboxIds.map(async (outboxId) => {
+      const outbox = await fixture.store.getOutbox(outboxId);
+      return outbox ? fixture.store.decryptOutboxPayload(outbox).text : undefined;
+    }));
+    expect(payloads).toContain("Air has no verified paid execution path enabled in this deployment. No generation was submitted.");
   });
 
   it("persists an acknowledgement and tapback before the verified scheduler submits a text-only job", async () => {
