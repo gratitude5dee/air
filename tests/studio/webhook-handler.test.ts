@@ -1,6 +1,17 @@
 import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createQueueCipher } from "../../lib/crypto.js";
+import { MemoryRedis } from "../../lib/redis.js";
 import { createSenderIdentity, hashThreadIdentifier } from "../../lib/security.js";
+import { loadStudioEnvironment } from "../../lib/studio/config.js";
+import { drainStudio } from "../../lib/studio/engine.js";
+import {
+  PhotonIMessageTransport,
+  type PhotonIMessageClient,
+  type PhotonIMessagePort,
+} from "../../lib/studio/photon-transport.js";
+import { UnprovisionedStudioProvider } from "../../lib/studio/provider-port.js";
+import { StudioStore } from "../../lib/studio/store.js";
 import { authorizeStudioDrain, handleStudioIMessageWebhook } from "../../lib/studio/webhook-handler.js";
 import type { StudioRuntime } from "../../lib/studio/runtime.js";
 
@@ -162,6 +173,105 @@ describe("Air iMessage webhook", () => {
     expect(response.status).toBe(200);
     expect(persistInbox).toHaveBeenCalledTimes(1);
     expect(drain).not.toHaveBeenCalled();
+  });
+
+  it("delivers a signed allowlisted /help through the fenced zero-spend path without a network or provider", async () => {
+    configureEnvironment({
+      VERCEL_ENV: "production",
+      AIR_RELEASE_PHASE: "production",
+      AIR_RELEASE_GENERATION: "1",
+      AIR_RELEASE_FENCE_SECRET: "test-release-fence-secret",
+      AIR_DELIVERY_ENABLED: "true",
+      AIR_JOB_SPEND_CAP_USD: "0",
+      AIR_DAILY_SPEND_CAP_USD: "0",
+    });
+    const environment = loadStudioEnvironment();
+    const now = Date.now();
+    const cipher = createQueueCipher(queueKey);
+    const redis = new MemoryRedis(() => now);
+    const store = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      clock: () => now,
+      releaseStamp: { generation: environment.releaseGeneration, phase: environment.releasePhase },
+    });
+    const darkStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      clock: () => now,
+      releaseStamp: { generation: 0, phase: "dark" },
+    });
+    expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    expect(await store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+
+    const sendText = vi.fn<PhotonIMessageClient["messages"]["sendText"]>(async () => ({ guid: "mock-sent-message" }));
+    const client: PhotonIMessageClient = {
+      chats: { setTyping: vi.fn<PhotonIMessageClient["chats"]["setTyping"]>(async () => undefined) },
+      messages: { sendText },
+    };
+    const getClient = vi.fn<PhotonIMessagePort["getClient"]>(async () => client);
+    const port: PhotonIMessagePort = { getClient };
+    const transport = new PhotonIMessageTransport({
+      projectId: "photon-project",
+      projectSecret: "photon-project-secret",
+      webhookSecret,
+      port,
+    });
+    const provider = new UnprovisionedStudioProvider();
+    const submit = vi.spyOn(provider, "submit");
+    const runtime: StudioRuntime = {
+      environment,
+      cipher,
+      store,
+      transport,
+      provider,
+      storageTransport: "tcp",
+      readiness: () => [],
+      close: async () => undefined,
+    };
+    let deferredWork: Promise<unknown> | undefined;
+    const waitUntil = vi.fn((work: Promise<unknown>) => {
+      deferredWork = work;
+    });
+
+    const response = await handleStudioIMessageWebhook(
+      signedRequest(messagePayload({ messageId: "help-delivery-001", text: "/help" })),
+      {
+        getRuntime: async () => runtime,
+        drain: drainStudio,
+        waitUntil,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(waitUntil).toHaveBeenCalledTimes(1);
+    if (!deferredWork) throw new Error("expected the durable drain to be scheduled");
+    await deferredWork;
+
+    const sentTexts = sendText.mock.calls.map(([, text]) => text);
+    const welcomeOne = "Hey — I’m Air by WZRD ⚡ Your image + video studio in iMessage.";
+    const welcomeTwo = "Create with /imagine, /animate, /edit-image, or /edit-video. Try: /imagine a chrome hummingbird at sunrise. Settings: /model-settings • Help: /help. Generation is currently unavailable while Air completes provider review; any later approved path will disclose its media-retention terms.";
+    expect(sentTexts).toHaveLength(3);
+    expect(sentTexts).toEqual(expect.arrayContaining([
+      welcomeOne,
+      welcomeTwo,
+      expect.stringContaining("Air commands:"),
+    ]));
+    expect(sentTexts.indexOf(welcomeOne)).toBeLessThan(sentTexts.indexOf(welcomeTwo));
+    expect(sendText).toHaveBeenCalledWith(
+      "any;-;+14155550123",
+      expect.any(String),
+      expect.objectContaining({
+        clientMessageId: expect.stringMatching(/^air-v2-outbox-[a-f0-9]{64}$/),
+        enableDataDetection: false,
+        enableLinkPreview: false,
+      }),
+    );
+    expect(getClient).toHaveBeenCalledWith("+14155550999");
+    expect(submit).not.toHaveBeenCalled();
+    expect(await store.getActiveJob(createSenderIdentity(identitySecret, senderId).senderHash)).toBeNull();
   });
 
   it("ignores signed groups, outbound echoes, and non-allowlisted DMs without opening storage", async () => {
