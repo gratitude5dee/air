@@ -7,6 +7,7 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/healthz.ts",
   "api/index.ts",
   "api/internal/drain-inbox.ts",
+  "api/internal/provider-audit.ts",
   "api/internal/readiness.ts",
   "api/internal/release-fence.ts",
   "api/webhooks/imessage.ts",
@@ -16,6 +17,7 @@ const EXPECTED_REWRITES = Object.freeze([
   ["/healthz", "/api/healthz"],
   ["/webhooks/imessage", "/api/webhooks/imessage"],
   ["/internal/drain-inbox", "/api/internal/drain-inbox"],
+  ["/internal/provider-audit", "/api/internal/provider-audit"],
   ["/internal/readiness", "/api/internal/readiness"],
   ["/internal/release-fence", "/api/internal/release-fence"],
 ]);
@@ -129,7 +131,7 @@ function verifyNoRetiredRuntimeDependencies(packageJson) {
 async function verifyRouteSources() {
   const actualApiFiles = await collectTypeScriptFiles("api");
   if (actualApiFiles.length !== EXPECTED_API_FILES.length || actualApiFiles.some((file, index) => file !== EXPECTED_API_FILES[index])) {
-    throw new Error("API surface differs from the approved five Air route files");
+    throw new Error("API surface differs from the approved Air route files");
   }
 
   const sourceFiles = [...actualApiFiles, ...await collectTypeScriptFiles("lib/studio")];
@@ -158,6 +160,10 @@ async function verifyRouteSources() {
   const drainSource = await readFile(resolve(ROOT, "api/internal/drain-inbox.ts"), "utf8");
   if (!drainSource.includes("handleStudioDrain")) {
     throw new Error("the cron route must use the Studio authorization handler");
+  }
+  const providerAuditSource = await readFile(resolve(ROOT, "api/internal/provider-audit.ts"), "utf8");
+  if (!providerAuditSource.includes("handleStudioProviderAudit")) {
+    throw new Error("the provider-audit route must use the read-only Studio audit handler");
   }
   const releaseFenceSource = await readFile(resolve(ROOT, "api/internal/release-fence.ts"), "utf8");
   if (!releaseFenceSource.includes("handleStudioReleaseFence")) {
