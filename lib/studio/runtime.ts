@@ -9,10 +9,21 @@ import {
   type StudioEnvironment,
 } from "./config.js";
 import { UnverifiedPhotonTransport, type StudioIMessageTransport } from "./imessage-transport.js";
-import { AIR_MODEL_REGISTRY, type AirModelRegistry } from "./model-registry.js";
+import {
+  AIR_MODEL_REGISTRY,
+  resolveDefaultModel,
+  type AirModelRegistry,
+  type StudioModel,
+} from "./model-registry.js";
 import { assertNoPhotonTelemetryExporters } from "./photon-telemetry.js";
 import { UnprovisionedStudioProvider, type StudioProviderPort } from "./provider-port.js";
 import { StudioStore } from "./store.js";
+import {
+  GMI_FLUX_KONTEXT_PRO_ADAPTER_KEY,
+  GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+  GmiFluxKontextProStudioProvider,
+} from "./gmi-flux-kontext-pro-provider.js";
+import { GmiRequestQueueClient } from "./gmi-request-queue.js";
 
 export const AIR_STUDIO_VERSION = "2";
 
@@ -53,14 +64,56 @@ export async function getStudioRuntime(): Promise<StudioRuntime> {
 export async function createStudioRuntime(
   environment: StudioEnvironment = loadStudioEnvironment(),
   transport?: StudioIMessageTransport,
-  provider: StudioProviderPort = new UnprovisionedStudioProvider(),
+  provider?: StudioProviderPort,
 ): Promise<StudioRuntime> {
   if (!environment.idHashSecret || !environment.queueEncryptionKey || environment.storageTransport === "unconfigured") {
     throw new Error("studio runtime configuration is incomplete");
   }
   const configuredTransport = transport ?? await createConfiguredIMessageTransport(environment);
+  const configuredProvider = createConfiguredStudioProvider(environment, AIR_MODEL_REGISTRY, provider);
   const connection = await connectExistingRedis(environment);
-  return runtimeFromConnectedRedis(environment, connection, configuredTransport, provider);
+  return runtimeFromConnectedRedis(environment, connection, configuredTransport, configuredProvider);
+}
+
+/**
+ * Composes the only reviewed first-launch provider contract. This does not
+ * enable a model: the committed production registry remains empty until live
+ * catalog, schema, and pricing evidence are recorded. The registry argument
+ * makes this pure boundary directly testable without changing that default.
+ */
+export function createConfiguredStudioProvider(
+  environment: StudioEnvironment,
+  registry: AirModelRegistry = AIR_MODEL_REGISTRY,
+  injectedProvider?: StudioProviderPort,
+): StudioProviderPort {
+  if (injectedProvider !== undefined) return injectedProvider;
+
+  const model = reviewedFluxKontextProImagineDefault(registry);
+  if (model === undefined || environment.gmiApiKey === undefined) {
+    return new UnprovisionedStudioProvider();
+  }
+
+  try {
+    // Construction only validates credentials and pins an immutable client
+    // configuration. It deliberately performs no provider request.
+    const queue = new GmiRequestQueueClient({
+      apiKey: environment.gmiApiKey,
+      ...(environment.gmiOrganizationId === undefined
+        ? {}
+        : { organizationId: environment.gmiOrganizationId }),
+      sideEffectEnvironment: environment,
+    });
+    return new GmiFluxKontextProStudioProvider(queue, {
+      outputPolicy: Object.freeze({
+        host: model.outputRetrieval.host,
+        pathPrefix: model.outputRetrieval.pathPrefix,
+      }),
+    });
+  } catch {
+    // A manually constructed or malformed test environment must fail closed,
+    // just like a missing credential or unreviewed registry binding.
+    return new UnprovisionedStudioProvider();
+  }
 }
 
 export function studioPublicStatusResponse(): Response {
@@ -89,6 +142,49 @@ async function connectExistingRedis(environment: StudioEnvironment): Promise<Con
       ? { upstashRestUrl: environment.upstashRedisRestUrl, upstashRestToken: environment.upstashRedisRestToken }
       : {}),
   });
+}
+
+/**
+ * The adapter's own final submit boundary repeats these checks. Keeping an
+ * equally narrow composition gate prevents a generic GMI key plus an enabled
+ * but differently shaped model from making a provider appear provisioned.
+ */
+function reviewedFluxKontextProImagineDefault(registry: AirModelRegistry): StudioModel | undefined {
+  const resolution = resolveDefaultModel(registry, "imagine");
+  if (!resolution.ok) return undefined;
+  const model = resolution.model;
+
+  const onlyPromptField = model.requiredPayloadFields.length === 1 &&
+    model.requiredPayloadFields[0]?.name === "prompt" &&
+    model.requiredPayloadFields[0]?.declaredType === "string" &&
+    model.requiredPayloadFields[0]?.required === true;
+  const exactlyOneImage = model.output.type === "image" &&
+    model.output.maximumOutputCount === 1 &&
+    model.output.supportedOutputCounts.length === 1 &&
+    model.output.supportedOutputCounts[0] === 1 &&
+    model.output.supportedDurationSeconds.length === 0;
+  // Host and path are verified registry evidence, not runtime guesses. The
+  // first authenticated catalog audit will commit their exact values; this
+  // gate only requires a non-empty, private, signed delivery contract and
+  // passes the reviewed allowlist through unchanged to the adapter.
+  const privateFluxOutput = model.outputRetrieval.host.trim().length > 0 &&
+    model.outputRetrieval.pathPrefix.length > 1 &&
+    model.outputRetrieval.access === "signed-url" &&
+    model.outputRetrieval.publiclyAccessible === false;
+
+  return model.provider === "gmi" &&
+    model.providerModelId === GMI_FLUX_KONTEXT_PRO_MODEL_ID &&
+    model.providerBinding.adapterKey === GMI_FLUX_KONTEXT_PRO_ADAPTER_KEY &&
+    model.input.prompt === "required" &&
+    model.input.image === false &&
+    model.input.video === false &&
+    model.input.mediaOnly === false &&
+    model.inputHosting.mode === "data-uri" &&
+    onlyPromptField &&
+    exactlyOneImage &&
+    privateFluxOutput
+    ? model
+    : undefined;
 }
 
 /**
