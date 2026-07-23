@@ -7,7 +7,10 @@ import {
   GmiFluxKontextProStudioProvider,
   type GmiFluxKontextProRequestQueueClient,
 } from "../../lib/studio/gmi-flux-kontext-pro-provider.js";
-import type { StudioProviderSubmitInput } from "../../lib/studio/provider-port.js";
+import type {
+  StudioProviderObservationInput,
+  StudioProviderSubmitInput,
+} from "../../lib/studio/provider-port.js";
 
 const FINGERPRINT = `sha256:${"a".repeat(64)}`;
 const SUBMISSION_INTENT_ID = "b".repeat(64);
@@ -70,12 +73,36 @@ function submitInput(overrides: Partial<StudioProviderSubmitInput> = {}): Studio
   };
 }
 
+function observationInput(
+  overrides: Partial<StudioProviderObservationInput> = {},
+): StudioProviderObservationInput {
+  const submit = submitInput();
+  return {
+    job: { ...submit.job, ...overrides.job },
+    snapshot: {
+      ...submit.snapshot,
+      ...overrides.snapshot,
+      workflow: { ...submit.snapshot.workflow, ...overrides.snapshot?.workflow },
+      model: { ...submit.snapshot.model, ...overrides.snapshot?.model },
+      output: { ...submit.snapshot.output, ...overrides.snapshot?.output },
+      polling: { ...submit.snapshot.polling, ...overrides.snapshot?.polling },
+      releaseStamp: { ...submit.snapshot.releaseStamp, ...overrides.snapshot?.releaseStamp },
+    },
+    providerRequestId: overrides.providerRequestId ?? "gmi-flux-observation-001",
+  };
+}
+
 function queueClient(result: GmiSubmitResult): GmiFluxKontextProRequestQueueClient & {
   readonly submitRequest: ReturnType<typeof vi.fn>;
 } {
   const submitRequest = vi.fn(async () => result);
   return { submitRequest } as GmiFluxKontextProRequestQueueClient & { readonly submitRequest: ReturnType<typeof vi.fn> };
 }
+
+const outputPolicy = Object.freeze({
+  host: "storage.googleapis.com",
+  pathPrefix: "/gmi-generated-assets/air/",
+});
 
 describe("GMI Flux Kontext Pro StudioProvider", () => {
   it("uses an injected queue client for the exact prompt-only Flux request", async () => {
@@ -179,5 +206,136 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
     await expect(ambiguousResult.submit(submitInput())).resolves.toEqual({ kind: "ambiguous" });
     await expect(malformedAccepted.submit(submitInput())).resolves.toEqual({ kind: "ambiguous" });
     await expect(clientThrows.submit(submitInput())).resolves.toEqual({ kind: "ambiguous" });
+  });
+
+  it("observes a pending Flux request without fetching an artifact or re-submitting", async () => {
+    const getRequestStatus = vi.fn(async () => ({
+      requestId: "gmi-flux-observation-001",
+      status: "processing" as const,
+      response: { request_id: "gmi-flux-observation-001", status: "processing" },
+    }));
+    const submitRequest = vi.fn(async () => ({
+      classification: "accepted" as const,
+      requestId: "not-used",
+      status: "dispatched" as const,
+    }));
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("must not fetch"));
+    const provider = new GmiFluxKontextProStudioProvider(
+      { submitRequest, getRequestStatus },
+      { outputPolicy, fetch },
+    );
+
+    await expect(provider.observe(observationInput())).resolves.toEqual({ kind: "pending" });
+    expect(getRequestStatus).toHaveBeenCalledWith("gmi-flux-observation-001");
+    expect(submitRequest).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("fetches exactly one documented private Flux result through the restricted output boundary", async () => {
+    const getRequestStatus = vi.fn(async () => ({
+      requestId: "gmi-flux-observation-001",
+      status: "success" as const,
+      response: {
+        request_id: "gmi-flux-observation-001",
+        model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+        status: "success",
+        is_public: false,
+        outcome: {
+          media_urls: [{
+            id: "0",
+            url: "https://storage.googleapis.com/gmi-generated-assets/air/opaque-output.jpg?X-Goog-Signature=private",
+          }],
+        },
+      },
+    }));
+    let request: Request | undefined;
+    const provider = new GmiFluxKontextProStudioProvider(
+      {
+        submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }),
+        getRequestStatus,
+      },
+      {
+        outputPolicy,
+        fetch: async (input, init) => {
+          request = new Request(input, init);
+          return new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
+            status: 200,
+            headers: { "content-type": "image/jpeg", "content-length": "3" },
+          });
+        },
+      },
+    );
+
+    const result = await provider.observe(observationInput());
+    expect(result.kind).toBe("ready");
+    if (result.kind !== "ready") throw new Error("expected Flux output");
+    expect(result.artifacts).toHaveLength(1);
+    expect(result.artifacts[0]).toMatchObject({
+      outputIndex: 1,
+      mediaType: "image",
+      declaredMimeType: "image/jpeg",
+    });
+    expect(request?.url).toContain("/gmi-generated-assets/air/opaque-output.jpg");
+    expect(request?.credentials).toBe("omit");
+    expect(request?.redirect).toBe("error");
+    expect(JSON.stringify(result)).not.toContain("X-Goog-Signature");
+  });
+
+  it("fences malformed, public, and off-policy Flux outcomes instead of guessing a result", async () => {
+    const baseResponse = {
+      request_id: "gmi-flux-observation-001",
+      model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+      status: "success",
+      is_public: false,
+      outcome: { media_urls: [{ id: "0", url: "https://storage.googleapis.com/gmi-generated-assets/air/output.jpg" }] },
+    };
+    const malformedResponses = [
+      { ...baseResponse, is_public: true },
+      { ...baseResponse, model: "other-model" },
+      { ...baseResponse, outcome: { media_urls: [] } },
+      {
+        ...baseResponse,
+        outcome: { media_urls: [{ id: "0", url: "https://storage.googleapis.com/other/output.jpg" }] },
+      },
+    ] as const;
+
+    for (const response of malformedResponses) {
+      const getRequestStatus = vi.fn(async () => ({
+        requestId: "gmi-flux-observation-001",
+        status: "success" as const,
+        response,
+      }));
+      const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("must not fetch"));
+      const provider = new GmiFluxKontextProStudioProvider(
+        { submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }), getRequestStatus },
+        { outputPolicy, fetch },
+      );
+      await expect(provider.observe(observationInput())).resolves.toEqual({ kind: "reconciliation_required" });
+      expect(fetch).not.toHaveBeenCalled();
+    }
+  });
+
+  it("keeps temporary status reads retryable but terminal provider failures definitive", async () => {
+    const retryable = new GmiFluxKontextProStudioProvider(
+      {
+        submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }),
+        getRequestStatus: async () => { throw new Error("private provider transport detail"); },
+      },
+      { outputPolicy },
+    );
+    const failed = new GmiFluxKontextProStudioProvider(
+      {
+        submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }),
+        getRequestStatus: async () => ({
+          requestId: "gmi-flux-observation-001",
+          status: "failed" as const,
+          response: { request_id: "gmi-flux-observation-001", status: "failed" },
+        }),
+      },
+      { outputPolicy },
+    );
+
+    await expect(retryable.observe(observationInput())).resolves.toEqual({ kind: "retryable_failure" });
+    await expect(failed.observe(observationInput())).resolves.toEqual({ kind: "definitive_failure" });
   });
 });

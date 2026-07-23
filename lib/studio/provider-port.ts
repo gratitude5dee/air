@@ -3,6 +3,11 @@ import type {
   StudioExecutionSnapshot,
   StudioJobRecord,
 } from "./store.js";
+import type {
+  StudioOutputIndex,
+  StudioProviderArtifactByteStream,
+  StudioProviderArtifactMediaType,
+} from "./artifact-validation.js";
 
 /**
  * The only provider boundary Air's durable executor may use. It has no
@@ -16,6 +21,57 @@ export interface StudioProviderPort {
    */
   readonly verified: boolean;
   submit(input: StudioProviderSubmitInput): Promise<StudioProviderSubmitResult>;
+}
+
+/**
+ * Observation is deliberately a separate optional capability. A provider that
+ * can submit work but cannot prove the exact result shape must never be
+ * mistaken for a usable end-to-end generation adapter.
+ */
+export interface StudioProviderObservationPort extends StudioProviderPort {
+  readonly observationSupported: true;
+  observe(input: StudioProviderObservationInput): Promise<StudioProviderObservationResult>;
+}
+
+/**
+ * One result stream is consumed immediately by Air's bounded artifact
+ * validator. It carries no URL, file name, provider identifier, or user
+ * routing data, so none of those values can escape into a result outbox.
+ */
+export interface StudioProviderObservedArtifact {
+  readonly outputIndex: StudioOutputIndex;
+  readonly mediaType: StudioProviderArtifactMediaType;
+  readonly declaredMimeType?: string | null | undefined;
+  readonly stream: StudioProviderArtifactByteStream;
+}
+
+export interface StudioProviderObservationInput {
+  readonly job: Pick<
+    StudioJobRecord,
+    "jobId" | "mode" | "modelSlug" | "provider" | "outputCount" | "durationSeconds" | "reservedCents"
+  >;
+  readonly snapshot: StudioExecutionSnapshot;
+  /** Encrypted at rest and supplied only after a known accepted submission. */
+  readonly providerRequestId: string;
+}
+
+/**
+ * A result poll never authorizes another submission. Temporary recovery
+ * failures remain retryable reads; malformed terminal results are fenced for
+ * reconciliation instead of being approximated or silently retried.
+ */
+export type StudioProviderObservationResult =
+  | { readonly kind: "pending" }
+  | { readonly kind: "ready"; readonly artifacts: readonly StudioProviderObservedArtifact[] }
+  | { readonly kind: "definitive_failure" }
+  | { readonly kind: "retryable_failure" }
+  | { readonly kind: "reconciliation_required" };
+
+export function isStudioProviderObservationPort(
+  provider: StudioProviderPort,
+): provider is StudioProviderObservationPort {
+  const candidate = provider as Partial<StudioProviderObservationPort>;
+  return candidate.observationSupported === true && typeof candidate.observe === "function";
 }
 
 /** User content is available only to the injected provider adapter at call time. */

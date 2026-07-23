@@ -4,8 +4,15 @@ import type {
   GmiRequestQueueClient,
   GmiSubmitResult,
 } from "./gmi-request-queue.js";
+import {
+  fetchStudioProviderArtifact,
+  StudioProviderArtifactFetchError,
+  type StudioProviderArtifactFetchPolicy,
+} from "./provider-artifact-fetch.js";
 import type {
-  StudioProviderPort,
+  StudioProviderObservationInput,
+  StudioProviderObservationPort,
+  StudioProviderObservationResult,
   StudioProviderSubmitInput,
   StudioProviderSubmitResult,
 } from "./provider-port.js";
@@ -29,7 +36,21 @@ export const GMI_FLUX_KONTEXT_PRO_ADAPTER_KEY = "gmi.flux-kontext-pro.v1" as con
  * effect. Tests pass a local fake; a future reviewed runtime must explicitly
  * inject an authenticated `GmiRequestQueueClient`.
  */
-export type GmiFluxKontextProRequestQueueClient = Pick<GmiRequestQueueClient, "submitRequest">;
+export type GmiFluxKontextProRequestQueueClient = Pick<GmiRequestQueueClient, "submitRequest">
+  & Partial<Pick<GmiRequestQueueClient, "getRequestStatus">>;
+
+/**
+ * The result URL policy belongs to a committed model review, not a provider
+ * response. Leaving it absent keeps observation fail-closed even though this
+ * adapter's submit implementation is available for deterministic tests.
+ */
+export interface GmiFluxKontextProStudioProviderOptions {
+  readonly outputPolicy?: StudioProviderArtifactFetchPolicy | undefined;
+  /** Dependency injection keeps result polling and download tests offline. */
+  readonly fetch?: typeof globalThis.fetch | undefined;
+  /** A model review may choose a shorter bounded artifact-read deadline. */
+  readonly artifactFetchTimeoutMs?: number | undefined;
+}
 
 /**
  * Prompt-only submission adapter for Flux Kontext Pro through GMI's Request
@@ -41,10 +62,14 @@ export type GmiFluxKontextProRequestQueueClient = Pick<GmiRequestQueueClient, "s
  * still needs live catalog/schema/pricing evidence, an enabled registry entry,
  * an authenticated injected client, and the existing release/cap gates.
  */
-export class GmiFluxKontextProStudioProvider implements StudioProviderPort {
+export class GmiFluxKontextProStudioProvider implements StudioProviderObservationPort {
   public readonly verified = true;
+  public readonly observationSupported = true;
 
-  public constructor(private readonly client: GmiFluxKontextProRequestQueueClient) {}
+  public constructor(
+    private readonly client: GmiFluxKontextProRequestQueueClient,
+    private readonly options: GmiFluxKontextProStudioProviderOptions = {},
+  ) {}
 
   public async submit(input: StudioProviderSubmitInput): Promise<StudioProviderSubmitResult> {
     let payload: GmiJsonObject | null;
@@ -71,13 +96,76 @@ export class GmiFluxKontextProStudioProvider implements StudioProviderPort {
       return ambiguous();
     }
   }
+
+  /**
+   * GMI status reads and result fetches are recovery operations only. The
+   * adapter never reconstructs a submission payload or calls `submit` here,
+   * so a poll retry cannot create another billable provider request.
+   */
+  public async observe(input: StudioProviderObservationInput): Promise<StudioProviderObservationResult> {
+    if (!hasExactFluxKontextProObservationBinding(input)) return reconciliationRequired();
+    if (!this.options.outputPolicy || typeof this.client.getRequestStatus !== "function") {
+      return reconciliationRequired();
+    }
+
+    let observation: Awaited<ReturnType<NonNullable<GmiFluxKontextProRequestQueueClient["getRequestStatus"]>>>;
+    try {
+      observation = await this.client.getRequestStatus(input.providerRequestId);
+    } catch {
+      // A status GET is safe to retry under the store's bounded poll policy;
+      // do not retain a provider error or URL in a durable record.
+      return retryableFailure();
+    }
+
+    if (!observation || observation.requestId !== input.providerRequestId) return reconciliationRequired();
+    switch (observation.status) {
+      case "dispatched":
+      case "processing":
+        return pending();
+      case "failed":
+      case "cancelled":
+        return definitiveFailure();
+      case "unknown":
+        return reconciliationRequired();
+      case "success":
+        break;
+    }
+
+    const resultUrl = extractPrivateFluxOutputUrl(observation.response);
+    if (resultUrl === null) return reconciliationRequired();
+
+    try {
+      const artifact = await fetchStudioProviderArtifact({
+        url: resultUrl,
+        policy: this.options.outputPolicy,
+        ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
+        ...(this.options.artifactFetchTimeoutMs === undefined
+          ? {}
+          : { timeoutMs: this.options.artifactFetchTimeoutMs }),
+      });
+      return Object.freeze({
+        kind: "ready" as const,
+        artifacts: Object.freeze([
+          Object.freeze({
+            outputIndex: 1 as const,
+            mediaType: "image" as const,
+            ...(artifact.declaredMimeType === undefined ? {} : { declaredMimeType: artifact.declaredMimeType }),
+            stream: artifact.stream,
+          }),
+        ]),
+      });
+    } catch (error) {
+      return isRetryableArtifactFetchError(error) ? retryableFailure() : reconciliationRequired();
+    }
+  }
 }
 
 /** A named factory keeps future composition explicit and test-friendly. */
 export function createGmiFluxKontextProStudioProvider(
   client: GmiFluxKontextProRequestQueueClient,
+  options?: GmiFluxKontextProStudioProviderOptions,
 ): GmiFluxKontextProStudioProvider {
-  return new GmiFluxKontextProStudioProvider(client);
+  return new GmiFluxKontextProStudioProvider(client, options);
 }
 
 /**
@@ -100,7 +188,18 @@ function createPromptOnlyPayload(input: StudioProviderSubmitInput): GmiJsonObjec
  * to name this exact provider/model/adapter combination.
  */
 function hasExactFluxKontextProBinding(input: StudioProviderSubmitInput): boolean {
-  const { job, snapshot, submissionIntentId } = input;
+  return hasExactFluxKontextProExecutionBinding(input) && isOpaqueSubmissionIntentId(input.submissionIntentId);
+}
+
+/** Observation has no submit intent, but must retain every other exact binding. */
+function hasExactFluxKontextProObservationBinding(input: StudioProviderObservationInput): boolean {
+  return isGmiProviderRequestId(input.providerRequestId) && hasExactFluxKontextProExecutionBinding(input);
+}
+
+function hasExactFluxKontextProExecutionBinding(
+  input: Pick<StudioProviderSubmitInput, "job" | "snapshot"> | StudioProviderObservationInput,
+): boolean {
+  const { job, snapshot } = input;
   const { model, output, workflow } = snapshot;
 
   return job.mode === "imagine"
@@ -109,7 +208,6 @@ function hasExactFluxKontextProBinding(input: StudioProviderSubmitInput): boolea
     && job.outputCount === 1
     && job.durationSeconds === undefined
     && isPositiveSafeInteger(job.reservedCents)
-    && isOpaqueSubmissionIntentId(submissionIntentId)
     && snapshot.schemaVersion === 2
     && workflow.workflowId === "air:imagine:v1"
     && workflow.workflowVersion === 1
@@ -127,6 +225,42 @@ function hasExactFluxKontextProBinding(input: StudioProviderSubmitInput): boolea
     && output.durationSeconds === undefined
     && snapshot.maximumQuotedCostCents === job.reservedCents
     && isPositiveSafeInteger(snapshot.maximumQuotedCostCents);
+}
+
+/**
+ * The documented Flux status response is intentionally parsed as a narrow
+ * protocol. `is_public: false`, one zero-indexed image, and the exact model
+ * ID are all required before Air is even allowed to inspect the result URL.
+ */
+function extractPrivateFluxOutputUrl(response: GmiJsonObject): string | null {
+  if (!isPlainJsonObject(response)) return null;
+  if (response.model !== GMI_FLUX_KONTEXT_PRO_MODEL_ID || response.is_public !== false) return null;
+  const outcome = response.outcome;
+  if (!isPlainJsonObject(outcome)) return null;
+  const mediaUrls = outcome.media_urls;
+  if (!Array.isArray(mediaUrls) || mediaUrls.length !== 1) return null;
+  const first = mediaUrls[0];
+  if (!isPlainJsonObject(first) || first.id !== "0" || typeof first.url !== "string") return null;
+  return first.url;
+}
+
+function isPlainJsonObject(value: unknown): value is GmiJsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isRetryableArtifactFetchError(error: unknown): boolean {
+  if (!(error instanceof StudioProviderArtifactFetchError)) return false;
+  switch (error.code) {
+    case "request_timeout":
+    case "transport_failure":
+    case "unexpected_status":
+    case "response_body_unavailable":
+    case "response_stream_failure":
+    case "response_stream_too_large":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function mapGmiSubmitResult(result: GmiSubmitResult): StudioProviderSubmitResult {
@@ -157,6 +291,22 @@ function definitiveRejection(): StudioProviderSubmitResult {
 
 function ambiguous(): StudioProviderSubmitResult {
   return Object.freeze({ kind: "ambiguous" });
+}
+
+function pending(): StudioProviderObservationResult {
+  return Object.freeze({ kind: "pending" });
+}
+
+function definitiveFailure(): StudioProviderObservationResult {
+  return Object.freeze({ kind: "definitive_failure" });
+}
+
+function retryableFailure(): StudioProviderObservationResult {
+  return Object.freeze({ kind: "retryable_failure" });
+}
+
+function reconciliationRequired(): StudioProviderObservationResult {
+  return Object.freeze({ kind: "reconciliation_required" });
 }
 
 function isPositiveSafeInteger(value: unknown): value is number {
