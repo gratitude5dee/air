@@ -1,4 +1,5 @@
-import type { StudioAttachmentReference } from "./store.js";
+import type { StudioAttachmentReference, StudioPreparedOutput } from "./store.js";
+import type { StudioValidatedProviderArtifact } from "./artifact-validation.js";
 
 /**
  * One physical iMessage side effect per method. The concrete Photon binding is
@@ -17,6 +18,17 @@ export type TransportOutcome =
   | { readonly kind: "failed"; readonly code: string }
   | { readonly kind: "send_unknown"; readonly code: string };
 
+/**
+ * Upload is a distinct physical operation with its own ambiguity boundary.
+ * A successful result is not a sent iMessage: it only authorizes the caller
+ * to durably record a validated Photon attachment GUID before a later send.
+ */
+export type StudioPrepareOutputOutcome =
+  | { readonly kind: "prepared"; readonly output: StudioPreparedOutput }
+  | { readonly kind: "retryable_failure"; readonly code: string }
+  | { readonly kind: "failed"; readonly code: string }
+  | { readonly kind: "send_unknown"; readonly code: string };
+
 export interface StudioIMessageTransport {
   readonly verified: boolean;
   showTyping(thread: IMessageThreadReference): Promise<void>;
@@ -25,6 +37,37 @@ export interface StudioIMessageTransport {
   sendAttachment(thread: IMessageThreadReference, attachment: StudioAttachmentReference, idempotencyKey: string): Promise<TransportOutcome>;
   addLikeTapback(thread: IMessageThreadReference, messageId: string, idempotencyKey: string): Promise<TransportOutcome>;
   fetchAttachment(thread: IMessageThreadReference, attachmentId: string): Promise<Uint8Array>;
+}
+
+/**
+ * Optional capability for the direct Photon output path. It is deliberately
+ * separate from the legacy transport so old/drain transports never receive
+ * provider bytes or an unreviewed Photon attachment GUID by accident.
+ */
+export interface StudioPreparedOutputTransport {
+  readonly preparedOutputTransport: "photon";
+  prepareValidatedProviderArtifact(
+    thread: IMessageThreadReference,
+    artifact: StudioValidatedProviderArtifact,
+  ): Promise<StudioPrepareOutputOutcome>;
+  sendPreparedOutput(
+    thread: IMessageThreadReference,
+    output: StudioPreparedOutput,
+    idempotencyKey: string,
+  ): Promise<TransportOutcome>;
+}
+
+/**
+ * Callers must explicitly opt into this narrow capability. Every legacy or
+ * non-Photon transport remains on the fail-closed attachment path.
+ */
+export function isStudioPreparedOutputTransport(
+  transport: StudioIMessageTransport,
+): transport is StudioIMessageTransport & StudioPreparedOutputTransport {
+  const candidate = transport as Partial<StudioPreparedOutputTransport>;
+  return candidate.preparedOutputTransport === "photon" &&
+    typeof candidate.prepareValidatedProviderArtifact === "function" &&
+    typeof candidate.sendPreparedOutput === "function";
 }
 
 /**

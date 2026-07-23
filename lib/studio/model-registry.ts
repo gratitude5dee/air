@@ -47,6 +47,13 @@ const ISO_UTC_TIMESTAMP_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
 const HOSTNAME_PATTERN =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+const SHA256_FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
+/**
+ * Provider bindings are code-facing identifiers, not display labels. The
+ * provider namespace and explicit version make an accidental adapter swap
+ * invalid before a provider request can be constructed.
+ */
+const PROVIDER_ADAPTER_KEY_PATTERN = /^(?:gmi|fal)\.[a-z0-9]+(?:[.-][a-z0-9]+)*\.v[1-9][0-9]*$/;
 
 function committedString(maximumLength: number) {
   return z
@@ -81,6 +88,17 @@ const studioVideoDurationSecondsSchema = z.union([
 const utcTimestampSchema = committedString(40).refine(
   (value) => ISO_UTC_TIMESTAMP_PATTERN.test(value) && Number.isFinite(Date.parse(value)),
   "must be a UTC ISO-8601 timestamp",
+);
+
+/** A canonical digest, never a mutable label or an unreviewed URL. */
+const sha256FingerprintSchema = committedString(71).refine(
+  (value) => SHA256_FINGERPRINT_PATTERN.test(value),
+  "must be a lowercase sha256 fingerprint",
+);
+
+const providerAdapterKeySchema = committedString(160).refine(
+  (value) => PROVIDER_ADAPTER_KEY_PATTERN.test(value),
+  "must be a provider-namespaced, explicitly versioned adapter key",
 );
 
 const providerPayloadFieldSchema = z
@@ -149,8 +167,21 @@ const modelOutputSchema = z
 const verificationSchema = z
   .object({
     verifiedAt: utcTimestampSchema,
-    catalogFingerprint: committedString(512),
-    schemaFingerprint: committedString(512),
+    catalogFingerprint: sha256FingerprintSchema,
+    schemaFingerprint: sha256FingerprintSchema,
+  })
+  .strict();
+
+/**
+ * Pins the registry entry to one reviewed implementation contract. Runtime
+ * adapter lookup must use `adapterKey` exactly; it must not infer an adapter
+ * from a provider label or provider model ID.
+ */
+const providerBindingSchema = z
+  .object({
+    adapterKey: providerAdapterKeySchema,
+    requestSchemaFingerprint: sha256FingerprintSchema,
+    resultSchemaFingerprint: sha256FingerprintSchema,
   })
   .strict();
 
@@ -169,6 +200,8 @@ const pricingSchema = z
     source: z.string().url().max(2_048),
     currency: z.string().regex(/^[A-Z]{3}$/, "must be an ISO-4217 currency"),
     verifiedAt: utcTimestampSchema,
+    /** Digest of the reviewed pricing evidence, not merely its landing page. */
+    evidenceFingerprint: sha256FingerprintSchema,
     quotes: z.array(priceQuoteSchema).min(1).max(12),
   })
   .strict();
@@ -190,6 +223,7 @@ const modelSchema = z
     provider: z.enum(MODEL_PROVIDERS),
     /** Exact provider identifier, never a display-name guess or candidate hint. */
     providerModelId: committedString(512),
+    providerBinding: providerBindingSchema,
     verification: verificationSchema,
     input: modelInputSchema,
     inputHosting: inputHostingSchema,
@@ -272,6 +306,14 @@ function collectSemanticIssues(registry: AirModelRegistry): readonly ModelRegist
 
     if (model.output.type !== EXPECTED_OUTPUT_BY_MODE[model.mode]) {
       addIssue(issues, [...path, "output", "type"], "output type does not match mode");
+    }
+
+    if (!model.providerBinding.adapterKey.startsWith(`${model.provider}.`)) {
+      addIssue(
+        issues,
+        [...path, "providerBinding", "adapterKey"],
+        "adapter key must be namespaced to the exact model provider",
+      );
     }
 
     const counts = new Set(model.output.supportedOutputCounts);

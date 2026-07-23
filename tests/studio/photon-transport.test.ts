@@ -1,6 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { IMessageThreadReference } from "../../lib/studio/imessage-transport.js";
+import {
+  validateStudioProviderArtifact,
+  type StudioOutputIndex,
+} from "../../lib/studio/artifact-validation.js";
+import {
+  isStudioPreparedOutputTransport,
+  UnverifiedPhotonTransport,
+  type IMessageThreadReference,
+} from "../../lib/studio/imessage-transport.js";
+import type { StudioPreparedOutput } from "../../lib/studio/store.js";
 import { assertNoPhotonTelemetryExporters } from "../../lib/studio/photon-telemetry.js";
 import {
   PhotonIMessageTransport,
@@ -12,18 +21,49 @@ const THREAD: IMessageThreadReference = Object.freeze({
   chatGuid: "any;-;+15555550101",
   sendingLine: "shared",
 });
+const REPLY_THREAD: IMessageThreadReference = Object.freeze({
+  ...THREAD,
+  replyTargetId: "incoming-message-guid",
+});
+const ONE_PIXEL_PNG = Uint8Array.from(Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl54P8AAAAASUVORK5CYII=",
+  "base64",
+));
+
+async function* singleChunk(bytes: Uint8Array): AsyncGenerator<Uint8Array> {
+  yield bytes;
+}
+
+async function validatedOutput(outputIndex: StudioOutputIndex = 1) {
+  return validateStudioProviderArtifact({
+    expectedMediaType: "image",
+    declaredMimeType: "image/png",
+    stream: singleChunk(ONE_PIXEL_PNG),
+    outputIndex,
+  });
+}
 
 function fixture(): {
   readonly transport: PhotonIMessageTransport;
   readonly port: { readonly getClient: ReturnType<typeof vi.fn> };
   readonly client: {
     readonly chats: { readonly setTyping: ReturnType<typeof vi.fn> };
-    readonly messages: { readonly sendText: ReturnType<typeof vi.fn> };
+    readonly attachments: { readonly upload: ReturnType<typeof vi.fn> };
+    readonly messages: {
+      readonly sendText: ReturnType<typeof vi.fn>;
+      readonly sendAttachment: ReturnType<typeof vi.fn>;
+      readonly setReaction: ReturnType<typeof vi.fn>;
+    };
   };
 } {
   const client = {
     chats: { setTyping: vi.fn(async () => undefined) },
-    messages: { sendText: vi.fn(async () => ({ guid: "sent-message" })) },
+    attachments: { upload: vi.fn(async () => ({ attachment: { guid: "uploaded-attachment-guid" } })) },
+    messages: {
+      sendText: vi.fn(async () => ({ guid: "sent-message" })),
+      sendAttachment: vi.fn(async () => ({ guid: "sent-attachment-message" })),
+      setReaction: vi.fn(async () => ({ guid: "reaction-message" })),
+    },
   };
   const port = { getClient: vi.fn(async () => client) };
   const transport = new PhotonIMessageTransport({
@@ -66,6 +106,20 @@ describe("Photon iMessage text transport", () => {
     });
   });
 
+  it("uses the signed inbound message GUID as a typed native reply target", async () => {
+    const { transport, client } = fixture();
+
+    await expect(transport.sendText(REPLY_THREAD, "Air is ready.", "stable-reply-key"))
+      .resolves.toEqual({ kind: "sent" });
+
+    expect(client.messages.sendText).toHaveBeenCalledWith(REPLY_THREAD.chatGuid, "Air is ready.", {
+      clientMessageId: "stable-reply-key",
+      enableDataDetection: false,
+      enableLinkPreview: false,
+      replyTo: REPLY_THREAD.replyTargetId,
+    });
+  });
+
   it("maps a rejected physical send to manual reconciliation instead of replay", async () => {
     const { transport, client } = fixture();
     client.messages.sendText.mockRejectedValueOnce(new Error("network"));
@@ -92,6 +146,8 @@ describe("Photon iMessage text transport", () => {
       .resolves.toEqual({ kind: "failed", code: "invalid_thread_reference" });
     await expect(transport.sendText(THREAD, "Air is ready.", "bad key"))
       .resolves.toEqual({ kind: "failed", code: "invalid_idempotency_key" });
+    await expect(transport.sendText({ ...THREAD, replyTargetId: "bad\nreply" }, "Air is ready.", "stable-outbox-key"))
+      .resolves.toEqual({ kind: "failed", code: "invalid_thread_reference" });
 
     expect(port.getClient).not.toHaveBeenCalled();
     expect(client.messages.sendText).not.toHaveBeenCalled();
@@ -119,17 +175,173 @@ describe("Photon iMessage text transport", () => {
     expect(client.chats.setTyping).toHaveBeenNthCalledWith(2, THREAD.chatGuid, false);
   });
 
-  it("keeps media, attachment fetch, and tapbacks disabled in the text-only release", async () => {
+  it("advertises prepared output delivery only for the direct Photon transport", () => {
+    const { transport } = fixture();
+
+    expect(isStudioPreparedOutputTransport(transport)).toBe(true);
+    expect(isStudioPreparedOutputTransport(new UnverifiedPhotonTransport())).toBe(false);
+  });
+
+  it("splits a canonical provider upload from the one physical attachment send", async () => {
+    const { transport, client } = fixture();
+    const artifact = await validatedOutput(1);
+
+    const prepared = await transport.prepareValidatedProviderArtifact(REPLY_THREAD, artifact);
+    expect(prepared).toEqual({
+      kind: "prepared",
+      output: { transport: "photon", attachmentGuid: "uploaded-attachment-guid" },
+    });
+    if (prepared.kind !== "prepared") throw new Error("expected an uploaded Photon attachment");
+
+    const uploaded = client.attachments.upload.mock.calls[0]?.[0];
+    expect(uploaded).toMatchObject({ fileName: "air-output-1.png" });
+    expect(uploaded?.data).toEqual(artifact.bytes);
+    expect(uploaded?.data).not.toBe(artifact.bytes);
+    expect(client.messages.sendAttachment).not.toHaveBeenCalled();
+
+    await expect(transport.sendPreparedOutput(REPLY_THREAD, prepared.output, "stable-artifact-key"))
+      .resolves.toEqual({ kind: "sent" });
+
+    expect(client.attachments.upload).toHaveBeenCalledTimes(1);
+    expect(client.messages.sendAttachment).toHaveBeenCalledWith(
+      REPLY_THREAD.chatGuid,
+      "uploaded-attachment-guid",
+      { clientMessageId: "stable-artifact-key", replyTo: REPLY_THREAD.replyTargetId },
+    );
+  });
+
+  it("keeps legacy sendAttachment structurally compatible while routing a validated artifact through the split path", async () => {
+    const { transport, client } = fixture();
+    const artifact = await validatedOutput(2);
+
+    await expect(transport.sendAttachment(REPLY_THREAD, artifact, "legacy-artifact-key"))
+      .resolves.toEqual({ kind: "sent" });
+
+    expect(client.attachments.upload).toHaveBeenCalledTimes(1);
+    expect(client.messages.sendAttachment).toHaveBeenCalledWith(
+      REPLY_THREAD.chatGuid,
+      "uploaded-attachment-guid",
+      { clientMessageId: "legacy-artifact-key", replyTo: REPLY_THREAD.replyTargetId },
+    );
+  });
+
+  it("does not mark the legacy bridge retryable after an upload when its later send cannot resolve a client", async () => {
+    const { transport, port, client } = fixture();
+    const artifact = await validatedOutput(2);
+    port.getClient.mockResolvedValueOnce(client).mockRejectedValueOnce(new Error("token refresh unavailable"));
+
+    await expect(transport.sendAttachment(THREAD, artifact, "legacy-no-reupload-key"))
+      .resolves.toEqual({ kind: "send_unknown", code: "photon_attachment_send_unknown" });
+
+    expect(client.attachments.upload).toHaveBeenCalledTimes(1);
+    expect(client.messages.sendAttachment).not.toHaveBeenCalled();
+  });
+
+  it("sends only a validated prepared Photon GUID and rejects a payload-bearing surrogate", async () => {
+    const { transport, port, client } = fixture();
+    const forged = {
+      transport: "photon",
+      attachmentGuid: "uploaded-attachment-guid",
+      bytes: Uint8Array.of(1),
+    } as unknown as StudioPreparedOutput;
+
+    await expect(transport.sendPreparedOutput(THREAD, forged, "prepared-key"))
+      .resolves.toEqual({ kind: "failed", code: "invalid_prepared_photon_output" });
+    expect(port.getClient).not.toHaveBeenCalled();
+    expect(client.messages.sendAttachment).not.toHaveBeenCalled();
+
+    await expect(transport.sendPreparedOutput(
+      THREAD,
+      { transport: "photon", attachmentGuid: "uploaded-attachment-guid" },
+      "prepared-key",
+    )).resolves.toEqual({ kind: "sent" });
+    expect(client.attachments.upload).not.toHaveBeenCalled();
+    expect(client.messages.sendAttachment).toHaveBeenCalledWith(
+      THREAD.chatGuid,
+      "uploaded-attachment-guid",
+      { clientMessageId: "prepared-key" },
+    );
+  });
+
+  it("never forwards an inbound attachment, zero-based output, or forged same-shape artifact", async () => {
+    const { transport, port, client } = fixture();
+    const artifact = await validatedOutput(1);
+    const zeroBased = { ...artifact, outputIndex: 0 } as unknown as typeof artifact;
+    const forgedSameShape = {
+      ...artifact,
+      bytes: Uint8Array.from(artifact.bytes),
+      metadata: { ...artifact.metadata },
+    } as unknown as typeof artifact;
+
+    await expect(transport.sendAttachment(THREAD, { id: "inbound", mimeType: "image/png", sizeBytes: 1 }, "key"))
+      .resolves.toEqual({ kind: "failed", code: "invalid_outbound_artifact" });
+    await expect(transport.sendAttachment(THREAD, zeroBased, "key"))
+      .resolves.toEqual({ kind: "failed", code: "invalid_outbound_artifact" });
+    await expect(transport.sendAttachment(THREAD, forgedSameShape, "key"))
+      .resolves.toEqual({ kind: "failed", code: "invalid_outbound_artifact" });
+
+    expect(port.getClient).not.toHaveBeenCalled();
+    expect(client.attachments.upload).not.toHaveBeenCalled();
+    expect(client.messages.sendAttachment).not.toHaveBeenCalled();
+  });
+
+  it("uploads a fresh canonical copy after a caller mutates the public byte view", async () => {
+    const { transport, client } = fixture();
+    const artifact = await validatedOutput(3);
+    const original = Uint8Array.from(artifact.bytes);
+
+    artifact.bytes.fill(0);
+
+    await expect(transport.sendAttachment(THREAD, artifact, "stable-mutated-artifact-key"))
+      .resolves.toEqual({ kind: "sent" });
+
+    const uploaded = client.attachments.upload.mock.calls[0]?.[0];
+    expect(uploaded?.data).toEqual(original);
+    expect(uploaded?.data).not.toBe(artifact.bytes);
+    expect(uploaded?.data).not.toEqual(artifact.bytes);
+  });
+
+  it("records upload and attachment-send ambiguity for manual reconciliation", async () => {
+    const { transport, client } = fixture();
+    const artifact = await validatedOutput(2);
+    client.attachments.upload.mockRejectedValueOnce(new Error("network"));
+
+    await expect(transport.sendAttachment(THREAD, artifact, "stable-upload-key"))
+      .resolves.toEqual({ kind: "send_unknown", code: "photon_attachment_upload_unknown" });
+    expect(client.messages.sendAttachment).not.toHaveBeenCalled();
+
+    client.messages.sendAttachment.mockRejectedValueOnce(new Error("network"));
+    await expect(transport.sendAttachment(THREAD, artifact, "stable-send-key"))
+      .resolves.toEqual({ kind: "send_unknown", code: "photon_attachment_send_unknown" });
+  });
+
+  it("uses the semantic like tapback and a durable client message ID", async () => {
     const { transport, client } = fixture();
 
-    await expect(transport.sendAttachment(THREAD, { id: "attachment", mimeType: "image/png", sizeBytes: 1 }, "key"))
-      .resolves.toEqual({ kind: "failed", code: "attachment_delivery_not_enabled" });
-    await expect(transport.addLikeTapback(THREAD, "message", "key"))
-      .resolves.toEqual({ kind: "failed", code: "tapback_delivery_not_enabled" });
+    await expect(transport.addLikeTapback(THREAD, "incoming-message-guid", "stable-like-key"))
+      .resolves.toEqual({ kind: "sent" });
+
+    expect(client.messages.setReaction).toHaveBeenCalledWith(
+      THREAD.chatGuid,
+      "incoming-message-guid",
+      { kind: "like" },
+      true,
+      { clientMessageId: "stable-like-key" },
+    );
+
+    client.messages.setReaction.mockRejectedValueOnce(new Error("network"));
+    await expect(transport.addLikeTapback(THREAD, "incoming-message-guid", "stable-like-unknown"))
+      .resolves.toEqual({ kind: "send_unknown", code: "photon_like_tapback_unknown" });
+  });
+
+  it("keeps inbound attachment fetching disabled", async () => {
+    const { transport, client } = fixture();
+
     await expect(transport.fetchAttachment(THREAD, "attachment"))
       .rejects.toThrow("attachment_transport_not_enabled");
 
     expect(client.messages.sendText).not.toHaveBeenCalled();
+    expect(client.attachments.upload).not.toHaveBeenCalled();
   });
 
   it("fails closed before Photon initialization when telemetry or logging is unsafe", () => {

@@ -22,6 +22,7 @@ import {
   type StudioModel,
 } from "./model-registry.js";
 import {
+  isStudioPreparedOutputTransport,
   isSafeTransportText,
   type IMessageThreadReference,
   type TransportOutcome,
@@ -34,6 +35,7 @@ import type {
   StudioOutboxPayload,
   StudioOutboxRecord,
   PendingWriteGuard,
+  StudioCanaryBudgetPolicy,
   StudioJobRecord,
   StudioExecutionSnapshot,
 } from "./store.js";
@@ -651,7 +653,7 @@ async function handleCreation(
     phase: runtime.environment.releasePhase,
   } as const);
   const execution: StudioExecutionSnapshot = Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
     workflow: Object.freeze({
       workflowId: workflow.workflowId,
       workflowVersion: workflow.version,
@@ -661,11 +663,19 @@ async function handleCreation(
       slug: selection.model.slug,
       provider: selection.model.provider,
       providerModelId: selection.model.providerModelId,
+      adapterKey: selection.model.providerBinding.adapterKey,
+      catalogFingerprint: selection.model.verification.catalogFingerprint,
+      requestSchemaFingerprint: selection.model.providerBinding.requestSchemaFingerprint,
+      resultSchemaFingerprint: selection.model.providerBinding.resultSchemaFingerprint,
+      pricingEvidenceFingerprint: selection.model.pricing.evidenceFingerprint,
     }),
     output: Object.freeze({
+      type: selection.model.output.type,
       count: outputCount,
       ...(durationSeconds === null ? {} : { durationSeconds }),
     }),
+    maximumQuotedCostCents: compatibility.maximumQuotedCost.maximumQuotedCostCents,
+    polling: Object.freeze({ ...selection.model.polling }),
     releaseStamp,
   });
   const admittedJob = createStudioJob({
@@ -708,12 +718,14 @@ async function handleCreation(
         targetMessageId: envelope.replyTargetId,
       }),
     });
+  const canaryBudget = canaryAdmissionBudget(runtime);
   const admission = await runtime.store.admitJobWithInitialNotifications({
     job: admittedJob,
     activeJobLimit: runtime.environment.activeJobLimit,
     dailyUserJobLimit: runtime.environment.dailyUserJobLimit,
     perJobCapCents: runtime.environment.spendCaps.perJobCents,
     dailySpendCapCents: runtime.environment.spendCaps.dailyCents,
+    ...(canaryBudget === undefined ? {} : { canaryBudget }),
     acknowledgement,
     ...(tapback === undefined ? {} : { tapback }),
   });
@@ -729,6 +741,15 @@ async function handleCreation(
     case "daily_cap":
       await enqueueResponse(runtime, record, envelope, `spend-cap-${mode}`, "This request exceeds the current studio spend limit. No generation was submitted.");
       return "processed";
+    case "canary_total_cap":
+      await enqueueResponse(runtime, record, envelope, `canary-total-cap-${mode}`, "Air’s shared launch budget is fully reserved. No generation was submitted.");
+      return "processed";
+    case "canary_fal_cap":
+      await enqueueResponse(runtime, record, envelope, `canary-fal-cap-${mode}`, "Air’s launch allocation for this provider is fully reserved. No generation was submitted.");
+      return "processed";
+    case "canary_budget_required":
+      await enqueueResponse(runtime, record, envelope, `canary-budget-required-${mode}`, "Air’s launch budget controls are unavailable right now. No generation was submitted.");
+      return "processed";
     case "release_blocked":
       // A fence change means this worker is stale. Creating a second generic
       // response could cross the same rollback boundary, so leave no effect.
@@ -739,6 +760,17 @@ async function handleCreation(
       // impossible, so a transient store failure cannot spend or send.
       throw new Error("studio_atomic_admission_unavailable");
   }
+}
+
+/** Pass the opaque budget policy only at the canary admission boundary. */
+function canaryAdmissionBudget(runtime: StudioRuntime): StudioCanaryBudgetPolicy | undefined {
+  const environment = runtime.environment;
+  if (environment.releasePhase !== "canary" || environment.canaryBudgetId === undefined) return undefined;
+  return Object.freeze({
+    budgetId: environment.canaryBudgetId,
+    totalCapCents: environment.spendCaps.canaryTotalCents,
+    falCapCents: environment.spendCaps.canaryFalCents,
+  });
 }
 
 async function handleModelSettings(
@@ -1169,8 +1201,10 @@ async function dispatchOutboxEntry(
       }
       return await runtime.transport.sendText(thread, payload.text, idempotencyKey);
     }
-    if (!payload.attachment) return Object.freeze({ kind: "failed", code: "missing_attachment_payload" });
-    return await runtime.transport.sendAttachment(thread, payload.attachment, idempotencyKey);
+    if (payload.kind !== "prepared-output" || !isStudioPreparedOutputTransport(runtime.transport)) {
+      return Object.freeze({ kind: "failed", code: "prepared_output_transport_unavailable" });
+    }
+    return await runtime.transport.sendPreparedOutput(thread, payload.output, idempotencyKey);
   } catch {
     // A rejected send promise can occur after the transport accepted bytes, so
     // it is intentionally unknown rather than a retryable failure.

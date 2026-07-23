@@ -207,9 +207,15 @@ describe("Air iMessage webhook", () => {
     expect(await store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
 
     const sendText = vi.fn<PhotonIMessageClient["messages"]["sendText"]>(async () => ({ guid: "mock-sent-message" }));
+    const sendAttachment = vi.fn<PhotonIMessageClient["messages"]["sendAttachment"]>(async () => ({ guid: "mock-attachment-message" }));
+    const setReaction = vi.fn<PhotonIMessageClient["messages"]["setReaction"]>(async () => ({ guid: "mock-reaction-message" }));
+    const upload = vi.fn<PhotonIMessageClient["attachments"]["upload"]>(async () => ({
+      attachment: { guid: "mock-uploaded-attachment" },
+    }));
     const client: PhotonIMessageClient = {
       chats: { setTyping: vi.fn<PhotonIMessageClient["chats"]["setTyping"]>(async () => undefined) },
-      messages: { sendText },
+      attachments: { upload },
+      messages: { sendText, sendAttachment, setReaction },
     };
     const getClient = vi.fn<PhotonIMessagePort["getClient"]>(async () => client);
     const port: PhotonIMessagePort = { getClient };

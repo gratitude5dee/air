@@ -21,6 +21,7 @@ import {
 const identitySecret = "studio-store-test-identity";
 const queueKey = Buffer.alloc(32, 41).toString("base64");
 const darkReleaseStamp: StudioReleaseStamp = Object.freeze({ generation: 0, phase: "dark" });
+const SNAPSHOT_FINGERPRINT = `sha256:${"a".repeat(64)}`;
 
 function fixture(start = Date.UTC(2026, 6, 18, 12, 0, 0)): {
   readonly redis: MemoryRedis;
@@ -93,6 +94,8 @@ function job(
   jobId: string,
   now: number,
   releaseStamp: StudioReleaseStamp = darkReleaseStamp,
+  outputCount = 1,
+  provider: "gmi" | "fal" = "gmi",
 ): StudioJobRecordWithPayload {
   return createStudioJob({
     jobId,
@@ -100,8 +103,8 @@ function job(
     threadHash,
     mode: "imagine",
     modelSlug: "verified-model",
-    provider: "gmi",
-    outputCount: 1,
+    provider,
+    outputCount,
     reservedCents: 25,
     releaseStamp,
     payload: {
@@ -110,7 +113,7 @@ function job(
       sendingLine: "+14155550000",
       replyTargetId: "reply-target-guid",
       execution: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         workflow: {
           workflowId: "air:imagine:v1",
           workflowVersion: 1,
@@ -118,10 +121,22 @@ function job(
         },
         model: {
           slug: "verified-model",
-          provider: "gmi",
+          provider,
           providerModelId: "verified-provider-model",
+          adapterKey: `${provider}.test-adapter.v1`,
+          catalogFingerprint: SNAPSHOT_FINGERPRINT,
+          requestSchemaFingerprint: SNAPSHOT_FINGERPRINT,
+          resultSchemaFingerprint: SNAPSHOT_FINGERPRINT,
+          pricingEvidenceFingerprint: SNAPSHOT_FINGERPRINT,
         },
-        output: { count: 1 },
+        output: { type: "image", count: outputCount },
+        maximumQuotedCostCents: 25,
+        polling: {
+          requestTimeoutMs: 5_000,
+          pollIntervalMs: 1_000,
+          maxPollAttempts: 3,
+          deadlineMs: 15_000,
+        },
         releaseStamp,
       },
     },
@@ -174,6 +189,44 @@ function initialNotifications(options: { readonly tapback?: boolean } = {}): {
         }),
       }
       : {}),
+  });
+}
+
+const studioLimits = Object.freeze({
+  activeJobLimit: 1,
+  dailyUserJobLimit: 3,
+  perJobCapCents: 50,
+  dailySpendCapCents: 100,
+});
+
+const canaryBudget = Object.freeze({
+  budgetId: "store-test-canary-budget",
+  totalCapCents: 100,
+  falCapCents: 0,
+});
+
+async function admitAndExecute(store: StudioStore, created: StudioJobRecordWithPayload): Promise<StudioJobRecord> {
+  const admitted = await store.admitJob({
+    job: created,
+    ...studioLimits,
+    ...(created.releaseStamp.phase === "canary" ? { canaryBudget } : {}),
+  });
+  if (!admitted.admitted) throw new Error("expected admission");
+  const executing = await store.transitionJob(created.jobId, "admitted", "executing");
+  if (!executing) throw new Error("expected executing job");
+  return executing;
+}
+
+function resultAttachmentPayload(outputIndex: number) {
+  return Object.freeze({
+    kind: "prepared-output" as const,
+    outputIndex,
+    output: Object.freeze({ transport: "photon" as const, attachmentGuid: `uploaded-output-${String(outputIndex)}` }),
+    thread: Object.freeze({
+      chatGuid: "iMessage;-;+14155550199",
+      sendingLine: "+14155550000",
+      replyTargetId: "reply-target-guid",
+    }),
   });
 }
 
@@ -1430,6 +1483,7 @@ describe("Air v2 studio durable store", () => {
       dailyUserJobLimit: 3,
       perJobCapCents: 50,
       dailySpendCapCents: 100,
+      canaryBudget,
     } as const;
 
     await expect(activeStore.admitJob({ job: candidate, ...limits }))
@@ -1463,6 +1517,158 @@ describe("Air v2 studio durable store", () => {
     const claim = await rollbackStore.claimNextJob();
     expect(claim?.record).toMatchObject({ jobId: candidate.jobId, state: "admitted" });
     await claim?.lease.release();
+  });
+
+  it("atomically exhausts one opaque canary budget across independent senders", async () => {
+    const { redis, store: darkStore, cipher, prefix, now } = fixture();
+    const firstIdentity = identities();
+    const secondSenderHash = hashSenderIdentifier(identitySecret, "+14155550200");
+    const secondThreadHash = hashThreadIdentifier(identitySecret, "iMessage;-;+14155550200\u0000+14155550000");
+    const activeStamp: StudioReleaseStamp = { generation: 1, phase: "canary" };
+    const activeStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: activeStamp,
+    });
+    expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    expect(await activeStore.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+    const policy = Object.freeze({
+      budgetId: "approved-shared-canary-budget",
+      totalCapCents: 40,
+      falCapCents: 0,
+    });
+    const limits = {
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      canaryBudget: policy,
+    } as const;
+    const first = job(cipher, firstIdentity.senderHash, firstIdentity.threadHash, "canary-shared-first", now(), activeStamp);
+    const second = job(cipher, secondSenderHash, secondThreadHash, "canary-shared-second", now(), activeStamp);
+
+    const results = await Promise.all([
+      activeStore.admitJob({ job: first, ...limits }),
+      activeStore.admitJob({ job: second, ...limits }),
+    ]);
+    expect(results.filter((result) => result.admitted)).toHaveLength(1);
+    expect(results.find((result) => !result.admitted)).toEqual({ admitted: false, reason: "canary_total_cap" });
+
+    const budgetKey = `${prefix}:canary:budget:${deriveOpaqueId(identitySecret, "studio-canary-budget", policy.budgetId)}`;
+    const budgetRaw = await redis.get(budgetKey);
+    expect(budgetRaw).not.toBeNull();
+    expect(JSON.parse(budgetRaw ?? "{}")).toEqual({
+      schemaVersion: 1,
+      totalReservedCents: 25,
+      falReservedCents: 0,
+    });
+    expect(await redis.pttl(budgetKey)).toBe(-1);
+    expect(await redis.get(`${prefix}:canary:budget:${policy.budgetId}`)).toBeNull();
+    expect(budgetRaw).not.toContain(policy.budgetId);
+  });
+
+  it("does not double-reserve a deterministic canary job retry", async () => {
+    const { redis, store: darkStore, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const activeStamp: StudioReleaseStamp = { generation: 1, phase: "canary" };
+    const activeStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: activeStamp,
+    });
+    expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    expect(await activeStore.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+    const policy = Object.freeze({ budgetId: "idempotent-canary-budget", totalCapCents: 25, falCapCents: 0 });
+    const candidate = job(cipher, senderHash, threadHash, "canary-idempotent-job", now(), activeStamp);
+    const input = {
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      canaryBudget: policy,
+    } as const;
+
+    await expect(activeStore.admitJob(input)).resolves.toMatchObject({ admitted: true });
+    await expect(activeStore.admitJob(input)).resolves.toMatchObject({ admitted: true, job: { jobId: candidate.jobId } });
+    const budgetKey = `${prefix}:canary:budget:${deriveOpaqueId(identitySecret, "studio-canary-budget", policy.budgetId)}`;
+    expect(JSON.parse((await redis.get(budgetKey)) ?? "{}")).toMatchObject({ totalReservedCents: 25, falReservedCents: 0 });
+  });
+
+  it("blocks FAL at its canary subcap before publishing an initial-notification bundle", async () => {
+    const { redis, store: darkStore, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const activeStamp: StudioReleaseStamp = { generation: 1, phase: "canary" };
+    const activeStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: activeStamp,
+    });
+    expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    expect(await activeStore.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+    const policy = Object.freeze({ budgetId: "fal-zero-canary-budget", totalCapCents: 100, falCapCents: 0 });
+    const candidate = job(cipher, senderHash, threadHash, "canary-fal-subcap", now(), activeStamp, 1, "fal");
+    const notifications = initialNotifications({ tapback: true });
+
+    await expect(activeStore.admitJobWithInitialNotifications({
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      canaryBudget: policy,
+      ...notifications,
+    })).resolves.toEqual({ admitted: false, reason: "canary_fal_cap" });
+    expect(await redis.get(`${prefix}:job:${candidate.jobId}`)).toBeNull();
+    expect(await redis.get(`${prefix}:outbox:${notifications.acknowledgement.outboxId}`)).toBeNull();
+    const budgetKey = `${prefix}:canary:budget:${deriveOpaqueId(identitySecret, "studio-canary-budget", policy.budgetId)}`;
+    expect(await redis.get(budgetKey)).toBeNull();
+  });
+
+  it("never reserves a canary budget from dark or fence-blocked admission", async () => {
+    const { redis, store: darkStore, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const policy = Object.freeze({ budgetId: "blocked-canary-budget", totalCapCents: 100, falCapCents: 0 });
+    const darkCandidate = job(cipher, senderHash, threadHash, "dark-no-canary-reservation", now());
+    await expect(darkStore.admitJob({
+      job: darkCandidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      canaryBudget: policy,
+    })).resolves.toMatchObject({ admitted: true });
+    const budgetKey = `${prefix}:canary:budget:${deriveOpaqueId(identitySecret, "studio-canary-budget", policy.budgetId)}`;
+    expect(await redis.get(budgetKey)).toBeNull();
+
+    const blockedStamp: StudioReleaseStamp = { generation: 1, phase: "canary" };
+    const blockedStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: blockedStamp,
+    });
+    const blockedCandidate = job(cipher, senderHash, threadHash, "blocked-no-canary-reservation", now(), blockedStamp);
+    await expect(blockedStore.admitJob({
+      job: blockedCandidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      canaryBudget: policy,
+    })).resolves.toEqual({ admitted: false, reason: "release_blocked" });
+    expect(await redis.get(budgetKey)).toBeNull();
   });
 
   it("claims only matching recoverable job records and fences rescheduling by state version", async () => {
@@ -1537,6 +1743,155 @@ describe("Air v2 studio durable store", () => {
     })).resolves.toMatchObject({ state: "intent" });
   });
 
+  it("publishes provider outputs once in one-based order and retains their cursor after terminal delivery", async () => {
+    const { redis, store, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const created = job(cipher, senderHash, threadHash, "ordered-result-job", now(), darkReleaseStamp, 2);
+    await admitAndExecute(store, created);
+
+    await expect(store.publishJobResult({
+      jobId: created.jobId,
+      outputIndex: 2,
+      payload: resultAttachmentPayload(2),
+    })).resolves.toEqual({ kind: "out_of_order", expectedOutputIndex: 1 });
+
+    const first = await store.publishJobResult({
+      jobId: created.jobId,
+      outputIndex: 1,
+      payload: resultAttachmentPayload(1),
+    });
+    if (first.kind !== "published") throw new Error("expected first output publication");
+    expect(first.cursor).toMatchObject({ nextOutputIndex: 2, outputs: [{ outputIndex: 1, state: "intent" }] });
+
+    const repeated = await store.publishJobResult({
+      jobId: created.jobId,
+      outputIndex: 1,
+      payload: resultAttachmentPayload(1),
+    });
+    expect(repeated).toMatchObject({ kind: "existing", outbox: { outboxId: first.outbox.outboxId } });
+
+    const second = await store.publishJobResult({
+      jobId: created.jobId,
+      outputIndex: 2,
+      payload: resultAttachmentPayload(2),
+    });
+    if (second.kind !== "published") throw new Error("expected second output publication");
+    expect(second.cursor).toMatchObject({ nextOutputIndex: 3, outputs: [
+      { outputIndex: 1, outboxId: first.outbox.outboxId },
+      { outputIndex: 2, outboxId: second.outbox.outboxId },
+    ] });
+    expect(await store.transitionJob(created.jobId, "executing", "ready")).toMatchObject({ state: "ready" });
+    expect(await store.transitionJob(created.jobId, "ready", "delivering")).toMatchObject({ state: "delivering" });
+    expect(await store.transitionJob(created.jobId, "delivering", "delivered")).toMatchObject({ state: "delivered" });
+    expect(await redis.pttl(prefix + ":job:result-cursor:" + created.jobId)).toBe(7 * 24 * 60 * 60 * 1_000);
+  });
+
+  it("hydrates each result cursor slot from definitive retry and send state", async () => {
+    const { store, cipher, now, advance } = fixture();
+    const { senderHash, threadHash } = identities();
+    const created = job(cipher, senderHash, threadHash, "retry-result-job", now());
+    await admitAndExecute(store, created);
+    const published = await store.publishJobResult({
+      jobId: created.jobId,
+      outputIndex: 1,
+      payload: resultAttachmentPayload(1),
+    });
+    if (published.kind !== "published") throw new Error("expected result publication");
+    const firstClaim = await store.claimNextOutbox();
+    if (!firstClaim) throw new Error("expected first delivery claim");
+    expect(await store.finishOutbox(firstClaim.record.outboxId, firstClaim.leaseToken, "retryable_failure")).toBe(true);
+    await expect(store.getJobResultCursor(created.jobId)).resolves.toMatchObject({
+      outputs: [{ outputIndex: 1, state: "retryable_failure", attempts: 1 }],
+    });
+    advance(30_000);
+    const retry = await store.claimNextOutbox();
+    if (!retry) throw new Error("expected retry delivery claim");
+    expect(await store.finishOutbox(retry.record.outboxId, retry.leaseToken, "sent")).toBe(true);
+    await expect(store.getJobResultCursor(created.jobId)).resolves.toMatchObject({
+      outputs: [{ outputIndex: 1, state: "sent", attempts: 2 }],
+    });
+  });
+
+  it("keeps the admitted stamp immutable while a fenced rollback deployment stamps result delivery", async () => {
+    const { redis, store: dark, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    expect(await dark.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    const admittedRelease: StudioReleaseStamp = { generation: 1, phase: "canary" };
+    const active = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: admittedRelease,
+    });
+    expect(await active.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+    const created = job(cipher, senderHash, threadHash, "rollback-result-job", now(), admittedRelease);
+    await admitAndExecute(active, created);
+
+    const rollbackStamp: StudioReleaseStamp = { generation: 2, phase: "dark" };
+    const rollback = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: rollbackStamp,
+    });
+    expect(await rollback.advanceReleaseFence(1)).toEqual({ kind: "advanced" });
+    const published = await rollback.publishJobResult({
+      jobId: created.jobId,
+      outputIndex: 1,
+      payload: resultAttachmentPayload(1),
+    });
+    if (published.kind !== "published") throw new Error("expected rollback delivery publication");
+    expect(published.cursor.releaseStamp).toEqual(admittedRelease);
+    expect(published.outbox.releaseStamp).toEqual(rollbackStamp);
+  });
+
+  it("atomically rebinds a confirmed-absent result cursor to its audited replacement intent", async () => {
+    const { store, cipher, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const created = job(cipher, senderHash, threadHash, "requeue-result-job", now());
+    await admitAndExecute(store, created);
+    const published = await store.publishJobResult({
+      jobId: created.jobId,
+      outputIndex: 1,
+      payload: resultAttachmentPayload(1),
+    });
+    if (published.kind !== "published") throw new Error("expected result publication");
+    const claim = await store.claimNextOutbox();
+    if (!claim) throw new Error("expected result delivery claim");
+    expect(await store.finishOutbox(claim.record.outboxId, claim.leaseToken, "send_unknown")).toBe(true);
+    const operatorHash = store.operatorAuditHash("cursor-recovery-operator");
+    const unknown = await store.getOutbox(claim.record.outboxId);
+    if (!unknown) throw new Error("expected unknown result outbox");
+    expect(await store.resolveOutboxSendForReconciliation({
+      outboxId: unknown.outboxId,
+      expectedOutboxVersion: unknown.stateVersion,
+      resolution: "confirmed_absent",
+      operatorHash,
+    })).toMatchObject({ kind: "applied" });
+    const absent = await store.getOutbox(claim.record.outboxId);
+    if (!absent) throw new Error("expected confirmed-absent outbox");
+    const requeued = await store.requeueConfirmedAbsentOutbox({
+      outboxId: absent.outboxId,
+      expectedOutboxVersion: absent.stateVersion,
+      operatorHash,
+    });
+    if (requeued.kind !== "applied" || !requeued.replacementOutboxId) throw new Error("expected replacement intent");
+    const cursor = await store.getJobResultCursor(created.jobId);
+    expect(cursor).toMatchObject({
+      outputs: [{ outputIndex: 1, outboxId: requeued.replacementOutboxId, state: "intent" }],
+    });
+    await expect(store.getOutbox(absent.outboxId)).resolves.toMatchObject({ state: "requeued" });
+    await expect(store.getReconciliationAudit(requeued.auditId)).resolves.toMatchObject({
+      action: "outbox_requeued",
+      subjectId: absent.outboxId,
+      relatedId: requeued.replacementOutboxId,
+    });
+  });
+
   it("keeps unresolved job metadata durable while bounding its encrypted snapshot to 24 hours", async () => {
     const { redis, store, cipher, prefix, now, advance } = fixture();
     const { senderHash, threadHash } = identities();
@@ -1591,11 +1946,36 @@ describe("Air v2 studio durable store", () => {
       ...job(cipher, senderHash, threadHash, "job-old-schema", now()),
       schemaVersion: 2,
     } as unknown as StudioJobRecordWithPayload;
+    const legacySnapshotBase = job(cipher, senderHash, threadHash, "job-legacy-execution-snapshot", now());
+    const legacySnapshotPayload = store.decryptJobPayload(legacySnapshotBase);
+    const legacyExecutionSnapshot = {
+      ...legacySnapshotBase,
+      encryptedPayload: cipher.encrypt({
+        ...legacySnapshotPayload,
+        execution: { ...legacySnapshotPayload.execution, schemaVersion: 1 },
+      }, `job:${legacySnapshotBase.jobId}`),
+    } as unknown as StudioJobRecordWithPayload;
+    const mismatchedBindingBase = job(cipher, senderHash, threadHash, "job-mismatched-execution-binding", now());
+    const mismatchedBindingPayload = store.decryptJobPayload(mismatchedBindingBase);
+    const mismatchedExecutionBinding = {
+      ...mismatchedBindingBase,
+      encryptedPayload: cipher.encrypt({
+        ...mismatchedBindingPayload,
+        execution: {
+          ...mismatchedBindingPayload.execution,
+          model: { ...mismatchedBindingPayload.execution?.model, adapterKey: "fal.test-adapter.v1" },
+        },
+      }, `job:${mismatchedBindingBase.jobId}`),
+    } as unknown as StudioJobRecordWithPayload;
 
     expect(await store.admitJob({ job: missingPayload, ...limits })).toEqual({ admitted: false, reason: "storage_error" });
     expect(await store.admitJob({ job: oldSchema, ...limits })).toEqual({ admitted: false, reason: "storage_error" });
+    expect(await store.admitJob({ job: legacyExecutionSnapshot, ...limits })).toEqual({ admitted: false, reason: "storage_error" });
+    expect(await store.admitJob({ job: mismatchedExecutionBinding, ...limits })).toEqual({ admitted: false, reason: "storage_error" });
     expect(await redis.get(`${prefix}:job:job-without-payload`)).toBeNull();
     expect(await redis.get(`${prefix}:job:job-old-schema`)).toBeNull();
+    expect(await redis.get(`${prefix}:job:job-legacy-execution-snapshot`)).toBeNull();
+    expect(await redis.get(`${prefix}:job:job-mismatched-execution-binding`)).toBeNull();
   });
 
   it("uses durable intents, enforces a lane head, and never retries an ambiguous outbox send", async () => {

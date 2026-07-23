@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -14,6 +16,10 @@ import {
   validateRegistryVersion,
 } from "../../lib/studio/model-registry.js";
 
+function sha256Fixture(value: string): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
 function verifiedAnimateModel(overrides: Record<string, unknown> = {}) {
   return {
     displayName: "Verified Test Video",
@@ -21,10 +27,15 @@ function verifiedAnimateModel(overrides: Record<string, unknown> = {}) {
     mode: "animate",
     provider: "gmi",
     providerModelId: "gmi/verified-test-video-v1",
+    providerBinding: {
+      adapterKey: "gmi.test-adapter.v1",
+      requestSchemaFingerprint: sha256Fixture("verified-test-video-request-schema"),
+      resultSchemaFingerprint: sha256Fixture("verified-test-video-result-schema"),
+    },
     verification: {
       verifiedAt: "2026-07-18T00:00:00Z",
-      catalogFingerprint: "sha256:catalog-fixture",
-      schemaFingerprint: "sha256:schema-fixture",
+      catalogFingerprint: sha256Fixture("verified-test-video-catalog"),
+      schemaFingerprint: sha256Fixture("verified-test-video-model-schema"),
     },
     input: {
       prompt: "optional",
@@ -48,6 +59,7 @@ function verifiedAnimateModel(overrides: Record<string, unknown> = {}) {
       source: "https://catalog.example.test/pricing/verified-test-video",
       currency: "USD",
       verifiedAt: "2026-07-18T00:00:00Z",
+      evidenceFingerprint: sha256Fixture("verified-test-video-pricing"),
       quotes: [
         { count: 1, durationSeconds: 5, maximumQuotedCostCents: 25 },
         { count: 1, durationSeconds: 10, maximumQuotedCostCents: 50 },
@@ -204,6 +216,7 @@ describe("Air model registry", () => {
         source: "https://catalog.example.test/pricing/verified-test-video",
         currency: "USD",
         verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("verified-test-video-pricing"),
         quotes: [{ count: 1, durationSeconds: 5, maximumQuotedCostCents: 25 }],
       },
     });
@@ -213,5 +226,87 @@ describe("Air model registry", () => {
       inputHosting: { mode: "hosted-public", host: "storage.example.test", pathPrefix: "/air-input/" },
     });
     expect(() => registry([publicWithoutAcknowledgement])).toThrow(ModelRegistryValidationError);
+  });
+
+  it("requires a reviewed, provider-bound contract and immutable pricing evidence", () => {
+    const catalog = registry([verifiedAnimateModel()]);
+    const model = catalog.models[0];
+    if (model === undefined) throw new Error("fixture should contain one model");
+
+    expect(model.providerBinding).toEqual({
+      adapterKey: "gmi.test-adapter.v1",
+      requestSchemaFingerprint: sha256Fixture("verified-test-video-request-schema"),
+      resultSchemaFingerprint: sha256Fixture("verified-test-video-result-schema"),
+    });
+    expect(Object.isFrozen(model.providerBinding)).toBe(true);
+    expect(Object.isFrozen(model.pricing)).toBe(true);
+    expect(() => {
+      (model.providerBinding as { adapterKey: string }).adapterKey = "gmi.other.v1";
+    }).toThrow(TypeError);
+
+    const withoutBinding = verifiedAnimateModel() as Record<string, unknown>;
+    delete withoutBinding.providerBinding;
+    expect(() => registry([withoutBinding])).toThrow(ModelRegistryValidationError);
+
+    const unversionedAdapter = verifiedAnimateModel({
+      providerBinding: {
+        adapterKey: "gmi.test-adapter",
+        requestSchemaFingerprint: sha256Fixture("verified-test-video-request-schema"),
+        resultSchemaFingerprint: sha256Fixture("verified-test-video-result-schema"),
+      },
+    });
+    expect(() => registry([unversionedAdapter])).toThrow(ModelRegistryValidationError);
+
+    const malformedRequestFingerprint = verifiedAnimateModel({
+      providerBinding: {
+        adapterKey: "gmi.test-adapter.v1",
+        requestSchemaFingerprint: "sha256:UPPERCASE-OR-SHORT",
+        resultSchemaFingerprint: sha256Fixture("verified-test-video-result-schema"),
+      },
+    });
+    expect(() => registry([malformedRequestFingerprint])).toThrow(ModelRegistryValidationError);
+
+    const incompleteResultBinding = verifiedAnimateModel({
+      providerBinding: {
+        adapterKey: "gmi.test-adapter.v1",
+        requestSchemaFingerprint: sha256Fixture("verified-test-video-request-schema"),
+      },
+    });
+    expect(() => registry([incompleteResultBinding])).toThrow(ModelRegistryValidationError);
+
+    const wrongProviderAdapter = verifiedAnimateModel({
+      providerBinding: {
+        adapterKey: "fal.test-adapter.v1",
+        requestSchemaFingerprint: sha256Fixture("verified-test-video-request-schema"),
+        resultSchemaFingerprint: sha256Fixture("verified-test-video-result-schema"),
+      },
+    });
+    expect(() => registry([wrongProviderAdapter])).toThrow(ModelRegistryValidationError);
+
+    const malformedEvidenceFingerprint = verifiedAnimateModel({
+      pricing: {
+        source: "https://catalog.example.test/pricing/verified-test-video",
+        currency: "USD",
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: "sha256:not-a-canonical-digest",
+        quotes: [
+          { count: 1, durationSeconds: 5, maximumQuotedCostCents: 25 },
+          { count: 1, durationSeconds: 10, maximumQuotedCostCents: 50 },
+          { count: 2, durationSeconds: 5, maximumQuotedCostCents: 50 },
+          { count: 2, durationSeconds: 10, maximumQuotedCostCents: 100 },
+        ],
+      },
+    });
+    expect(() => registry([malformedEvidenceFingerprint])).toThrow(ModelRegistryValidationError);
+
+    const unknownBindingField = verifiedAnimateModel({
+      providerBinding: {
+        adapterKey: "gmi.test-adapter.v1",
+        requestSchemaFingerprint: sha256Fixture("verified-test-video-request-schema"),
+        resultSchemaFingerprint: sha256Fixture("verified-test-video-result-schema"),
+        unreviewed: true,
+      },
+    });
+    expect(() => registry([unknownBindingField])).toThrow(ModelRegistryValidationError);
   });
 });

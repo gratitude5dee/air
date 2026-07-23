@@ -22,6 +22,7 @@ const IDENTITY_SECRET = "workflow-executor-test-identity-secret";
 const QUEUE_KEY = Buffer.alloc(32, 67).toString("base64");
 const SENDER = "+14155550777";
 const THREAD = "iMessage;-;+14155550777";
+const SNAPSHOT_FINGERPRINT = `sha256:${"b".repeat(64)}`;
 
 function fixture(options: {
   readonly phase?: StudioReleasePhase;
@@ -65,6 +66,7 @@ function fixture(options: {
     modelRegistryVersion: "2.1.0",
     dailyUserJobLimit: 3,
     activeJobLimit: 1,
+    ...(phase === "canary" ? { canaryBudgetId: "workflow-executor-test-canary-budget" } : {}),
     policy: {
       acceptNewJobs: phase !== "dark",
       allowProviderSubmit: phase !== "dark",
@@ -93,7 +95,7 @@ function fixture(options: {
   };
 
   const snapshot: StudioExecutionSnapshot = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     workflow: {
       workflowId: "air:imagine:v1",
       workflowVersion: 1,
@@ -103,8 +105,20 @@ function fixture(options: {
       slug: "verified-model",
       provider: "gmi",
       providerModelId: "verified-provider-model",
+      adapterKey: "gmi.test-adapter.v1",
+      catalogFingerprint: SNAPSHOT_FINGERPRINT,
+      requestSchemaFingerprint: SNAPSHOT_FINGERPRINT,
+      resultSchemaFingerprint: SNAPSHOT_FINGERPRINT,
+      pricingEvidenceFingerprint: SNAPSHOT_FINGERPRINT,
     },
-    output: { count: 1 },
+    output: { type: "image", count: 1 },
+    maximumQuotedCostCents: 25,
+    polling: {
+      requestTimeoutMs: 5_000,
+      pollIntervalMs: 1_000,
+      maxPollAttempts: 3,
+      deadlineMs: 15_000,
+    },
     releaseStamp: { generation, phase },
   };
   let armed = phase === "dark";
@@ -140,6 +154,15 @@ function fixture(options: {
       dailyUserJobLimit: 3,
       perJobCapCents: 100,
       dailySpendCapCents: 100,
+      ...(phase === "canary"
+        ? {
+          canaryBudget: {
+            budgetId: "workflow-executor-test-canary-budget",
+            totalCapCents: environment.spendCaps.canaryTotalCents,
+            falCapCents: environment.spendCaps.canaryFalCents,
+          },
+        }
+        : {}),
     })).resolves.toMatchObject({ admitted: true });
   }
 

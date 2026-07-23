@@ -16,6 +16,7 @@ import {
   type StudioAttachmentReference,
   type StudioInboundEnvelope,
   type StudioInboxRecord,
+  type StudioOutboxPayload,
   type StudioOutboxRecord,
 } from "../../lib/studio/store.js";
 
@@ -34,6 +35,9 @@ function createDarkFixture(options: {
   readonly registry?: AirModelRegistry;
   readonly perJobCents?: number;
   readonly dailyCents?: number;
+  readonly canaryTotalCents?: number;
+  readonly canaryFalCents?: number;
+  readonly canaryBudgetId?: string;
 } = {}) {
   const now = 1_784_990_400_000;
   const cipher = createQueueCipher(Buffer.alloc(32, 23).toString("base64"));
@@ -92,6 +96,9 @@ function createDarkFixture(options: {
     modelRegistryVersion: "2.1.0",
     dailyUserJobLimit: 3,
     activeJobLimit: 1,
+    ...(releasePhase === "canary"
+      ? { canaryBudgetId: options.canaryBudgetId ?? "engine-test-canary-budget" }
+      : {}),
     policy: {
       acceptNewJobs: options.acceptNewJobs ?? false,
       allowProviderSubmit: options.allowProviderSubmit ?? false,
@@ -102,8 +109,8 @@ function createDarkFixture(options: {
     spendCaps: {
       perJobCents: options.perJobCents ?? 0,
       dailyCents: options.dailyCents ?? 0,
-      canaryTotalCents: 0,
-      canaryFalCents: 0,
+      canaryTotalCents: options.canaryTotalCents ?? (releasePhase === "canary" ? 100 : 0),
+      canaryFalCents: options.canaryFalCents ?? 0,
     },
   };
   const runtime: StudioRuntime = {
@@ -143,10 +150,15 @@ function reviewedImagineRegistry(): AirModelRegistry {
       mode: "imagine",
       provider: "gmi",
       providerModelId: "reviewed-provider-image-model",
+      providerBinding: {
+        adapterKey: "gmi.test-adapter.v1",
+        requestSchemaFingerprint: "sha256:15c9c4c639d7a17e24f635771f2d8f39840e769eec92e9d5a2f6a5b864f74c9f",
+        resultSchemaFingerprint: "sha256:7c00f55d2774e6212e2c14f035d5096df824ad2f2430cf4960899258a893c5c7",
+      },
       verification: {
         verifiedAt: "2026-07-18T12:00:00Z",
-        catalogFingerprint: "catalog-fixture",
-        schemaFingerprint: "schema-fixture",
+        catalogFingerprint: "sha256:0e1fc0e407a81cce262b73cb17d6e8709b12a038aee452ff77c11eaf5f01a4e0",
+        schemaFingerprint: "sha256:572f6d4c2e2da341c2f9465d3fd8c834a85f4a533e8bf452ec1c89d4a862fa82",
       },
       input: { prompt: "required", image: false, video: false, mediaOnly: false },
       inputHosting: { mode: "data-uri" },
@@ -162,6 +174,7 @@ function reviewedImagineRegistry(): AirModelRegistry {
         source: "https://pricing.example.test/reviewed-gmi-imagine",
         currency: "USD",
         verifiedAt: "2026-07-18T12:00:00Z",
+        evidenceFingerprint: "sha256:69b7d0c3f7a681c18f1b8590ab3276d1c081ed510916e094d604284a7475e350",
         quotes: [{ count: 1, durationSeconds: null, maximumQuotedCostCents: 25 }],
       },
       polling: { requestTimeoutMs: 5_000, pollIntervalMs: 1_000, maxPollAttempts: 3, deadlineMs: 15_000 },
@@ -231,6 +244,10 @@ async function durableOutboxRecords(
   return records as StudioOutboxRecord[];
 }
 
+function textFromOutboxPayload(payload: StudioOutboxPayload): string | undefined {
+  return payload.kind === "text" ? payload.text : undefined;
+}
+
 describe("Air studio dark engine", () => {
   it("drains an allowlisted persisted creation into maintenance_rejected with onboarding and a durable response", async () => {
     const fixture = createDarkFixture();
@@ -260,7 +277,7 @@ describe("Air studio dark engine", () => {
     const records = await durableOutboxRecords(fixture, outboxIds);
     expect(records.every((record) => record.state === "intent" && record.attempts === 0)).toBe(true);
 
-    const texts = records.map((record) => fixture.store.decryptOutboxPayload(record).text);
+    const texts = records.map((record) => textFromOutboxPayload(fixture.store.decryptOutboxPayload(record)));
     expect(texts).toEqual(expect.arrayContaining([
       expect.stringContaining("I’m Air by WZRD"),
       expect.stringContaining("Create with /imagine"),
@@ -339,6 +356,43 @@ describe("Air studio dark engine", () => {
     expect(fixture.transport.sendText).not.toHaveBeenCalled();
   });
 
+  it("delivers a prepared provider result only through the Photon GUID capability", async () => {
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      deliveryEnabled: true,
+      transportVerified: true,
+    });
+    await armFixtureReleaseFence(fixture);
+    const sendPreparedOutput = vi.fn(async (): Promise<TransportOutcome> => ({ kind: "sent" }));
+    Object.assign(fixture.transport, {
+      preparedOutputTransport: "photon" as const,
+      prepareValidatedProviderArtifact: vi.fn(),
+      sendPreparedOutput,
+    });
+    await fixture.store.createOutbox({
+      outboxId: "prepared-output-intent",
+      senderHash: fixture.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: {
+        kind: "prepared-output",
+        outputIndex: 1,
+        output: { transport: "photon", attachmentGuid: "already-uploaded-photon-guid" },
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+      },
+    });
+
+    await expect(drainStudioOutbox(fixture.runtime)).resolves.toBe(1);
+    expect(sendPreparedOutput).toHaveBeenCalledWith(
+      { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+      { transport: "photon", attachmentGuid: "already-uploaded-photon-guid" },
+      expect.stringContaining("prepared-output-intent"),
+    );
+    expect(fixture.transport.sendAttachment).not.toHaveBeenCalled();
+    await expect(fixture.store.getOutbox("prepared-output-intent")).resolves.toMatchObject({ state: "sent" });
+  });
+
   it("fails an outbox whose encrypted payload disappears after claim without treating it as a send", async () => {
     const fixture = createDarkFixture({
       releasePhase: "canary",
@@ -410,7 +464,7 @@ describe("Air studio dark engine", () => {
       fixture,
       createOutbox.mock.calls.map(([input]) => input.outboxId),
     );
-    expect(records.map((record) => fixture.store.decryptOutboxPayload(record).text)).toEqual(expect.arrayContaining([
+    expect(records.map((record) => textFromOutboxPayload(fixture.store.decryptOutboxPayload(record)))).toEqual(expect.arrayContaining([
       "Air is in maintenance mode; I canceled the pending request. No generation was submitted.",
     ]));
   });
@@ -433,7 +487,7 @@ describe("Air studio dark engine", () => {
       fixture,
       createOutbox.mock.calls.map(([input]) => input.outboxId),
     );
-    expect(records.map((record) => fixture.store.decryptOutboxPayload(record).text)).toEqual(expect.arrayContaining([
+    expect(records.map((record) => textFromOutboxPayload(fixture.store.decryptOutboxPayload(record)))).toEqual(expect.arrayContaining([
       "Air is in maintenance mode; I didn’t retain that attachment. No generation was submitted.",
     ]));
   });
@@ -637,9 +691,44 @@ describe("Air studio dark engine", () => {
     );
     const payloads = await Promise.all(outboxIds.map(async (outboxId) => {
       const outbox = await fixture.store.getOutbox(outboxId);
-      return outbox ? fixture.store.decryptOutboxPayload(outbox).text : undefined;
+      return outbox ? textFromOutboxPayload(fixture.store.decryptOutboxPayload(outbox)) : undefined;
     }));
     expect(payloads).toContain("Air has no verified paid execution path enabled in this deployment. No generation was submitted.");
+  });
+
+  it("reports a shared canary-budget reservation refusal without submitting", async () => {
+    const provider = {
+      verified: true,
+      submit: vi.fn(async () => Object.freeze({ kind: "accepted" as const, providerRequestId: "must-not-submit" })),
+    } satisfies StudioProviderPort;
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      allowProviderSubmit: true,
+      provider,
+      registry: reviewedImagineRegistry(),
+      perJobCents: 100,
+      dailyCents: 100,
+      canaryTotalCents: 24,
+      canaryFalCents: 0,
+    });
+    await armFixtureReleaseFence(fixture);
+    const receiptId = await persistInbound(fixture, "shared-canary-cap-001", "/imagine a brushed-steel hummingbird");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "processed" });
+    await expect(fixture.store.getActiveJob(fixture.senderHash)).resolves.toBeNull();
+    expect(provider.submit).not.toHaveBeenCalled();
+    const outboxIds = await fixture.redis.zRangeByScore(
+      `${STUDIO_REDIS_PREFIX}:outbox:ready`,
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    const payloads = await Promise.all(outboxIds.map(async (outboxId) => {
+      const outbox = await fixture.store.getOutbox(outboxId);
+      return outbox ? textFromOutboxPayload(fixture.store.decryptOutboxPayload(outbox)) : undefined;
+    }));
+    expect(payloads).toContain("Air’s shared launch budget is fully reserved. No generation was submitted.");
   });
 
   it("persists an acknowledgement and tapback before the verified scheduler submits a text-only job", async () => {

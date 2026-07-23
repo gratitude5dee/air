@@ -1,10 +1,18 @@
 import { createClient } from "@photon-ai/advanced-imessage";
 import { cloud } from "@spectrum-ts/core";
 
-import type { StudioAttachmentReference } from "./store.js";
+import {
+  copyAndRevalidateStudioProviderArtifactForUpload,
+  isStudioValidatedProviderArtifact,
+  type StudioPreparedProviderArtifactUpload,
+  type StudioValidatedProviderArtifact,
+} from "./artifact-validation.js";
+import type { StudioAttachmentReference, StudioPreparedOutput } from "./store.js";
 import {
   isSafeTransportText,
   type IMessageThreadReference,
+  type StudioPreparedOutputTransport,
+  type StudioPrepareOutputOutcome,
   type StudioIMessageTransport,
   type TransportOutcome,
 } from "./imessage-transport.js";
@@ -13,6 +21,32 @@ import { assertNoPhotonTelemetryExporters } from "./photon-telemetry.js";
 const PHOTON_SHARED_LINE = "shared";
 const PHOTON_SHARED_ADDRESS = "imessage.spectrum.photon.codes:443";
 const TOKEN_EXPIRY_SAFETY_WINDOW_MS = 30_000;
+/**
+ * Keep every unary Photon RPC well inside Air's 90-second durable lease. A
+ * timeout is intentionally still classified as an unknown physical outcome;
+ * it only prevents a stalled SDK call from holding the worker indefinitely.
+ */
+const PHOTON_UNARY_RPC_TIMEOUT_MS = 20_000;
+const PHOTON_LIKE_TAPBACK = Object.freeze({ kind: "like" as const });
+
+interface PhotonReplyOptions {
+  /** Native iMessage reply target, carried only from a validated inbound GUID. */
+  readonly replyTo?: string;
+}
+
+interface PhotonTextSendOptions extends PhotonReplyOptions {
+  readonly clientMessageId: string;
+  readonly enableDataDetection: false;
+  readonly enableLinkPreview: false;
+}
+
+interface PhotonAttachmentSendOptions extends PhotonReplyOptions {
+  readonly clientMessageId: string;
+}
+
+interface PhotonReactionSendOptions {
+  readonly clientMessageId: string;
+}
 
 /**
  * A deliberately tiny, injected provider boundary. Unlike Spectrum's
@@ -24,11 +58,28 @@ export interface PhotonIMessageClient {
   readonly chats: {
     setTyping(chatGuid: string, isTyping: boolean): Promise<void>;
   };
+  readonly attachments: {
+    upload(input: { readonly data: Uint8Array; readonly fileName: string }): Promise<{
+      readonly attachment: { readonly guid: string };
+    }>;
+  };
   readonly messages: {
     sendText(
       chatGuid: string,
       text: string,
-      options: { readonly clientMessageId: string; readonly enableDataDetection: false; readonly enableLinkPreview: false },
+      options: PhotonTextSendOptions,
+    ): Promise<unknown>;
+    sendAttachment(
+      chatGuid: string,
+      attachmentGuid: string,
+      options: PhotonAttachmentSendOptions,
+    ): Promise<unknown>;
+    setReaction(
+      chatGuid: string,
+      messageId: string,
+      reaction: typeof PHOTON_LIKE_TAPBACK,
+      isSet: true,
+      options: PhotonReactionSendOptions,
     ): Promise<unknown>;
   };
 }
@@ -81,12 +132,14 @@ export async function createPhotonIMessageTransport(
 }
 
 /**
- * Text-only, direct Cloud iMessage delivery. Attachments, tapbacks, native
- * replies, and inbound media fetch remain unavailable until they have their
- * own reviewed byte and idempotency paths.
+ * Direct Cloud iMessage delivery. Air only accepts an explicitly validated
+ * provider artifact at the output boundary; an inbound attachment reference
+ * is a locator, never an outbound byte payload. Inbound media fetch remains
+ * unavailable until it has its own reviewed retrieval path.
  */
-export class PhotonIMessageTransport implements StudioIMessageTransport {
+export class PhotonIMessageTransport implements StudioIMessageTransport, StudioPreparedOutputTransport {
   public readonly verified = true;
+  public readonly preparedOutputTransport = "photon" as const;
   private readonly port: PhotonIMessagePort;
 
   public constructor(options: PhotonIMessageTransportOptions) {
@@ -137,6 +190,7 @@ export class PhotonIMessageTransport implements StudioIMessageTransport {
         // data-detector enrichment outside the signed Air boundary.
         enableDataDetection: false,
         enableLinkPreview: false,
+        ...replyOptionsFor(thread),
       });
       return Object.freeze({ kind: "sent" });
     } catch {
@@ -147,22 +201,177 @@ export class PhotonIMessageTransport implements StudioIMessageTransport {
     }
   }
 
-  /** Artifact delivery is intentionally unavailable until its byte path is reviewed. */
+  /**
+   * Uploads an Air-validated provider output then sends its Photon GUID.
+   *
+   * The broad parameter keeps this class structurally compatible with the
+   * legacy transport interface while rejecting a `StudioAttachmentReference`
+   * at runtime. That reference identifies an inbound attachment and has no
+   * validated bytes, filename, or one-based provider output position.
+   */
   public async sendAttachment(
-    _thread: IMessageThreadReference,
-    _attachment: StudioAttachmentReference,
-    _idempotencyKey: string,
+    thread: IMessageThreadReference,
+    attachment: StudioAttachmentReference | StudioValidatedProviderArtifact,
+    idempotencyKey: string,
   ): Promise<TransportOutcome> {
-    return Object.freeze({ kind: "failed", code: "attachment_delivery_not_enabled" });
+    if (!isSafeThreadReference(thread)) {
+      return Object.freeze({ kind: "failed", code: "invalid_thread_reference" });
+    }
+    if (!isSafeIdempotencyKey(idempotencyKey)) {
+      return Object.freeze({ kind: "failed", code: "invalid_idempotency_key" });
+    }
+    if (!isStudioValidatedProviderArtifact(attachment)) {
+      return Object.freeze({ kind: "failed", code: "invalid_outbound_artifact" });
+    }
+
+    const prepared = await this.prepareValidatedProviderArtifact(thread, attachment);
+    if (prepared.kind !== "prepared") return prepared;
+
+    const sent = await this.sendPreparedOutput(thread, prepared.output, idempotencyKey);
+    if (sent.kind !== "retryable_failure") return sent;
+
+    // The legacy method has nowhere durable to keep the newly uploaded GUID.
+    // Reporting retryable here would cause its old outbox caller to invoke
+    // this whole method again and upload a duplicate remote attachment. The
+    // split capability above can safely retry this exact send after it has
+    // persisted `prepared.output`; the compatibility bridge must fail closed.
+    return Object.freeze({ kind: "send_unknown", code: "photon_attachment_send_unknown" });
   }
 
-  /** Tapbacks remain disabled until a real-line reaction spike is documented. */
-  public async addLikeTapback(
-    _thread: IMessageThreadReference,
-    _messageId: string,
-    _idempotencyKey: string,
+  /**
+   * Performs only the Photon upload half of direct output delivery. The
+   * resulting small GUID record is safe for a later encrypted durable outbox
+   * record; it deliberately cannot contain provider bytes, URLs, or names.
+   */
+  public async prepareValidatedProviderArtifact(
+    thread: IMessageThreadReference,
+    attachment: StudioValidatedProviderArtifact,
+  ): Promise<StudioPrepareOutputOutcome> {
+    if (!isSafeThreadReference(thread)) {
+      return Object.freeze({ kind: "failed", code: "invalid_thread_reference" });
+    }
+    if (!isStudioValidatedProviderArtifact(attachment)) {
+      return Object.freeze({ kind: "failed", code: "invalid_outbound_artifact" });
+    }
+
+    let uploadArtifact: StudioPreparedProviderArtifactUpload;
+    try {
+      // This is the last byte boundary before Photon. It rejects forged
+      // structures and uses a fresh revalidated copy rather than the public,
+      // mutable `attachment.bytes` property.
+      uploadArtifact = copyAndRevalidateStudioProviderArtifactForUpload(attachment);
+    } catch {
+      return Object.freeze({ kind: "failed", code: "invalid_outbound_artifact" });
+    }
+
+    let client: PhotonIMessageClient;
+    try {
+      client = await this.port.getClient(thread.sendingLine);
+    } catch {
+      return Object.freeze({ kind: "retryable_failure", code: "photon_client_unavailable" });
+    }
+
+    let attachmentGuid: string;
+    try {
+      const uploaded = await client.attachments.upload({
+        data: uploadArtifact.bytes,
+        fileName: uploadArtifact.filename,
+      });
+      attachmentGuid = uploaded.attachment.guid;
+    } catch {
+      // The Photon upload API has no clientMessageId option. It may have
+      // persisted bytes even when the caller observes an error, so retries
+      // would create a second remote artifact and are never automatic.
+      return Object.freeze({ kind: "send_unknown", code: "photon_attachment_upload_unknown" });
+    }
+
+    if (!isSafePhotonOpaqueId(attachmentGuid)) {
+      // Treat an unusable upload response as ambiguous too: the upload may
+      // have succeeded, but Air cannot safely create a second copy to retry.
+      return Object.freeze({ kind: "send_unknown", code: "photon_attachment_upload_unknown" });
+    }
+
+    return Object.freeze({
+      kind: "prepared",
+      output: Object.freeze({ transport: "photon" as const, attachmentGuid }),
+    });
+  }
+
+  /**
+   * Performs only the physical iMessage send half of output delivery. It
+   * accepts no provider artifact or byte payload, and it repeats GUID
+   * validation after any durable rehydration before handing it to Photon.
+   */
+  public async sendPreparedOutput(
+    thread: IMessageThreadReference,
+    output: StudioPreparedOutput,
+    idempotencyKey: string,
   ): Promise<TransportOutcome> {
-    return Object.freeze({ kind: "failed", code: "tapback_delivery_not_enabled" });
+    if (!isSafeThreadReference(thread)) {
+      return Object.freeze({ kind: "failed", code: "invalid_thread_reference" });
+    }
+    if (!isSafeIdempotencyKey(idempotencyKey)) {
+      return Object.freeze({ kind: "failed", code: "invalid_idempotency_key" });
+    }
+    if (!isSafePreparedPhotonOutput(output)) {
+      return Object.freeze({ kind: "failed", code: "invalid_prepared_photon_output" });
+    }
+
+    let client: PhotonIMessageClient;
+    try {
+      client = await this.port.getClient(thread.sendingLine);
+    } catch {
+      return Object.freeze({ kind: "retryable_failure", code: "photon_client_unavailable" });
+    }
+
+    try {
+      await client.messages.sendAttachment(thread.chatGuid, output.attachmentGuid, {
+        clientMessageId: idempotencyKey,
+        ...replyOptionsFor(thread),
+      });
+      return Object.freeze({ kind: "sent" });
+    } catch {
+      // This send may have reached Photon. Keep the durable clientMessageId
+      // for explicit reconciliation instead of re-uploading or replaying.
+      return Object.freeze({ kind: "send_unknown", code: "photon_attachment_send_unknown" });
+    }
+  }
+
+  /** Adds the semantic iMessage thumbs-up tapback to one validated message. */
+  public async addLikeTapback(
+    thread: IMessageThreadReference,
+    messageId: string,
+    idempotencyKey: string,
+  ): Promise<TransportOutcome> {
+    if (!isSafeThreadReference(thread)) {
+      return Object.freeze({ kind: "failed", code: "invalid_thread_reference" });
+    }
+    if (!isSafePhotonOpaqueId(messageId)) {
+      return Object.freeze({ kind: "failed", code: "invalid_message_reference" });
+    }
+    if (!isSafeIdempotencyKey(idempotencyKey)) {
+      return Object.freeze({ kind: "failed", code: "invalid_idempotency_key" });
+    }
+
+    let client: PhotonIMessageClient;
+    try {
+      client = await this.port.getClient(thread.sendingLine);
+    } catch {
+      return Object.freeze({ kind: "retryable_failure", code: "photon_client_unavailable" });
+    }
+
+    try {
+      await client.messages.setReaction(
+        thread.chatGuid,
+        messageId,
+        PHOTON_LIKE_TAPBACK,
+        true,
+        { clientMessageId: idempotencyKey },
+      );
+      return Object.freeze({ kind: "sent" });
+    } catch {
+      return Object.freeze({ kind: "send_unknown", code: "photon_like_tapback_unknown" });
+    }
   }
 
   /** Inbound attachment bytes stay unavailable until media validation is wired. */
@@ -272,6 +481,7 @@ class CloudIMessagePort implements PhotonIMessagePort {
       autoIdempotency: false,
       retry: false,
       tls: true,
+      timeout: PHOTON_UNARY_RPC_TIMEOUT_MS,
       token: async () => this.tokenFor(instanceId),
     });
     this.clientsByInstance.set(instanceId, client);
@@ -306,7 +516,9 @@ function isSafeThreadReference(thread: IMessageThreadReference): boolean {
   // an inbound GUID verbatim for auditability, but must fail before its send
   // RPC rather than let an unrecognized legacy/provider-shaped value become
   // an ambiguous physical-delivery failure.
-  return isSafePhotonChatGuid(thread.chatGuid) && isSafeOpaqueValue(thread.sendingLine, 320);
+  return isSafePhotonChatGuid(thread.chatGuid) &&
+    isSafeOpaqueValue(thread.sendingLine, 320) &&
+    (thread.replyTargetId === undefined || isSafePhotonOpaqueId(thread.replyTargetId));
 }
 
 function isSafePhotonChatGuid(value: string): boolean {
@@ -315,6 +527,35 @@ function isSafePhotonChatGuid(value: string): boolean {
 
 function isSafeIdempotencyKey(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/.test(value);
+}
+
+function replyOptionsFor(thread: IMessageThreadReference): PhotonReplyOptions {
+  return thread.replyTargetId === undefined ? Object.freeze({}) : Object.freeze({ replyTo: thread.replyTargetId });
+}
+
+/**
+ * A prepared output has exactly one remote capability: a validated Photon
+ * attachment GUID. Reject any provider bytes, locator, or unexpected shape
+ * before a post-restart delivery path can invoke the direct SDK.
+ */
+function isSafePreparedPhotonOutput(value: unknown): value is StudioPreparedOutput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  try {
+    const output = value as Record<string, unknown>;
+    const keys = Object.keys(output);
+    return keys.length === 2 &&
+      Object.hasOwn(output, "transport") &&
+      Object.hasOwn(output, "attachmentGuid") &&
+      output.transport === "photon" &&
+      typeof output.attachmentGuid === "string" &&
+      isSafePhotonOpaqueId(output.attachmentGuid);
+  } catch {
+    return false;
+  }
+}
+
+function isSafePhotonOpaqueId(value: string): boolean {
+  return isSafeOpaqueValue(value, 4_096);
 }
 
 function isSafeOpaqueValue(value: string, maximumLength: number): boolean {

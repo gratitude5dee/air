@@ -67,6 +67,16 @@ export interface StudioAttachmentReference {
   readonly sizeBytes: number | null;
 }
 
+/**
+ * A provider result after exactly one successful Photon upload. This compact
+ * capability is encrypted at rest; it carries no provider URL, filename,
+ * bytes, or inbound attachment locator.
+ */
+export interface StudioPreparedOutput {
+  readonly transport: "photon";
+  readonly attachmentGuid: string;
+}
+
 /** Stored encrypted. No prompt, phone, GUID, or media bytes is visible in Redis metadata. */
 export interface StudioInboundEnvelope {
   readonly chatGuid: string;
@@ -114,7 +124,12 @@ export interface StudioJobPayload {
  * belongs in durable plaintext metadata.
  */
 export interface StudioExecutionSnapshot {
-  readonly schemaVersion: 1;
+  /**
+   * Version two pins every code-facing provider contract used at admission.
+   * A legacy snapshot deliberately cannot cross the paid-provider boundary:
+   * its model name alone is not enough to reconstruct a safe request later.
+   */
+  readonly schemaVersion: 2;
   readonly workflow: {
     readonly workflowId: string;
     readonly workflowVersion: 1;
@@ -124,10 +139,27 @@ export interface StudioExecutionSnapshot {
     readonly slug: string;
     readonly provider: "gmi" | "fal";
     readonly providerModelId: string;
+    /** Exact reviewed adapter key; never infer an adapter from provider name. */
+    readonly adapterKey: string;
+    /** Canonical fingerprints captured from the exact live model review. */
+    readonly catalogFingerprint: string;
+    readonly requestSchemaFingerprint: string;
+    readonly resultSchemaFingerprint: string;
+    readonly pricingEvidenceFingerprint: string;
   };
   readonly output: {
+    readonly type: "image" | "video";
     readonly count: number;
     readonly durationSeconds?: number | undefined;
+  };
+  /** The quoted ceiling that was atomically reserved as `job.reservedCents`. */
+  readonly maximumQuotedCostCents: number;
+  /** Exact bounded observation policy from the reviewed registry entry. */
+  readonly polling: {
+    readonly requestTimeoutMs: number;
+    readonly pollIntervalMs: number;
+    readonly maxPollAttempts: number;
+    readonly deadlineMs: number;
   };
   /** The release generation that was allowed to admit this exact work. */
   readonly releaseStamp: StudioReleaseStamp;
@@ -315,23 +347,40 @@ export interface RequeueConfirmedAbsentOutboxInput {
   readonly operatorHash: string;
 }
 
-export interface StudioOutboxPayload {
-  readonly kind: "text" | "attachment" | "tapback";
+export interface StudioOutboxThread {
   readonly thread: {
     readonly chatGuid: string;
     readonly sendingLine: string;
     readonly replyTargetId?: string | undefined;
   };
-  readonly text?: string | undefined;
-  readonly attachment?: StudioAttachmentReference | undefined;
-  readonly targetMessageId?: string | undefined;
-  readonly outputIndex?: number | undefined;
 }
+
+export type StudioOutboxPayload =
+  | (StudioOutboxThread & {
+      readonly kind: "text";
+      readonly text: string;
+    })
+  | (StudioOutboxThread & {
+      /** Never an inbound reference: only an already-uploaded Photon GUID. */
+      readonly kind: "prepared-output";
+      readonly outputIndex: number;
+      readonly output: StudioPreparedOutput;
+    })
+  | (StudioOutboxThread & {
+      readonly kind: "tapback";
+      readonly targetMessageId: string;
+    });
 
 export interface StudioOutboxRecord {
   readonly schemaVersion: 3;
   readonly outboxId: string;
   readonly jobId?: string | undefined;
+  /**
+   * Present only on a result intent that is owned by the durable per-job
+   * delivery cursor.  Generic `job-result` records created before that cursor
+   * foundation intentionally omit it and remain readable during migration.
+   */
+  readonly resultOutputIndex?: number | undefined;
   readonly senderHash: SenderHash;
   readonly lane: "onboarding" | "tapback" | "job-acknowledgement" | "job-result" | "request-response";
   /** Stable identity for an isolated lane across an explicitly requeued send. */
@@ -361,6 +410,61 @@ export interface StudioOutboxRecord {
   readonly dueAtMs: number;
   readonly updatedAtMs: number;
 }
+
+/**
+ * Content-free, durable pointer for one provider output. The actual artifact
+ * reference remains encrypted in the outbox payload, never in this cursor.
+ */
+interface StudioJobResultCursorOutput {
+  readonly outputIndex: number;
+  readonly outboxId: string;
+}
+
+interface StudioJobResultCursorMetadata {
+  readonly schemaVersion: 1;
+  readonly jobId: string;
+  readonly senderHash: SenderHash;
+  readonly threadHash: ThreadHash;
+  readonly outputCount: number;
+  /** Immutable copy of the release stamp at paid-job admission. */
+  readonly releaseStamp: StudioReleaseStamp;
+  /** The next one-based provider output index allowed to publish. */
+  readonly nextOutputIndex: number;
+  readonly outputs: readonly StudioJobResultCursorOutput[];
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+/** The authoritative delivery state is hydrated from the linked outbox. */
+export interface StudioJobResultOutputStatus extends StudioJobResultCursorOutput {
+  readonly state: StudioOutboxState;
+  readonly attempts: number;
+  readonly stateVersion: number;
+  readonly updatedAtMs: number;
+}
+
+/**
+ * A read-safe view of the result cursor. It binds every one-based provider
+ * output to its current physical iMessage intent without exposing media,
+ * route, prompt, or provider references.
+ */
+export interface StudioJobResultCursor extends Omit<StudioJobResultCursorMetadata, "outputs"> {
+  readonly outputs: readonly StudioJobResultOutputStatus[];
+}
+
+export interface PublishStudioJobResultInput {
+  readonly jobId: string;
+  readonly outputIndex: number;
+  /** Must be a native attachment result bound to the job's encrypted route. */
+  readonly payload: StudioOutboxPayload;
+}
+
+export type StudioJobResultPublishResult =
+  | { readonly kind: "published"; readonly cursor: StudioJobResultCursor; readonly outbox: StudioOutboxRecord }
+  | { readonly kind: "existing"; readonly cursor: StudioJobResultCursor; readonly outbox: StudioOutboxRecord }
+  | { readonly kind: "out_of_order"; readonly expectedOutputIndex: number }
+  | { readonly kind: "release_blocked" }
+  | { readonly kind: "unavailable" };
 
 /** Opaque capability bound to one pending-assembly fencing transition. */
 export interface PendingWriteGuard {
@@ -447,6 +551,14 @@ interface PendingControl {
   readonly expiresAtMs?: number | undefined;
 }
 
+/** Internal, secret-free arguments for the atomic canary admission scripts. */
+interface CanaryBudgetAdmission {
+  readonly key: string;
+  readonly enabled: "0" | "1";
+  readonly totalCapCents: number;
+  readonly falCapCents: number;
+}
+
 type CreateStudioOutboxInput = Omit<StudioOutboxRecord,
   "schemaVersion" | "releaseStamp" | "encryptedPayload" | "createdAtMs" | "dueAtMs" | "updatedAtMs" | "stateVersion" | "state" | "attempts" | "pendingGuard"
 > & {
@@ -463,7 +575,16 @@ export type AdmissionResult =
   | { readonly admitted: true; readonly job: StudioJobRecord }
   | {
       readonly admitted: false;
-      readonly reason: "active_job" | "user_limit" | "per_job_cap" | "daily_cap" | "release_blocked" | "storage_error";
+      readonly reason:
+        | "active_job"
+        | "user_limit"
+        | "per_job_cap"
+        | "daily_cap"
+        | "canary_budget_required"
+        | "canary_total_cap"
+        | "canary_fal_cap"
+        | "release_blocked"
+        | "storage_error";
     };
 
 /**
@@ -494,12 +615,25 @@ export interface StudioStoreOptions {
   readonly releaseStamp?: StudioReleaseStamp | undefined;
 }
 
+/**
+ * Ephemeral canary-admission policy. Its budget identifier is used only to
+ * derive an HMAC-scoped Redis key; it is never serialized into a job,
+ * argument, log, or budget record.
+ */
+export interface StudioCanaryBudgetPolicy {
+  readonly budgetId: string;
+  readonly totalCapCents: number;
+  readonly falCapCents: number;
+}
+
 export interface AdmitStudioJobInput {
   readonly job: StudioJobRecordWithPayload;
   readonly activeJobLimit: number;
   readonly dailyUserJobLimit: number;
   readonly perJobCapCents: number;
   readonly dailySpendCapCents: number;
+  /** Required for a new canary reservation; ignored outside canary. */
+  readonly canaryBudget?: StudioCanaryBudgetPolicy | undefined;
 }
 
 /**
@@ -1023,6 +1157,7 @@ export class StudioStore {
     const dailySpendKey = this.dailySpendKey(day);
     const jobPayloadKey = this.jobPayloadKey(input.job.jobId);
     const ttl = secondsToUtcMidnight(now);
+    const canaryBudget = this.canaryBudgetAdmission(input.canaryBudget);
     const result = await this.redis.eval(ADMIT_JOB_LUA, {
       keys: [
         activeKey,
@@ -1032,6 +1167,7 @@ export class StudioStore {
         jobPayloadKey,
         this.readyJobKey(),
         this.releaseFenceKey(),
+        canaryBudget.key,
       ],
       arguments: [
         input.job.jobId,
@@ -1045,6 +1181,9 @@ export class StudioStore {
         String(now),
         String(this.releaseStamp.generation),
         this.releaseStamp.phase,
+        canaryBudget.enabled,
+        String(canaryBudget.totalCapCents),
+        String(canaryBudget.falCapCents),
       ],
     });
     const code = Array.isArray(result) ? result[0] : result;
@@ -1056,7 +1195,15 @@ export class StudioStore {
       }
       return Object.freeze({ admitted: true, job: await this.hydrateJobPayload(existing) });
     }
-    if (code === "active_job" || code === "user_limit" || code === "daily_cap" || code === "release_blocked") {
+    if (
+      code === "active_job"
+      || code === "user_limit"
+      || code === "daily_cap"
+      || code === "canary_budget_required"
+      || code === "canary_total_cap"
+      || code === "canary_fal_cap"
+      || code === "release_blocked"
+    ) {
       return Object.freeze({ admitted: false, reason: code });
     }
     return Object.freeze({ admitted: false, reason: "storage_error" });
@@ -1142,6 +1289,7 @@ export class StudioStore {
     const now = this.now();
     const ttl = secondsToUtcMidnight(now);
     const day = utcDay(now);
+    const canaryBudget = this.canaryBudgetAdmission(input.canaryBudget);
     const result = await this.redis.eval(ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_LUA, {
       keys: [
         this.activeJobKey(job.senderHash),
@@ -1158,6 +1306,7 @@ export class StudioStore {
         tapback === undefined ? this.unusedInitialAdmissionOutboxKey() : this.outboxKey(tapback.outboxId),
         tapback === undefined ? this.unusedInitialAdmissionOutboxPayloadKey() : this.outboxPayloadKey(tapback.outboxId),
         tapback === undefined ? this.unusedInitialAdmissionOutboxLaneKey() : this.outboxLaneKey(tapback),
+        canaryBudget.key,
       ],
       arguments: [
         job.jobId,
@@ -1184,6 +1333,9 @@ export class StudioStore {
         tapback === undefined ? "0" : String(tapback.dueAtMs),
         tapback === undefined ? "0" : "1",
         String(OUTBOX_PAYLOAD_TTL_SECONDS),
+        canaryBudget.enabled,
+        String(canaryBudget.totalCapCents),
+        String(canaryBudget.falCapCents),
       ],
     });
     const code = Array.isArray(result) ? result[0] : result;
@@ -1200,7 +1352,16 @@ export class StudioStore {
       }
       return Object.freeze({ admitted: true, job: await this.hydrateJobPayload(existing) });
     }
-    if (code === "active_job" || code === "user_limit" || code === "daily_cap" || code === "per_job_cap" || code === "release_blocked") {
+    if (
+      code === "active_job"
+      || code === "user_limit"
+      || code === "daily_cap"
+      || code === "per_job_cap"
+      || code === "canary_budget_required"
+      || code === "canary_total_cap"
+      || code === "canary_fal_cap"
+      || code === "release_blocked"
+    ) {
       return Object.freeze({ admitted: false, reason: code });
     }
     return Object.freeze({ admitted: false, reason: "storage_error" });
@@ -1331,6 +1492,7 @@ export class StudioStore {
         this.jobPayloadKey(jobId),
         this.activeJobKey(job.senderHash),
         this.readyJobKey(),
+        this.jobResultCursorKey(jobId),
       ],
       arguments: [from, String(job.stateVersion), to, String(this.now()), String(TERMINAL_METADATA_TTL_SECONDS), job.jobId, isTerminalJobState(to) ? "1" : "0"],
     });
@@ -1680,7 +1842,152 @@ export class StudioStore {
     return reconciliationResult(result, audit.auditId);
   }
 
+  /**
+   * Reads the compact result cursor and hydrates each individual delivery
+   * status from its linked outbox. A malformed or missing linked intent fails
+   * closed rather than making a caller guess whether an artifact was sent.
+   */
+  public async getJobResultCursor(jobId: string): Promise<StudioJobResultCursor | null> {
+    if (!isSafeRecordString(jobId, 160)) return null;
+    const metadata = await this.getJobResultCursorMetadata(jobId);
+    if (!metadata) return null;
+    const outputs: StudioJobResultOutputStatus[] = [];
+    for (const output of metadata.outputs) {
+      const outbox = await this.getOutbox(output.outboxId);
+      if (
+        !outbox
+        || outbox.jobId !== metadata.jobId
+        || outbox.senderHash !== metadata.senderHash
+        || outbox.lane !== "job-result"
+        || outbox.resultOutputIndex !== output.outputIndex
+      ) return null;
+      outputs.push(Object.freeze({
+        outputIndex: output.outputIndex,
+        outboxId: output.outboxId,
+        state: outbox.state,
+        attempts: outbox.attempts,
+        stateVersion: outbox.stateVersion,
+        updatedAtMs: outbox.updatedAtMs,
+      }));
+    }
+    return Object.freeze({
+      schemaVersion: metadata.schemaVersion,
+      jobId: metadata.jobId,
+      senderHash: metadata.senderHash,
+      threadHash: metadata.threadHash,
+      outputCount: metadata.outputCount,
+      releaseStamp: metadata.releaseStamp,
+      nextOutputIndex: metadata.nextOutputIndex,
+      outputs: Object.freeze(outputs),
+      createdAtMs: metadata.createdAtMs,
+      updatedAtMs: metadata.updatedAtMs,
+    });
+  }
+
+  /**
+   * Atomically appends exactly one one-based provider output to the job's
+   * result cursor and publishes its attachment outbox intent. The cursor keeps
+   * the immutable admission stamp; the physical intent deliberately receives
+   * this deployment's fenced stamp so an approved recovery deployment can
+   * finish delivery after a rollback without reopening provider admission.
+   */
+  public async publishJobResult(
+    input: PublishStudioJobResultInput,
+  ): Promise<StudioJobResultPublishResult> {
+    if (!isSafeRecordString(input.jobId, 160) || !isPositiveSafeInteger(input.outputIndex) || input.outputIndex > 4) {
+      return Object.freeze({ kind: "unavailable" });
+    }
+    const job = await this.getJob(input.jobId);
+    if (!job || job.jobId !== input.jobId || input.outputIndex > job.outputCount) {
+      return Object.freeze({ kind: "unavailable" });
+    }
+
+    // A delivery cursor is authoritative after the first publication. This
+    // makes a provider-poll retry idempotent even after the job's private
+    // admission payload has expired or the job has terminalized.
+    const existingCursor = await this.getJobResultCursor(job.jobId);
+    const existingOutput = existingCursor?.outputs.find((output) => output.outputIndex === input.outputIndex);
+    if (existingCursor && existingOutput) {
+      const outbox = await this.getOutbox(existingOutput.outboxId);
+      if (!outbox) return Object.freeze({ kind: "unavailable" });
+      return Object.freeze({ kind: "existing", cursor: existingCursor, outbox });
+    }
+
+    let jobPayload: StudioJobPayload;
+    try {
+      jobPayload = this.decryptJobPayload(job);
+    } catch {
+      return Object.freeze({ kind: "unavailable" });
+    }
+    if (!isJobResultPayloadBoundToJob(input.payload, input.outputIndex, jobPayload)) {
+      return Object.freeze({ kind: "unavailable" });
+    }
+
+    const outboxId = this.jobResultOutboxId(job.jobId, input.outputIndex);
+    let outbox: StudioOutboxRecord;
+    try {
+      outbox = this.buildOutboxRecord({
+        outboxId,
+        jobId: job.jobId,
+        resultOutputIndex: input.outputIndex,
+        senderHash: job.senderHash,
+        lane: "job-result",
+        sequence: input.outputIndex,
+        payload: input.payload,
+      }, undefined, undefined, true);
+    } catch {
+      return Object.freeze({ kind: "unavailable" });
+    }
+
+    const result = await this.redis.eval(PUBLISH_JOB_RESULT_LUA, {
+      keys: [
+        this.jobKey(job.jobId),
+        this.jobResultCursorKey(job.jobId),
+        this.outboxKey(outbox.outboxId),
+        this.outboxPayloadKey(outbox.outboxId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey(outbox),
+        this.releaseFenceKey(),
+      ],
+      arguments: [
+        job.jobId,
+        String(job.stateVersion),
+        String(job.releaseStamp.generation),
+        job.releaseStamp.phase,
+        String(input.outputIndex),
+        outbox.outboxId,
+        JSON.stringify(outboxMetadata(outbox)),
+        JSON.stringify(requiredOutboxPayload(outbox)),
+        String(OUTBOX_PAYLOAD_TTL_SECONDS),
+        String(outbox.dueAtMs),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+        String(this.now()),
+      ],
+    });
+    const outcome = parseJobResultPublication(result);
+    if (outcome.kind === "out_of_order") {
+      return Object.freeze({ kind: "out_of_order", expectedOutputIndex: outcome.expectedOutputIndex });
+    }
+    if (outcome.kind === "release_blocked") return Object.freeze({ kind: "release_blocked" });
+    if (outcome.kind !== "created" && outcome.kind !== "existing") {
+      return Object.freeze({ kind: "unavailable" });
+    }
+    const cursor = await this.getJobResultCursor(job.jobId);
+    const currentOutput = cursor?.outputs.find((output) => output.outputIndex === input.outputIndex);
+    const persistedOutbox = currentOutput ? await this.getOutbox(currentOutput.outboxId) : null;
+    if (!cursor || !persistedOutbox) return Object.freeze({ kind: "unavailable" });
+    return Object.freeze({
+      kind: outcome.kind === "created" ? "published" : "existing",
+      cursor,
+      outbox: persistedOutbox,
+    });
+  }
+
   public async createOutbox(input: CreateStudioOutboxInput): Promise<StudioOutboxRecord> {
+    if (input.resultOutputIndex !== undefined) {
+      throw new Error("job result outboxes require the durable result cursor");
+    }
     const record = this.buildOutboxRecord(input);
     const result = await this.persistOutbox(record);
     if (result === "created") return record;
@@ -1747,9 +2054,13 @@ export class StudioStore {
     input: CreateStudioOutboxInput,
     pendingGuard?: PendingWriteGuard,
     laneIdentity?: string,
+    allowResultOutput = false,
   ): StudioOutboxRecord {
     if (!Number.isSafeInteger(input.sequence) || input.sequence < 0) {
       throw new Error("outbox sequence is invalid");
+    }
+    if (!isStudioOutboxPayload(input.payload)) {
+      throw new Error("outbox payload is invalid");
     }
     const now = this.now();
     const dueAtMs = input.dueAtMs ?? now;
@@ -1759,10 +2070,22 @@ export class StudioStore {
     if (laneIdentity !== undefined && !isSafeRecordString(laneIdentity, 160)) {
       throw new Error("outbox lane identity is invalid");
     }
+    if (input.resultOutputIndex !== undefined) {
+      if (
+        !allowResultOutput
+        || input.lane !== "job-result"
+        || input.jobId === undefined
+        || !isPositiveSafeInteger(input.resultOutputIndex)
+        || input.sequence !== input.resultOutputIndex
+      ) {
+        throw new Error("outbox result cursor binding is invalid");
+      }
+    }
     const record: StudioOutboxRecord = Object.freeze({
       schemaVersion: 3,
       outboxId: input.outboxId,
       ...(input.jobId === undefined ? {} : { jobId: input.jobId }),
+      ...(input.resultOutputIndex === undefined ? {} : { resultOutputIndex: input.resultOutputIndex }),
       senderHash: input.senderHash,
       lane: input.lane,
       ...(laneIdentity === undefined ? {} : { laneIdentity }),
@@ -1807,6 +2130,11 @@ export class StudioStore {
     const existing = await this.getOutbox(outboxId);
     if (!existing) throw new Error("outbox publication could not be confirmed");
     return existing;
+  }
+
+  private async getJobResultCursorMetadata(jobId: string): Promise<StudioJobResultCursorMetadata | null> {
+    const metadata = parseStored<StudioJobResultCursorMetadata>(await this.redis.get(this.jobResultCursorKey(jobId)));
+    return metadata && isJobResultCursorMetadata(metadata) ? metadata : null;
   }
 
   private buildReconciliationAudit(input: {
@@ -1994,11 +2322,12 @@ export class StudioStore {
     const replacement = this.buildOutboxRecord({
       outboxId: replacementOutboxId,
       ...(source.jobId === undefined ? {} : { jobId: source.jobId }),
+      ...(source.resultOutputIndex === undefined ? {} : { resultOutputIndex: source.resultOutputIndex }),
       senderHash: source.senderHash,
       lane: source.lane,
       sequence: source.sequence,
       payload,
-    }, source.pendingGuard, laneIdentity);
+    }, source.pendingGuard, laneIdentity, source.resultOutputIndex !== undefined);
     const audit = this.buildReconciliationAudit({
       actorHash: input.operatorHash,
       action: "outbox_requeued",
@@ -2015,6 +2344,9 @@ export class StudioStore {
         this.outboxLaneKey(replacement),
         this.releaseFenceKey(),
         this.reconciliationAuditKey(audit.auditId),
+        source.resultOutputIndex === undefined || source.jobId === undefined
+          ? this.unusedJobResultCursorKey()
+          : this.jobResultCursorKey(source.jobId),
       ],
       arguments: [
         String(input.expectedOutboxVersion),
@@ -2145,6 +2477,28 @@ export class StudioStore {
     return `${this.prefix}:operations:cron-heartbeat:${scope}`;
   }
   private releaseFenceKey(): string { return `${this.prefix}:operations:release-fence`; }
+  private canaryBudgetAdmission(policy: StudioCanaryBudgetPolicy | undefined): CanaryBudgetAdmission {
+    if (this.releaseStamp.phase !== "canary" || !isValidCanaryBudgetPolicy(policy)) {
+      return Object.freeze({
+        key: this.unusedCanaryBudgetKey(),
+        enabled: "0" as const,
+        totalCapCents: 0,
+        falCapCents: 0,
+      });
+    }
+    return Object.freeze({
+      key: this.canaryBudgetKey(policy.budgetId),
+      enabled: "1" as const,
+      totalCapCents: policy.totalCapCents,
+      falCapCents: policy.falCapCents,
+    });
+  }
+  /** HMAC-derived so the operator budget identifier never appears in Redis. */
+  private canaryBudgetKey(budgetId: string): string {
+    return `${this.prefix}:canary:budget:${deriveOpaqueId(this.secret, "studio-canary-budget", budgetId)}`;
+  }
+  /** Never written; keeps fixed Lua key arity when a canary policy is absent. */
+  private unusedCanaryBudgetKey(): string { return `${this.prefix}:canary:budget:unused`; }
   private settingsKey(senderHash: SenderHash): string { return `${this.prefix}:settings:${senderHash}`; }
   private onboardingMarkerKey(senderHash: SenderHash, onboardingVersion: number): string {
     return `${this.prefix}:onboarding:marker:${senderHash}:v${onboardingVersion}`;
@@ -2167,6 +2521,11 @@ export class StudioStore {
   private jobPayloadKey(jobId: string): string { return `${this.prefix}:job:payload:${jobId}`; }
   private readyJobKey(): string { return `${this.prefix}:job:ready`; }
   private jobLeaseKey(jobId: string): string { return `${this.prefix}:job:lease:${jobId}`; }
+  private jobResultCursorKey(jobId: string): string { return `${this.prefix}:job:result-cursor:${jobId}`; }
+  private jobResultOutboxId(jobId: string, outputIndex: number): string {
+    return deriveOpaqueId(this.secret, "studio-job-result-outbox", `${jobId}\u0000${String(outputIndex)}`);
+  }
+  private unusedJobResultCursorKey(): string { return `${this.prefix}:job:result-cursor:unused`; }
   private providerSubrunKey(subrunId: string): string { return `${this.prefix}:provider-subrun:${subrunId}`; }
   private providerSubrunReferenceKey(subrunId: string): string { return `${this.prefix}:provider-subrun:reference:${subrunId}`; }
   private providerSubrunLeaseKey(subrunId: string): string { return `${this.prefix}:provider-subrun:lease:${subrunId}`; }
@@ -2403,11 +2762,27 @@ return payload
 `;
 
 const ADMIT_JOB_LUA = `
--- AIR_STUDIO_ADMIT_JOB_V4
+-- AIR_STUDIO_ADMIT_JOB_V5
 -- KEYS: active sender fence, daily user count, daily spend, job metadata,
---       encrypted job payload, durable job-ready index, release fence
+--       encrypted job payload, durable job-ready index, release fence,
+--       opaque non-expiring canary budget reservation
 -- ARGV: job id, metadata, payload, daily ttl, payload ttl, user limit,
---       spend cap, reserved cents, now, release generation, release phase
+--       spend cap, reserved cents, now, release generation, release phase,
+--       canary policy enabled, total cap, fal subcap
+local function nonnegativeInteger(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+
+local function keyType(key)
+  local response = redis.call('TYPE', key)
+  return response and response.ok or ''
+end
+
+local function isStringOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'string'
+end
+
 local existing = redis.call('GET', KEYS[4])
 -- A retry must preserve the original admission even if a later deployment has
 -- advanced the shared fence. The current fence governs only a new reservation.
@@ -2418,6 +2793,9 @@ if existing then
     redis.call('ZADD', KEYS[6], tonumber(ARGV[9]), ARGV[1])
   end
   return {'existing', existing}
+end
+if ARGV[11] ~= 'dark' and ARGV[11] ~= 'canary' and ARGV[11] ~= 'production' then
+  return {'release_blocked'}
 end
 local metadata = cjson.decode(ARGV[2])
 local stamp = metadata.releaseStamp
@@ -2437,6 +2815,40 @@ if fenceRaw then
 elseif ARGV[11] ~= 'dark' then
   return {'release_blocked'}
 end
+
+-- The canary record is shared by every sender/mode/provider for this opaque
+-- approved budget. It is touched only after the live release fence accepts
+-- this exact admission, so dark/rollback/stale workers cannot reserve money.
+local canaryBudget = nil
+if ARGV[11] == 'canary' then
+  if ARGV[12] ~= '1' then return {'canary_budget_required'} end
+  local totalCap = tonumber(ARGV[13])
+  local falCap = tonumber(ARGV[14])
+  local cost = tonumber(ARGV[8])
+  if not nonnegativeInteger(totalCap) or not nonnegativeInteger(falCap)
+    or not nonnegativeInteger(cost)
+    or (metadata.provider ~= 'gmi' and metadata.provider ~= 'fal')
+    or not isStringOrMissing(KEYS[8]) then return {'storage_error'} end
+  local totalReserved = 0
+  local falReserved = 0
+  local budgetRaw = redis.call('GET', KEYS[8])
+  if budgetRaw then
+    local okBudget, budget = pcall(cjson.decode, budgetRaw)
+    if not okBudget or type(budget) ~= 'table' or budget.schemaVersion ~= 1
+      or not nonnegativeInteger(budget.totalReservedCents)
+      or not nonnegativeInteger(budget.falReservedCents) then return {'storage_error'} end
+    totalReserved = budget.totalReservedCents
+    falReserved = budget.falReservedCents
+  end
+  if totalReserved + cost > totalCap then return {'canary_total_cap'} end
+  if metadata.provider == 'fal' and falReserved + cost > falCap then return {'canary_fal_cap'} end
+  canaryBudget = {
+    schemaVersion = 1,
+    totalReservedCents = totalReserved + cost,
+    falReservedCents = metadata.provider == 'fal' and falReserved + cost or falReserved
+  }
+end
+
 if redis.call('EXISTS', KEYS[5]) == 1 then return {'storage_error'} end
 local active = redis.call('GET', KEYS[1])
 if active then return {'active_job'} end
@@ -2456,19 +2868,21 @@ redis.call('SET', KEYS[3], tostring(spend + cost), 'EX', ARGV[4])
 redis.call('SET', KEYS[4], ARGV[2])
 redis.call('SET', KEYS[5], ARGV[3], 'EX', ARGV[5])
 redis.call('ZADD', KEYS[6], tonumber(ARGV[9]), ARGV[1])
+if canaryBudget then redis.call('SET', KEYS[8], cjson.encode(canaryBudget)) end
 return {'admitted'}
 `;
 
 const ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_LUA = `
--- AIR_STUDIO_ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_V1
+-- AIR_STUDIO_ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_V2
 -- KEYS: active sender fence, daily user count, daily spend, job metadata,
 --       encrypted job payload, durable job-ready index, release fence,
 --       outbox-ready index, acknowledgement metadata/payload/lane,
---       optional tapback metadata/payload/lane
+--       optional tapback metadata/payload/lane, opaque canary budget
 -- ARGV: job id, metadata, payload, daily ttl, job payload ttl, user limit,
 --       daily spend cap, reserved cents, now, release generation/phase,
 --       per-job cap, acknowledgement metadata/payload/id/sequence/due,
---       optional tapback metadata/payload/id/sequence/due/flag, outbox ttl
+--       optional tapback metadata/payload/id/sequence/due/flag, outbox ttl,
+--       canary policy enabled, total cap, fal subcap
 local function keyType(key)
   local response = redis.call('TYPE', key)
   return response and response.ok or ''
@@ -2631,6 +3045,7 @@ if not isStringOrMissing(KEYS[1]) or not isStringOrMissing(KEYS[2])
   or not isZsetOrMissing(KEYS[6]) or not isStringOrMissing(KEYS[7])
   or not isZsetOrMissing(KEYS[8]) or not isStringOrMissing(KEYS[9])
   or not isStringOrMissing(KEYS[10]) or not isZsetOrMissing(KEYS[11])
+  or (ARGV[11] == 'canary' and not isStringOrMissing(KEYS[15]))
   or (hasTapback and (
     not isStringOrMissing(KEYS[12]) or not isStringOrMissing(KEYS[13]) or not isZsetOrMissing(KEYS[14])
   )) then return {'storage_error'} end
@@ -2647,6 +3062,36 @@ end
 -- A known release revocation wins over a cost response: this stale worker
 -- must not publish any user-visible effect while a rollback is in force.
 if reservedCents > perJobCap then return {'per_job_cap'} end
+
+-- The reservation record is shared by the opaque approved canary budget and
+-- intentionally has no expiry. It is evaluated only after the current fence
+-- accepts this exact release, so dark/rollback/stale workers cannot mutate it.
+local canaryBudget = nil
+if ARGV[11] == 'canary' then
+  if ARGV[25] ~= '1' then return {'canary_budget_required'} end
+  local canaryTotalCap = tonumber(ARGV[26])
+  local canaryFalCap = tonumber(ARGV[27])
+  if not nonnegativeInteger(canaryTotalCap) or not nonnegativeInteger(canaryFalCap)
+    or (candidate.provider ~= 'gmi' and candidate.provider ~= 'fal') then return {'storage_error'} end
+  local totalReserved = 0
+  local falReserved = 0
+  local budgetRaw = redis.call('GET', KEYS[15])
+  if budgetRaw then
+    local okBudget, budget = pcall(cjson.decode, budgetRaw)
+    if not okBudget or type(budget) ~= 'table' or budget.schemaVersion ~= 1
+      or not nonnegativeInteger(budget.totalReservedCents)
+      or not nonnegativeInteger(budget.falReservedCents) then return {'storage_error'} end
+    totalReserved = budget.totalReservedCents
+    falReserved = budget.falReservedCents
+  end
+  if totalReserved + reservedCents > canaryTotalCap then return {'canary_total_cap'} end
+  if candidate.provider == 'fal' and falReserved + reservedCents > canaryFalCap then return {'canary_fal_cap'} end
+  canaryBudget = {
+    schemaVersion = 1,
+    totalReservedCents = totalReserved + reservedCents,
+    falReservedCents = candidate.provider == 'fal' and falReserved + reservedCents or falReserved
+  }
+end
 
 local okPayload, encryptedJobPayload = pcall(cjson.decode, ARGV[3])
 local okAcknowledgement, acknowledgement = pcall(cjson.decode, ARGV[13])
@@ -2723,6 +3168,7 @@ if hasTapback then
 end
 -- Publication is last: all user-visible durable intents exist first.
 redis.call('ZADD', KEYS[6], now, jobId)
+if canaryBudget then redis.call('SET', KEYS[15], cjson.encode(canaryBudget)) end
 return {'admitted'}
 `;
 
@@ -2829,6 +3275,214 @@ if current.generation == target and current.phase == ARGV[3]
 if current.generation ~= previous or target ~= previous + 1 then return -1 end
 redis.call('SET', KEYS[1], cjson.encode({ schemaVersion = 1, generation = target, phase = ARGV[3] }))
 return 1
+`;
+
+const PUBLISH_JOB_RESULT_LUA = `
+-- AIR_STUDIO_PUBLISH_JOB_RESULT_V1
+-- KEYS: job metadata, result cursor, outbox metadata/payload, ready index,
+--       result lane, current release fence
+-- ARGV: job id/version/admission generation/admission phase, one-based output
+--       index, deterministic outbox id, outbox metadata/payload/payload ttl/
+--       due time, current outbox generation/phase, now
+local function keyType(key)
+  local response = redis.call('TYPE', key)
+  return response and response.ok or ''
+end
+
+local function isStringOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'string'
+end
+
+local function isZsetOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'zset'
+end
+
+local function opaque(value)
+  return type(value) == 'string' and #value == 64 and string.match(value, '^[a-f0-9]+$') ~= nil
+end
+
+local function safeText(value, maximum)
+  return type(value) == 'string' and #value > 0 and #value <= maximum
+    and string.match(value, '[\x00\r\n]') == nil
+end
+
+local function positiveInteger(value)
+  return type(value) == 'number' and value >= 1 and value == math.floor(value)
+end
+
+local function nonnegativeInteger(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+
+local function validStamp(stamp)
+  return type(stamp) == 'table'
+    and nonnegativeInteger(stamp.generation)
+    and (stamp.phase == 'dark' or stamp.phase == 'canary' or stamp.phase == 'production')
+    and (stamp.phase == 'dark' or stamp.generation >= 1)
+end
+
+local function sameStamp(left, right)
+  return validStamp(left) and validStamp(right)
+    and left.generation == right.generation and left.phase == right.phase
+end
+
+local function encrypted(value)
+  return type(value) == 'table'
+    and value.version == 1
+    and value.algorithm == 'aes-256-gcm'
+    and type(value.iv) == 'string'
+    and type(value.ciphertext) == 'string'
+    and type(value.tag) == 'string'
+end
+
+local function result(kind, expected)
+  local value = { kind = kind }
+  if expected ~= nil then value.expectedOutputIndex = expected end
+  return cjson.encode(value)
+end
+
+local expectedJobVersion = tonumber(ARGV[2])
+local admissionGeneration = tonumber(ARGV[3])
+local outputIndex = tonumber(ARGV[5])
+local payloadTtl = tonumber(ARGV[9])
+local dueAt = tonumber(ARGV[10])
+local currentGeneration = tonumber(ARGV[11])
+local now = tonumber(ARGV[13])
+if not positiveInteger(expectedJobVersion)
+  or not nonnegativeInteger(admissionGeneration)
+  or not positiveInteger(outputIndex)
+  or not positiveInteger(payloadTtl)
+  or not nonnegativeInteger(dueAt)
+  or not nonnegativeInteger(currentGeneration)
+  or not nonnegativeInteger(now)
+  or not safeText(ARGV[1], 160)
+  or not opaque(ARGV[6])
+  or (ARGV[4] ~= 'dark' and ARGV[4] ~= 'canary' and ARGV[4] ~= 'production')
+  or (ARGV[12] ~= 'dark' and ARGV[12] ~= 'canary' and ARGV[12] ~= 'production')
+  or (ARGV[12] ~= 'dark' and currentGeneration < 1) then return result('unavailable') end
+
+if not isStringOrMissing(KEYS[1])
+  or not isStringOrMissing(KEYS[2])
+  or not isStringOrMissing(KEYS[3])
+  or not isStringOrMissing(KEYS[4])
+  or not isZsetOrMissing(KEYS[5])
+  or not isZsetOrMissing(KEYS[6])
+  or not isStringOrMissing(KEYS[7]) then return result('unavailable') end
+
+local jobRaw = redis.call('GET', KEYS[1])
+if not jobRaw then return result('unavailable') end
+local jobOk, job = pcall(cjson.decode, jobRaw)
+if not jobOk or type(job) ~= 'table'
+  or job.jobId ~= ARGV[1]
+  or not opaque(job.senderHash)
+  or not opaque(job.threadHash)
+  or not positiveInteger(job.outputCount)
+  or job.outputCount > 4
+  or outputIndex > job.outputCount
+  or not validStamp(job.releaseStamp)
+  or job.releaseStamp.generation ~= admissionGeneration
+  or job.releaseStamp.phase ~= ARGV[4] then return result('unavailable') end
+
+local cursorRaw = redis.call('GET', KEYS[2])
+local cursor = nil
+if cursorRaw then
+  local cursorOk
+  cursorOk, cursor = pcall(cjson.decode, cursorRaw)
+  if not cursorOk or type(cursor) ~= 'table'
+    or cursor.schemaVersion ~= 1
+    or cursor.jobId ~= job.jobId
+    or cursor.senderHash ~= job.senderHash
+    or cursor.threadHash ~= job.threadHash
+    or cursor.outputCount ~= job.outputCount
+    or not sameStamp(cursor.releaseStamp, job.releaseStamp)
+    or not positiveInteger(cursor.nextOutputIndex)
+    or cursor.nextOutputIndex > job.outputCount + 1
+    or type(cursor.outputs) ~= 'table'
+    or not nonnegativeInteger(cursor.createdAtMs)
+    or not nonnegativeInteger(cursor.updatedAtMs) then return result('unavailable') end
+  if #cursor.outputs ~= cursor.nextOutputIndex - 1 then return result('unavailable') end
+  for position, output in ipairs(cursor.outputs) do
+    if type(output) ~= 'table'
+      or output.outputIndex ~= position
+      or not opaque(output.outboxId) then return result('unavailable') end
+  end
+  local prior = cursor.outputs[outputIndex]
+  if prior ~= nil then
+    -- A confirmed-absent requeue may already have rebound this output to a
+    -- new opaque outbox. The cursor remains the idempotency authority.
+    return result('existing')
+  end
+  if outputIndex ~= cursor.nextOutputIndex then
+    return result('out_of_order', cursor.nextOutputIndex)
+  end
+else
+  if outputIndex ~= 1 then return result('out_of_order', 1) end
+  cursor = {
+    schemaVersion = 1,
+    jobId = job.jobId,
+    senderHash = job.senderHash,
+    threadHash = job.threadHash,
+    outputCount = job.outputCount,
+    releaseStamp = job.releaseStamp,
+    nextOutputIndex = 1,
+    outputs = {},
+    createdAtMs = now,
+    updatedAtMs = now
+  }
+end
+
+-- Existing outputs above remain idempotent after terminalization. A new
+-- output must still bind to the exact live nonterminal job version.
+if (job.state ~= 'executing' and job.state ~= 'ready' and job.state ~= 'delivering')
+  or job.stateVersion ~= expectedJobVersion then return result('unavailable') end
+
+local outboxOk, outbox = pcall(cjson.decode, ARGV[7])
+local encryptedOk, outboxPayload = pcall(cjson.decode, ARGV[8])
+local currentStamp = { generation = currentGeneration, phase = ARGV[12] }
+if not outboxOk or type(outbox) ~= 'table'
+  or not encryptedOk or not encrypted(outboxPayload)
+  or outbox.schemaVersion ~= 3
+  or outbox.outboxId ~= ARGV[6]
+  or outbox.jobId ~= job.jobId
+  or outbox.senderHash ~= job.senderHash
+  or outbox.lane ~= 'job-result'
+  or outbox.resultOutputIndex ~= outputIndex
+  or outbox.sequence ~= outputIndex
+  or outbox.state ~= 'intent'
+  or outbox.attempts ~= 0
+  or outbox.stateVersion ~= 1
+  or outbox.laneIdentity ~= nil
+  or outbox.pendingGuard ~= nil
+  or not nonnegativeInteger(outbox.createdAtMs)
+  or outbox.dueAtMs ~= dueAt
+  or not nonnegativeInteger(outbox.updatedAtMs)
+  or not sameStamp(outbox.releaseStamp, currentStamp) then return result('unavailable') end
+
+local fenceRaw = redis.call('GET', KEYS[7])
+if fenceRaw then
+  local fenceOk, fence = pcall(cjson.decode, fenceRaw)
+  if not fenceOk or not sameStamp(fence, currentStamp) then return result('release_blocked') end
+elseif ARGV[12] ~= 'dark' then
+  return result('release_blocked')
+end
+
+if redis.call('EXISTS', KEYS[3]) == 1
+  or redis.call('EXISTS', KEYS[4]) == 1
+  or #redis.call('ZRANGEBYSCORE', KEYS[6], outputIndex, outputIndex, 'LIMIT', 0, 1) > 0 then
+  return result('unavailable')
+end
+
+table.insert(cursor.outputs, { outputIndex = outputIndex, outboxId = ARGV[6] })
+cursor.nextOutputIndex = outputIndex + 1
+cursor.updatedAtMs = now
+redis.call('SET', KEYS[2], cjson.encode(cursor))
+redis.call('SET', KEYS[3], ARGV[7])
+redis.call('SET', KEYS[4], ARGV[8], 'EX', payloadTtl)
+redis.call('ZADD', KEYS[5], dueAt, ARGV[6])
+redis.call('ZADD', KEYS[6], outputIndex, ARGV[6])
+return result('created')
 `;
 
 const PERSIST_OUTBOX_LUA = `
@@ -3358,7 +4012,8 @@ return 1
 
 const COMPARE_AND_TRANSITION_JOB_LUA = `
 -- AIR_STUDIO_TRANSITION_JOB_V5
--- KEYS: job metadata, encrypted job payload, active sender fence, job-ready index
+-- KEYS: job metadata, encrypted job payload, active sender fence, job-ready
+--       index, durable job-result cursor
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local record = cjson.decode(raw)
@@ -3374,6 +4029,11 @@ if ARGV[7] == '1' then
   -- transition. The value is the fencing identity for this particular job.
   if redis.call('GET', KEYS[3]) == ARGV[6] then redis.call('DEL', KEYS[3]) end
   redis.call('ZREM', KEYS[4], ARGV[6])
+  -- This content-free cursor remains useful for delivery audit and an
+  -- operator-confirmed requeue, but never outlives terminal metadata.
+  if redis.call('EXISTS', KEYS[5]) == 1 then
+    redis.call('EXPIRE', KEYS[5], ARGV[5])
+  end
 else
   redis.call('SET', KEYS[1], cjson.encode(record))
 end
@@ -3785,7 +4445,8 @@ return 1
 const REQUEUE_CONFIRMED_ABSENT_OUTBOX_LUA = `
 -- AIR_STUDIO_REQUEUE_CONFIRMED_ABSENT_OUTBOX_V1
 -- KEYS: source metadata, source payload, replacement metadata, replacement payload,
---       ready index, replacement lane index, shared release fence, audit record
+--       ready index, replacement lane index, shared release fence, audit record,
+--       optional job-result cursor
 -- ARGV: expected source version, expected source outbox id, replacement metadata,
 --       replacement encrypted payload, replacement due time, replacement id,
 --       replacement sequence, release generation, release phase, audit record,
@@ -3803,6 +4464,34 @@ if not replacementOk or type(replacement) ~= 'table'
   or replacement.outboxId ~= ARGV[6]
   or replacement.state ~= 'intent'
   or tonumber(replacement.stateVersion) ~= 1 then return -4 end
+local resultCursor = nil
+local resultCursorTtl = nil
+if source.resultOutputIndex ~= nil then
+  if source.lane ~= 'job-result'
+    or type(source.jobId) ~= 'string'
+    or type(source.resultOutputIndex) ~= 'number'
+    or source.resultOutputIndex < 1
+    or source.resultOutputIndex ~= math.floor(source.resultOutputIndex)
+    or replacement.jobId ~= source.jobId
+    or replacement.lane ~= 'job-result'
+    or replacement.resultOutputIndex ~= source.resultOutputIndex
+    or replacement.sequence ~= source.resultOutputIndex then return -4 end
+  local cursorRaw = redis.call('GET', KEYS[9])
+  local cursorOk
+  cursorOk, resultCursor = pcall(cjson.decode, cursorRaw or '')
+  if not cursorOk or type(resultCursor) ~= 'table'
+    or resultCursor.schemaVersion ~= 1
+    or resultCursor.jobId ~= source.jobId
+    or type(resultCursor.outputs) ~= 'table' then return -4 end
+  local cursorOutput = resultCursor.outputs[source.resultOutputIndex]
+  if type(cursorOutput) ~= 'table'
+    or cursorOutput.outputIndex ~= source.resultOutputIndex
+    or cursorOutput.outboxId ~= source.outboxId then return -1 end
+  resultCursorTtl = redis.call('PTTL', KEYS[9])
+  if resultCursorTtl == -2 then return -4 end
+elseif replacement.resultOutputIndex ~= nil then
+  return -4
+end
 local payloadTtl = redis.call('PTTL', KEYS[2])
 if not payloadTtl or payloadTtl < 1 then return -2 end
 local stamp = replacement.releaseStamp
@@ -3837,6 +4526,15 @@ redis.call('SET', KEYS[4], ARGV[4], 'PX', payloadTtl)
 redis.call('ZADD', KEYS[5], tonumber(ARGV[5]), ARGV[6])
 redis.call('ZREM', KEYS[6], ARGV[2])
 redis.call('ZADD', KEYS[6], tonumber(ARGV[7]), ARGV[6])
+if resultCursor ~= nil then
+  resultCursor.outputs[source.resultOutputIndex].outboxId = ARGV[6]
+  resultCursor.updatedAtMs = tonumber(ARGV[11])
+  if resultCursorTtl and resultCursorTtl > 0 then
+    redis.call('SET', KEYS[9], cjson.encode(resultCursor), 'PX', resultCursorTtl)
+  else
+    redis.call('SET', KEYS[9], cjson.encode(resultCursor))
+  end
+end
 return 1
 `;
 
@@ -3918,18 +4616,187 @@ function parseProviderSubmissionBeginResult(raw: string | null): StudioProviderS
 }
 
 function isExecutionSnapshotForJob(snapshot: StudioExecutionSnapshot, job: StudioJobRecord): boolean {
-  return snapshot.schemaVersion === 1
+  return snapshot.schemaVersion === 2
     && snapshot.workflow.workflowVersion === 1
     && snapshot.workflow.stepId === "provider-generation"
     && isSafeRecordString(snapshot.workflow.workflowId, 160)
     && snapshot.model.slug === job.modelSlug
     && snapshot.model.provider === job.provider
     && isSafeRecordString(snapshot.model.providerModelId, 512)
-    && snapshot.output.count === job.outputCount
-    && (snapshot.output.durationSeconds ?? undefined) === (job.durationSeconds ?? undefined)
+    && isSafeProviderAdapterKey(snapshot.model.adapterKey, job.provider)
+    && isCanonicalSha256Fingerprint(snapshot.model.catalogFingerprint)
+    && isCanonicalSha256Fingerprint(snapshot.model.requestSchemaFingerprint)
+    && isCanonicalSha256Fingerprint(snapshot.model.resultSchemaFingerprint)
+    && isCanonicalSha256Fingerprint(snapshot.model.pricingEvidenceFingerprint)
+    && isSnapshotOutputCompatibleWithJob(snapshot.output, job)
+    && snapshot.maximumQuotedCostCents === job.reservedCents
+    && isSnapshotPollingPolicy(snapshot.polling)
     && isValidReleaseStamp(snapshot.releaseStamp)
     && isValidReleaseStamp(job.releaseStamp)
     && sameReleaseStamp(snapshot.releaseStamp, job.releaseStamp);
+}
+
+const CANONICAL_SHA256_FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
+const SNAPSHOT_PROVIDER_ADAPTER_KEY_PATTERN = /^(?:gmi|fal)\.[a-z0-9]+(?:[.-][a-z0-9]+)*\.v[1-9][0-9]*$/;
+
+function isCanonicalSha256Fingerprint(value: unknown): value is string {
+  return typeof value === "string" && CANONICAL_SHA256_FINGERPRINT_PATTERN.test(value);
+}
+
+function isSafeProviderAdapterKey(value: unknown, provider: StudioJobRecord["provider"]): value is string {
+  return typeof value === "string"
+    && SNAPSHOT_PROVIDER_ADAPTER_KEY_PATTERN.test(value)
+    && value.startsWith(`${provider}.`);
+}
+
+function isSnapshotOutputCompatibleWithJob(
+  output: StudioExecutionSnapshot["output"],
+  job: StudioJobRecord,
+): boolean {
+  if (!isPositiveSafeInteger(output.count) || output.count > 4 || output.count !== job.outputCount) return false;
+  const expectedType = job.mode === "imagine" || job.mode === "edit-image" ? "image" : "video";
+  if (output.type !== expectedType) return false;
+  if (expectedType === "image") return output.durationSeconds === undefined && job.durationSeconds === undefined;
+  return isPositiveSafeInteger(output.durationSeconds ?? 0)
+    && output.durationSeconds === job.durationSeconds;
+}
+
+function isSnapshotPollingPolicy(value: StudioExecutionSnapshot["polling"]): boolean {
+  return isPositiveSafeInteger(value.requestTimeoutMs)
+    && value.requestTimeoutMs >= 1_000
+    && value.requestTimeoutMs <= 900_000
+    && isPositiveSafeInteger(value.pollIntervalMs)
+    && value.pollIntervalMs >= 250
+    && value.pollIntervalMs <= 300_000
+    && isPositiveSafeInteger(value.maxPollAttempts)
+    && value.maxPollAttempts <= 10_000
+    && isPositiveSafeInteger(value.deadlineMs)
+    && value.deadlineMs <= 86_400_000
+    && value.deadlineMs >= value.requestTimeoutMs;
+}
+
+type JobResultPublicationOutcome =
+  | { readonly kind: "created" | "existing" }
+  | { readonly kind: "out_of_order"; readonly expectedOutputIndex: number }
+  | { readonly kind: "release_blocked" | "unavailable" };
+
+function parseJobResultPublication(raw: unknown): JobResultPublicationOutcome {
+  const value = parseStored<{ readonly kind?: unknown; readonly expectedOutputIndex?: unknown }>(
+    typeof raw === "string" ? raw : null,
+  );
+  if (!value || typeof value.kind !== "string") return Object.freeze({ kind: "unavailable" });
+  if (value.kind === "created" || value.kind === "existing" || value.kind === "release_blocked") {
+    return Object.freeze({ kind: value.kind });
+  }
+  if (value.kind === "out_of_order" && typeof value.expectedOutputIndex === "number" && isPositiveSafeInteger(value.expectedOutputIndex)) {
+    return Object.freeze({ kind: "out_of_order", expectedOutputIndex: value.expectedOutputIndex });
+  }
+  return Object.freeze({ kind: "unavailable" });
+}
+
+function isJobResultCursorMetadata(value: unknown): value is StudioJobResultCursorMetadata {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<StudioJobResultCursorMetadata>;
+  if (
+    candidate.schemaVersion !== 1
+    || !isSafeRecordString(candidate.jobId, 160)
+    || !isOpaqueStudioIdentifier(candidate.senderHash)
+    || !isOpaqueStudioIdentifier(candidate.threadHash)
+    || typeof candidate.outputCount !== "number"
+    || !isPositiveSafeInteger(candidate.outputCount)
+    || candidate.outputCount > 4
+    || !isValidReleaseStamp(candidate.releaseStamp)
+    || typeof candidate.nextOutputIndex !== "number"
+    || !isPositiveSafeInteger(candidate.nextOutputIndex)
+    || candidate.nextOutputIndex > candidate.outputCount + 1
+    || !Array.isArray(candidate.outputs)
+    || candidate.outputs.length !== candidate.nextOutputIndex - 1
+    || typeof candidate.createdAtMs !== "number"
+    || !isNonnegativeSafeInteger(candidate.createdAtMs)
+    || typeof candidate.updatedAtMs !== "number"
+    || !isNonnegativeSafeInteger(candidate.updatedAtMs)
+  ) return false;
+  return candidate.outputs.every((output, offset) => {
+    if (!output || typeof output !== "object" || Array.isArray(output)) return false;
+    const result = output as Partial<StudioJobResultCursorOutput>;
+    return result.outputIndex === offset + 1 && isOpaqueStudioIdentifier(result.outboxId);
+  });
+}
+
+function isJobResultPayloadBoundToJob(
+  payload: StudioOutboxPayload,
+  outputIndex: number,
+  jobPayload: StudioJobPayload,
+): boolean {
+  if (
+    payload.kind !== "prepared-output"
+    || payload.outputIndex !== outputIndex
+    || !isStudioPreparedOutput(payload.output)
+  ) return false;
+  const thread = payload.thread;
+  return thread.chatGuid === jobPayload.chatGuid
+    && thread.sendingLine === jobPayload.sendingLine
+    && thread.replyTargetId === jobPayload.replyTargetId;
+}
+
+/**
+ * Reject unknown payload fields at every encrypted-outbox write. This keeps a
+ * prepared Photon output from becoming a generic bag that could retain a
+ * provider URL, filename, byte buffer, or inbound attachment locator.
+ */
+function isStudioOutboxPayload(value: unknown): value is StudioOutboxPayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const payload = value as Record<string, unknown>;
+  if (!isStudioOutboxThread(payload.thread)) return false;
+  switch (payload.kind) {
+    case "text":
+      return hasExactObjectKeys(payload, ["kind", "thread", "text"])
+        && typeof payload.text === "string"
+        && payload.text.length > 0
+        && payload.text.length <= 4_000
+        && !/[\u0000\r]/u.test(payload.text);
+    case "tapback":
+      return hasExactObjectKeys(payload, ["kind", "thread", "targetMessageId"])
+        && isSafeRecordString(payload.targetMessageId, 512);
+    case "prepared-output":
+      return hasExactObjectKeys(payload, ["kind", "thread", "outputIndex", "output"])
+        && typeof payload.outputIndex === "number"
+        && isPositiveSafeInteger(payload.outputIndex)
+        && payload.outputIndex <= 4
+        && isStudioPreparedOutput(payload.output);
+    default:
+      return false;
+  }
+}
+
+function isStudioOutboxThread(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const thread = value as Record<string, unknown>;
+  return hasExactObjectKeys(thread, ["chatGuid", "sendingLine"], ["replyTargetId"])
+    && isSafeRecordString(thread.chatGuid, 512)
+    && isSafeRecordString(thread.sendingLine, 160)
+    && (thread.replyTargetId === undefined || isSafeRecordString(thread.replyTargetId, 512));
+}
+
+function hasExactObjectKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[] = [],
+): boolean {
+  const keys = Object.keys(value);
+  return required.every((key) => Object.hasOwn(value, key))
+    && keys.every((key) => required.includes(key) || optional.includes(key));
+}
+
+function isStudioPreparedOutput(value: unknown): value is StudioPreparedOutput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const output = value as Record<string, unknown>;
+  const keys = Object.keys(output);
+  return keys.length === 2
+    && Object.hasOwn(output, "transport")
+    && Object.hasOwn(output, "attachmentGuid")
+    && output.transport === "photon"
+    && isSafeRecordString(output.attachmentGuid, 4_096);
 }
 
 function isProviderSubrunRecord(value: unknown): value is StudioProviderSubrunRecord {
@@ -4053,7 +4920,8 @@ function isInitialNotificationBoundToJob(
     || thread.sendingLine !== jobPayload.sendingLine
     || thread.replyTargetId !== jobPayload.replyTargetId
   ) return false;
-  return expectedKind === "text" || message.targetMessageId === jobPayload.replyTargetId;
+  return expectedKind === "text"
+    || (message.kind === "tapback" && message.targetMessageId === jobPayload.replyTargetId);
 }
 
 /**
@@ -4181,6 +5049,17 @@ function hasValidAdmissionBounds(input: AdmitStudioJobInput): boolean {
     && isPositiveSafeInteger(job.outputCount)
     && (job.durationSeconds === undefined || isPositiveSafeInteger(job.durationSeconds))
   );
+}
+
+function isValidCanaryBudgetPolicy(
+  value: StudioCanaryBudgetPolicy | undefined,
+): value is StudioCanaryBudgetPolicy {
+  return value !== undefined
+    && value.budgetId.trim().length > 0
+    && value.budgetId.length <= 4_096
+    && !/[\u0000\r\n]/u.test(value.budgetId)
+    && isNonnegativeSafeInteger(value.totalCapCents)
+    && isNonnegativeSafeInteger(value.falCapCents);
 }
 
 function isTerminalJobState(state: StudioJobState): boolean {
