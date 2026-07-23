@@ -169,6 +169,14 @@ function reviewedImagineRegistry(): AirModelRegistry {
         supportedDurationSeconds: [],
         lockedAspectRatio: "1:1",
       },
+      outputRetrieval: {
+        host: "storage.example.test",
+        pathPrefix: "/air-output/",
+        access: "signed-url",
+        publiclyAccessible: false,
+        verifiedAt: "2026-07-18T12:00:00Z",
+        evidenceFingerprint: "sha256:4ba1aa35208012ff19979eb847e0202d89d5e72634ff7bc8d97ed3370461ed4b",
+      },
       requiredPayloadFields: [{ name: "prompt", declaredType: "string", required: true }],
       pricing: {
         source: "https://pricing.example.test/reviewed-gmi-imagine",

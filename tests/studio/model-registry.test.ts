@@ -51,6 +51,14 @@ function verifiedAnimateModel(overrides: Record<string, unknown> = {}) {
       supportedDurationSeconds: [5, 10],
       lockedAspectRatio: "provider-default",
     },
+    outputRetrieval: {
+      host: "storage.example.test",
+      pathPrefix: "/air-output/",
+      access: "signed-url",
+      publiclyAccessible: false,
+      verifiedAt: "2026-07-18T00:00:00Z",
+      evidenceFingerprint: sha256Fixture("verified-test-video-output-retrieval"),
+    },
     requiredPayloadFields: [
       { name: "prompt", declaredType: "string", required: false },
       { name: "durationSeconds", declaredType: "string", required: true },
@@ -226,6 +234,30 @@ describe("Air model registry", () => {
       inputHosting: { mode: "hosted-public", host: "storage.example.test", pathPrefix: "/air-input/" },
     });
     expect(() => registry([publicWithoutAcknowledgement])).toThrow(ModelRegistryValidationError);
+
+    const publiclyRetrievableOutput = verifiedAnimateModel({
+      outputRetrieval: {
+        host: "storage.example.test",
+        pathPrefix: "/air-output/",
+        access: "signed-url",
+        publiclyAccessible: true,
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("public-output-must-not-enable"),
+      },
+    });
+    expect(() => registry([publiclyRetrievableOutput])).toThrow(ModelRegistryValidationError);
+
+    const broadOutputPath = verifiedAnimateModel({
+      outputRetrieval: {
+        host: "storage.example.test",
+        pathPrefix: "/",
+        access: "provider-private",
+        publiclyAccessible: false,
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("broad-output-path-must-not-enable"),
+      },
+    });
+    expect(() => registry([broadOutputPath])).toThrow(ModelRegistryValidationError);
   });
 
   it("requires a reviewed, provider-bound contract and immutable pricing evidence", () => {
@@ -240,6 +272,7 @@ describe("Air model registry", () => {
     });
     expect(Object.isFrozen(model.providerBinding)).toBe(true);
     expect(Object.isFrozen(model.pricing)).toBe(true);
+    expect(Object.isFrozen(model.outputRetrieval)).toBe(true);
     expect(() => {
       (model.providerBinding as { adapterKey: string }).adapterKey = "gmi.other.v1";
     }).toThrow(TypeError);

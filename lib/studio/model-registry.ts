@@ -143,6 +143,39 @@ const hostedPublicInputHostingSchema = z
 
 const inputHostingSchema = z.union([dataUriInputHostingSchema, hostedPublicInputHostingSchema]);
 
+/**
+ * Provider result retrieval is a separate contract from input hosting. A
+ * model can accept a data URI yet return its output from a provider-owned
+ * object store, so the worker needs an exact allowlist before it is ever
+ * permitted to fetch a result. The visibility assertion is deliberately a
+ * literal `false`: Air cannot call itself private while an enabled model's
+ * result contract says the generated object is public.
+ */
+const outputRetrievalSchema = z
+  .object({
+    host: z.string().max(253).regex(HOSTNAME_PATTERN, "must be a hostname"),
+    pathPrefix: z
+      .string()
+      .min(2)
+      .max(512)
+      .refine(
+        (value) =>
+          value.startsWith("/") &&
+          !value.includes("?") &&
+          !value.includes("#") &&
+          !value.includes("\\") &&
+          !value.includes("..") &&
+          !CONTROL_CHARACTER_PATTERN.test(value),
+        "must be a safe absolute path prefix",
+      ),
+    /** Only a reviewed private or signed retrieval contract may be enabled. */
+    access: z.enum(["provider-private", "signed-url"]),
+    publiclyAccessible: z.literal(false),
+    verifiedAt: utcTimestampSchema,
+    evidenceFingerprint: sha256FingerprintSchema,
+  })
+  .strict();
+
 const modelInputSchema = z
   .object({
     prompt: z.enum(MODEL_PROMPT_REQUIREMENTS),
@@ -228,6 +261,8 @@ const modelSchema = z
     input: modelInputSchema,
     inputHosting: inputHostingSchema,
     output: modelOutputSchema,
+    /** Exact policy for fetching provider output before native delivery. */
+    outputRetrieval: outputRetrievalSchema,
     requiredPayloadFields: z.array(providerPayloadFieldSchema).min(1).max(64),
     pricing: pricingSchema,
     polling: pollingSchema,
