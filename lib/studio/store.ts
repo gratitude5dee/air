@@ -1648,21 +1648,37 @@ export class StudioStore {
     leaseToken: string,
     delayMs: number,
   ): Promise<StudioJobRescheduleResult> {
+    if (!Number.isSafeInteger(delayMs) || delayMs < 0 || delayMs > 24 * 60 * 60 * 1_000) return "conflict";
+    const dueAtMs = this.now() + delayMs;
+    if (!Number.isSafeInteger(dueAtMs)) return "conflict";
+    return this.rescheduleClaimedJobAt(job, leaseToken, dueAtMs);
+  }
+
+  /**
+   * Requeues a claimed job at an authoritative provider-supplied due time.
+   * Observation records have their own update clock, so deriving a delay from
+   * `job.updatedAtMs` could postpone a poll far beyond its reviewed cadence.
+   * A past due time is safely made eligible immediately using the store clock.
+   */
+  public async rescheduleClaimedJobAt(
+    job: Pick<StudioJobRecord, "jobId" | "stateVersion">,
+    leaseToken: string,
+    dueAtMs: number,
+  ): Promise<StudioJobRescheduleResult> {
     if (
       !isSafeRecordString(job.jobId, 160)
       || !isSafeRecordString(leaseToken, 256)
       || !Number.isSafeInteger(job.stateVersion)
       || job.stateVersion < 1
-      || !Number.isSafeInteger(delayMs)
-      || delayMs < 0
-      || delayMs > 24 * 60 * 60 * 1_000
+      || !Number.isSafeInteger(dueAtMs)
+      || dueAtMs < 0
     ) return "conflict";
     const now = this.now();
-    const dueAtMs = now + delayMs;
-    if (!Number.isSafeInteger(dueAtMs)) return "conflict";
+    const effectiveDueAtMs = Math.max(now, dueAtMs);
+    if (!Number.isSafeInteger(effectiveDueAtMs)) return "conflict";
     const result = await this.redis.eval(RESCHEDULE_CLAIMED_JOB_LUA, {
       keys: [this.jobKey(job.jobId), this.jobLeaseKey(job.jobId), this.readyJobKey()],
-      arguments: [leaseToken, String(job.stateVersion), String(now), String(dueAtMs), job.jobId],
+      arguments: [leaseToken, String(job.stateVersion), String(now), String(effectiveDueAtMs), job.jobId],
     });
     if (result === 1 || result === "1") return "scheduled";
     if (result === 2 || result === "2") return "removed";

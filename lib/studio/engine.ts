@@ -10,6 +10,7 @@ import {
 import {
   canAcceptStudioJobs,
   canDeliverStudioMessages,
+  canRecoverPaidStudioProvider,
   canSubmitPaidStudioProvider,
 } from "./config.js";
 import {
@@ -40,6 +41,12 @@ import type {
   StudioExecutionSnapshot,
 } from "./store.js";
 import { createStudioJob, isJobQueueEligibleState } from "./store.js";
+import {
+  advanceStudioProviderResultLifecycle,
+  authorizeStudioJobResultDispatch,
+  reconcileStudioJobResultDelivery,
+  type StudioProviderResultLifecycleResult,
+} from "./provider-result-lifecycle.js";
 import { executeStudioProviderSubrun } from "./workflow-executor.js";
 import { getStudioWorkflow, isSinglePaidStepWorkflow } from "./workflows.js";
 
@@ -50,7 +57,7 @@ const MAX_INBOX_PER_DRAIN = 12;
 const MAX_OUTBOX_PER_DRAIN = 16;
 /** Keep one Cron invocation bounded even with many recoverable jobs. */
 const MAX_JOBS_PER_DRAIN = 8;
-/** Accepted provider work is revisited slowly until observation is implemented. */
+/** Default recovery cadence when no provider observation supplies a due time. */
 const JOB_RECHECK_DELAY_MS = 60_000;
 const TYPING_DWELL_MS = 300;
 const MEDIA_FIRST_CORRECTION_DELAY_MS = 500;
@@ -119,6 +126,10 @@ export interface StudioDrainStats {
 export async function drainStudio(runtime: StudioRuntime): Promise<void> {
   await drainStudioWithStats(runtime);
   await drainStudioJobs(runtime);
+  // A webhook-triggered drain can now publish a completed result during the
+  // job phase. Run one bounded second outbox pass so its ordered preamble and
+  // attachment do not need to wait for the next minute Cron.
+  await drainStudioOutbox(runtime);
 }
 
 export async function drainStudioWithStats(runtime: StudioRuntime): Promise<StudioDrainStats> {
@@ -156,10 +167,12 @@ export async function drainStudioWithStats(runtime: StudioRuntime): Promise<Stud
  * reviewed provider adapter must be explicitly active first.
  */
 export async function drainStudioJobs(runtime: StudioRuntime): Promise<number> {
-  // A zero-dollar budget is a hard kill switch even if an operator has
-  // accidentally left a raw provider switch enabled. Do not claim or mutate
-  // a queued job until the explicit paid-provider predicate is satisfied.
-  if (!canSubmitPaidStudioProvider(runtime.environment) || !runtime.provider.verified) return 0;
+  const maySubmit = canSubmitPaidStudioProvider(runtime.environment) && runtime.provider.verified;
+  const mayRecover = canRecoverPaidStudioProvider(runtime.environment) && runtime.provider.verified;
+  // A ready/delivering result contains no provider side effect: retain its
+  // durable recovery loop even during a submit rollback so an already-sent
+  // Photon attachment can reach a truthful terminal job state.
+  if (!maySubmit && !mayRecover && !canDeliverStudioMessages(runtime.environment)) return 0;
 
   let advanced = 0;
   for (let index = 0; index < MAX_JOBS_PER_DRAIN; index += 1) {
@@ -168,8 +181,8 @@ export async function drainStudioJobs(runtime: StudioRuntime): Promise<number> {
     advanced += 1;
 
     try {
-      await executeStudioProviderSubrun(runtime, claim.record.jobId);
-      await rescheduleCurrentJob(runtime, claim.record, claim.lease.token);
+      const lifecycle = await advanceClaimedStudioJob(runtime, claim.record, maySubmit, mayRecover);
+      await rescheduleCurrentJob(runtime, claim.record, claim.lease.token, lifecycle);
     } catch {
       // An internal fault before a physical provider-call outcome is not a
       // reason to terminalize paid work. Leave the durable queue entry in
@@ -191,6 +204,7 @@ async function rescheduleCurrentJob(
   runtime: StudioRuntime,
   claimed: StudioJobRecord,
   leaseToken: string,
+  lifecycle?: StudioProviderResultLifecycleResult | undefined,
 ): Promise<void> {
   // Provider submission and terminal transitions change state/version, so a
   // stale pre-execution record must never decide queue ownership afterward.
@@ -199,7 +213,45 @@ async function rescheduleCurrentJob(
     await runtime.store.removeJobFromQueue(claimed.jobId);
     return;
   }
+  if (lifecycle?.kind === "pending") {
+    await runtime.store.rescheduleClaimedJobAt(current, leaseToken, lifecycle.nextDueAtMs);
+    return;
+  }
   await runtime.store.rescheduleClaimedJob(current, leaseToken, JOB_RECHECK_DELAY_MS);
+}
+
+/**
+ * Submission and recovery deliberately use different gates. A rollback may
+ * close new paid work while retaining a known accepted request's bounded GET
+ * / private-download path, so this dispatcher never turns recovery into a
+ * second submit.
+ */
+async function advanceClaimedStudioJob(
+  runtime: StudioRuntime,
+  claimed: StudioJobRecord,
+  maySubmit: boolean,
+  mayRecover: boolean,
+): Promise<StudioProviderResultLifecycleResult | undefined> {
+  if (claimed.state === "ready" || claimed.state === "delivering") {
+    return await reconcileStudioJobResultDelivery(runtime, claimed.jobId);
+  }
+
+  if (claimed.state === "admitted") {
+    if (!maySubmit) return undefined;
+    await executeStudioProviderSubrun(runtime, claimed.jobId);
+  } else if (claimed.state === "executing" && maySubmit) {
+    // This is still needed for a stale `submitting` boundary: the executor
+    // converts it to reconciliation rather than risking a blind re-submit.
+    await executeStudioProviderSubrun(runtime, claimed.jobId);
+  }
+
+  const current = await runtime.store.getJob(claimed.jobId);
+  if (!current) return undefined;
+  if (current.state === "ready" || current.state === "delivering") {
+    return await reconcileStudioJobResultDelivery(runtime, current.jobId);
+  }
+  if (current.state !== "executing" || !mayRecover) return undefined;
+  return await advanceStudioProviderResultLifecycle(runtime, current.jobId);
 }
 
 /**
@@ -235,6 +287,18 @@ export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number>
     if (outcome === null) continue;
     const finished = await runtime.store.finishOutbox(claim.record.outboxId, claim.leaseToken, outcome.kind);
     if (finished) delivered += 1;
+    if (finished && claim.record.lane === "job-result" && claim.record.jobId !== undefined) {
+      // This does not send anything. It records the durable attachment state
+      // after every terminal/retryable outbox outcome so Cron can recover a
+      // worker crash between a Photon call and its job transition.
+      try {
+        await reconcileStudioJobResultDelivery(runtime, claim.record.jobId);
+      } catch {
+        // The linked job remains in its own durable recovery queue. Never
+        // alter a physical iMessage outcome because this bookkeeping read
+        // failed after the outbox result was already committed.
+      }
+    }
 
     // An uncertain send pauses all further dispatch in this invocation. The
     // store additionally fences the affected lane; this conservative global
@@ -506,6 +570,11 @@ async function handleCommand(
     case "create":
       return handleCreation(runtime, record, envelope, settings, attachment, command.mode, command.prompt);
   }
+  // `parseStudioCommand` supplies a closed union, but keep the ingress worker
+  // fail-closed if a future command reaches this dispatch without an explicit
+  // durable handler. Silently completing its inbox receipt would lose a user
+  // request and make its response non-recoverable.
+  throw new Error("unknown_studio_command");
 }
 
 /**
@@ -1168,6 +1237,15 @@ async function dispatchOutboxEntry(
   leaseToken: string,
   payload: StudioOutboxPayload,
 ): Promise<TransportOutcome | null> {
+  if (record.lane === "job-result") {
+    const authorization = await authorizeStudioJobResultDispatch(runtime, record);
+    if (authorization === "defer") {
+      return Object.freeze({ kind: "retryable_failure", code: "job_result_not_ready" });
+    }
+    if (authorization === "blocked") {
+      return Object.freeze({ kind: "failed", code: "job_result_delivery_blocked" });
+    }
+  }
   const thread: IMessageThreadReference = payload.thread;
   const idempotencyKey = `air-v2-outbox-${record.outboxId}`;
 
