@@ -13,6 +13,11 @@ export const GMI_PROVIDER_AUDIT_MODEL_ID = "flux-kontext-pro";
 /** Keep a manual response small even if a provider adds a huge schema. */
 export const MAX_PROVIDER_AUDIT_PARAMETERS = 32;
 
+// These versions make evidence semantics explicit while keeping every digest
+// independent of the provider's raw, potentially private response payload.
+const CATALOG_EVIDENCE_FORMAT = "air:gmi-catalog-review/v1";
+const SCHEMA_EVIDENCE_FORMAT = "air:gmi-schema-review/v1";
+
 export type StudioProviderAuditDeclaredType =
   | "string"
   | "number"
@@ -96,6 +101,13 @@ export async function handleStudioProviderAudit(
     return privateEmptyResponse(503);
   }
 
+  // A catalog hit alone is not enough: only a detail payload that explicitly
+  // identifies the exact reviewed model is trusted. Never infer identity from
+  // descriptive provider text or nested schema contents.
+  if (!detailIdentifiesExactModel(detail, GMI_PROVIDER_AUDIT_MODEL_ID)) {
+    return privateEmptyResponse(503);
+  }
+
   return Response.json(sanitizeProviderAudit(catalog, detail), {
     headers: { "cache-control": "no-store" },
   });
@@ -105,12 +117,14 @@ export function sanitizeProviderAudit(
   catalog: GmiJsonValue,
   detail: GmiJsonValue,
 ): StudioProviderAuditResponse {
+  const available = catalogContainsExactModel(catalog, GMI_PROVIDER_AUDIT_MODEL_ID);
+  const parameters = Object.freeze(extractSanitizedParameters(detail));
   return Object.freeze({
     modelId: GMI_PROVIDER_AUDIT_MODEL_ID,
-    available: catalogContainsExactModel(catalog, GMI_PROVIDER_AUDIT_MODEL_ID),
-    catalogFingerprint: sha256Fingerprint(catalog),
-    schemaFingerprint: sha256Fingerprint(detail),
-    parameters: Object.freeze(extractSanitizedParameters(detail)),
+    available,
+    catalogFingerprint: catalogEvidenceFingerprint(available),
+    schemaFingerprint: schemaEvidenceFingerprint(parameters),
+    parameters,
     // Public docs are not an authorization to use a price. The account's
     // console must still be reviewed manually before any registry update.
     pricing: "manual_console_required" as const,
@@ -127,7 +141,7 @@ function createGmiProviderAuditClient(input: {
 function catalogContainsExactModel(catalog: GmiJsonValue, modelId: string): boolean {
   const root = object(catalog);
   if (!root) return false;
-  const candidates = [root.models, root.data, root.items];
+  const candidates = [root.model_ids, root.models, root.data, root.items];
   for (const candidate of candidates) {
     if (!Array.isArray(candidate)) continue;
     for (const entry of candidate) {
@@ -142,6 +156,17 @@ function catalogContainsExactModel(catalog: GmiJsonValue, modelId: string): bool
     }
   }
   return false;
+}
+
+function detailIdentifiesExactModel(detail: GmiJsonValue, modelId: string): boolean {
+  const root = object(detail);
+  if (!root) return false;
+  // This is intentionally top-level and exact. Do not accept a matching name,
+  // description, nested field, or substring as provider identity evidence.
+  return root.id === modelId
+    || root.model_id === modelId
+    || root.model === modelId
+    || root.slug === modelId;
 }
 
 function extractSanitizedParameters(detail: GmiJsonValue): StudioProviderAuditParameter[] {
@@ -206,11 +231,26 @@ function boundedUniqueParameters(
 ): StudioProviderAuditParameter[] {
   const selected = new Map<string, StudioProviderAuditParameter>();
   for (const parameter of parameters) {
-    if (!selected.has(parameter.name)) selected.set(parameter.name, parameter);
+    const existing = selected.get(parameter.name);
+    selected.set(parameter.name, existing ? mergeDuplicateParameter(existing, parameter) : parameter);
   }
   return [...selected.values()]
     .sort((left, right) => left.name.localeCompare(right.name))
     .slice(0, MAX_PROVIDER_AUDIT_PARAMETERS);
+}
+
+/** Resolve duplicate provider entries without making raw array order evidence. */
+function mergeDuplicateParameter(
+  left: StudioProviderAuditParameter,
+  right: StudioProviderAuditParameter,
+): StudioProviderAuditParameter {
+  return frozenParameter({
+    name: left.name,
+    // A conflict is not silently favored; the compact review records it as
+    // unknown while preserving only our fixed safe type vocabulary.
+    declaredType: left.declaredType === right.declaredType ? left.declaredType : "unknown",
+    required: left.required || right.required,
+  });
 }
 
 function requiredNames(value: GmiJsonValue | undefined): ReadonlySet<string> {
@@ -246,18 +286,24 @@ function object(value: GmiJsonValue | undefined): GmiJsonObject | undefined {
     : undefined;
 }
 
-/** Stable key ordering means equivalent provider JSON produces the same evidence digest. */
-function sha256Fingerprint(value: GmiJsonValue): string {
-  return `sha256:${createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")}`;
+function catalogEvidenceFingerprint(available: boolean): string {
+  return sha256Evidence(JSON.stringify({
+    format: CATALOG_EVIDENCE_FORMAT,
+    modelId: GMI_PROVIDER_AUDIT_MODEL_ID,
+    available,
+  }));
 }
 
-function canonicalJson(value: GmiJsonValue): string {
-  if (value === null || typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  const objectValue = value as GmiJsonObject;
-  return `{${Object.keys(objectValue).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(objectValue[key]!)}`).join(",")}}`;
+function schemaEvidenceFingerprint(parameters: readonly StudioProviderAuditParameter[]): string {
+  return sha256Evidence(JSON.stringify({
+    format: SCHEMA_EVIDENCE_FORMAT,
+    modelId: GMI_PROVIDER_AUDIT_MODEL_ID,
+    parameters: parameters.map(({ name, declaredType, required }) => ({ name, declaredType, required })),
+  }));
+}
+
+function sha256Evidence(evidence: string): string {
+  return `sha256:${createHash("sha256").update(evidence, "utf8").digest("hex")}`;
 }
 
 function methodNotAllowed(): Response {

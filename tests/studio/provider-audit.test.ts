@@ -143,23 +143,17 @@ describe("read-only protected GMI provider audit", () => {
   it("calls only the exact two approved read methods and returns a bounded sanitized review", async () => {
     const client = clientFixture({
       catalog: {
-        models: [
-          { model_id: GMI_PROVIDER_AUDIT_MODEL_ID, description: `ignore ${PRIVATE_URL}` },
-          { model_id: "other-model", prompt: PRIVATE_PROMPT },
-        ],
+        model_ids: ["other-model", GMI_PROVIDER_AUDIT_MODEL_ID],
         request_id: PRIVATE_REQUEST_ID,
       },
       detail: {
-        model_id: GMI_PROVIDER_AUDIT_MODEL_ID,
-        input_schema: {
-          required: ["prompt"],
-          properties: {
-            prompt: { type: "string", description: PRIVATE_PROMPT },
-            aspect_ratio: { type: "string", default: "16:9", url: PRIVATE_URL },
-            "unsafe name with space": { type: "string" },
-            unsupported_type: { type: "url", example: PRIVATE_URL },
-          },
-        },
+        model: GMI_PROVIDER_AUDIT_MODEL_ID,
+        parameters: [
+          { name: "prompt", type: "string", required: true, description: PRIVATE_PROMPT },
+          { name: "aspect_ratio", type: "string", default: "16:9", url: PRIVATE_URL },
+          { name: "unsafe name with space", type: "string" },
+          { name: "unsupported_type", type: "url", example: PRIVATE_URL },
+        ],
         output: { url: PRIVATE_URL },
         request_id: PRIVATE_REQUEST_ID,
       },
@@ -212,22 +206,89 @@ describe("read-only protected GMI provider audit", () => {
     expect(serialized).not.toContain(PRIVATE_REQUEST_ID);
   });
 
-  it("uses deterministic evidence digests and bounds every allowlisted parameter projection", () => {
-    const manyProperties = Object.fromEntries(Array.from({ length: MAX_PROVIDER_AUDIT_PARAMETERS + 8 }, (_, index) => [
+  it("fails closed when the detail does not explicitly identify the exact reviewed model", async () => {
+    const client = clientFixture({
+      catalog: { model_ids: [GMI_PROVIDER_AUDIT_MODEL_ID] },
+      detail: {
+        model: "other-model",
+        description: `not identity: ${GMI_PROVIDER_AUDIT_MODEL_ID}`,
+        input_schema: { properties: { prompt: { type: "string" } } },
+      },
+    });
+
+    const response = await handleStudioProviderAudit(request(), {
+      loadEnvironment: () => environment(),
+      createClient: () => client,
+    });
+
+    expect(response.status).toBe(503);
+    expect(await response.text()).toBe("");
+    expect(client.listModels).toHaveBeenCalledTimes(1);
+    expect(client.getModelDetail).toHaveBeenCalledTimes(1);
+    expect(client.getModelDetail).toHaveBeenCalledWith(GMI_PROVIDER_AUDIT_MODEL_ID);
+    expect(client.submit).not.toHaveBeenCalled();
+    expect(client.getRequestStatus).not.toHaveBeenCalled();
+    expect(client.createUploadUrl).not.toHaveBeenCalled();
+  });
+
+  it("hashes only minimized safe evidence and bounds every allowlisted parameter projection", () => {
+    const propertyEntries = Array.from({ length: MAX_PROVIDER_AUDIT_PARAMETERS + 8 }, (_, index) => [
       `field_${String(index).padStart(2, "0")}`,
-      { type: index % 2 === 0 ? "string" : "number", private_text: PRIVATE_PROMPT },
-    ]));
+      index % 2 === 0 ? "string" : "number",
+    ] as const);
+    const firstProperties = Object.fromEntries(propertyEntries.map(([name, type]) => [name, {
+      type,
+      private_text: PRIVATE_PROMPT,
+      url: PRIVATE_URL,
+      request_id: PRIVATE_REQUEST_ID,
+    }]));
+    const secondProperties = Object.fromEntries([...propertyEntries].reverse().map(([name, type]) => [name, {
+      type,
+      private_text: "a different private prompt",
+      url: "https://provider.example.test/another-private-output?signature=also-never-return",
+      request_id: "different-provider-request-id",
+      timestamp: "volatile-provider-timestamp",
+    }]));
     const first = sanitizeProviderAudit(
-      { models: [{ id: GMI_PROVIDER_AUDIT_MODEL_ID, url: PRIVATE_URL }], z: "ignored" },
-      { input_schema: { properties: manyProperties }, a: PRIVATE_REQUEST_ID },
+      {
+        model_ids: [GMI_PROVIDER_AUDIT_MODEL_ID, "unrelated-model"],
+        url: PRIVATE_URL,
+        prompt: PRIVATE_PROMPT,
+        request_id: PRIVATE_REQUEST_ID,
+        timestamp: "first-volatile-timestamp",
+      },
+      {
+        model: GMI_PROVIDER_AUDIT_MODEL_ID,
+        input_schema: { properties: firstProperties },
+        output: { url: PRIVATE_URL, prompt: PRIVATE_PROMPT },
+        request_id: PRIVATE_REQUEST_ID,
+        timestamp: "first-volatile-timestamp",
+      },
     );
     const second = sanitizeProviderAudit(
-      { z: "ignored", models: [{ url: PRIVATE_URL, id: GMI_PROVIDER_AUDIT_MODEL_ID }] },
-      { a: PRIVATE_REQUEST_ID, input_schema: { properties: manyProperties } },
+      {
+        model_ids: ["different-unrelated-model", GMI_PROVIDER_AUDIT_MODEL_ID],
+        url: "https://provider.example.test/another-private-catalog-url",
+        prompt: "a different private catalog prompt",
+        request_id: "different-catalog-request-id",
+        timestamp: "second-volatile-timestamp",
+      },
+      {
+        model: GMI_PROVIDER_AUDIT_MODEL_ID,
+        input_schema: { properties: secondProperties },
+        output: { url: "https://provider.example.test/another-private-output" },
+        request_id: "different-provider-request-id",
+        timestamp: "second-volatile-timestamp",
+      },
+    );
+    const unavailable = sanitizeProviderAudit(
+      { model_ids: ["different-unrelated-model"] },
+      { model: GMI_PROVIDER_AUDIT_MODEL_ID, input_schema: { properties: secondProperties } },
     );
 
     expect(first.catalogFingerprint).toBe(second.catalogFingerprint);
     expect(first.schemaFingerprint).toBe(second.schemaFingerprint);
+    expect(first.catalogFingerprint).not.toBe(unavailable.catalogFingerprint);
     expect(first.parameters).toHaveLength(MAX_PROVIDER_AUDIT_PARAMETERS);
     expect(first.parameters[0]?.name).toBe("field_00");
     expect(first.parameters.at(-1)?.name).toBe("field_31");
