@@ -9,7 +9,7 @@ deployment.
 ## Live status
 
 The current direct release is Vercel deployment
-`dpl_D1R2wKXNQdAC7n2wbPsPV8GUgBb5` from `codex/air-direct-studio`, aliased to
+`dpl_5ihyMswovHd4Aymcd6tJ5XtPTeTq` from `codex/air-direct-studio`, aliased to
 [`https://air.wzrd.tech`](https://air.wzrd.tech). Its public health endpoint
 returned `{"ok":true,"version":"2"}` after deployment.
 

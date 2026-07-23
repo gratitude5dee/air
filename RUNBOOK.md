@@ -9,7 +9,7 @@ retrieval, a provider submission, or a generation command.
 
 - Source of truth: `codex/air-direct-studio`. Zap is retained only to drain or
   roll back legacy jobs that it already accepted; it is not a new-work path.
-- Live deployment: `dpl_D1R2wKXNQdAC7n2wbPsPV8GUgBb5`, aliased to
+- Live deployment: `dpl_5ihyMswovHd4Aymcd6tJ5XtPTeTq`, aliased to
   [`https://air.wzrd.tech`](https://air.wzrd.tech).
 - Verified public probe: `GET /healthz` returned `{"ok":true,"version":"2"}`.
 - Vercel has encrypted `GMI_API_KEY` configuration for Preview and Production.
