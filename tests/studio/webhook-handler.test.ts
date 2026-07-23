@@ -158,24 +158,21 @@ describe("Air iMessage webhook", () => {
     expect(persisted.envelope).not.toHaveProperty("messageId");
   });
 
-  it("persists duplicate deliveries but only schedules a drain for a newly created receipt", async () => {
+  it("persists duplicate deliveries without scheduling any ingress drain", async () => {
     configureEnvironment();
     const persistInbox = vi.fn(async (input: PersistInput) => ({
       created: false,
       record: { receiptId: input.receiptId },
     }));
-    const drain = vi.fn(async () => undefined);
     const response = await handleStudioIMessageWebhook(signedRequest(messagePayload()), {
       getRuntime: async () => runtimeWith(persistInbox),
-      drain,
     });
 
     expect(response.status).toBe(200);
     expect(persistInbox).toHaveBeenCalledTimes(1);
-    expect(drain).not.toHaveBeenCalled();
   });
 
-  it("delivers a signed allowlisted /help through the fenced zero-spend path without a network or provider", async () => {
+  it("leaves a signed allowlisted /help for the authoritative Cron drain", async () => {
     configureEnvironment({
       VERCEL_ENV: "production",
       AIR_RELEASE_PHASE: "production",
@@ -237,24 +234,18 @@ describe("Air iMessage webhook", () => {
       readiness: () => [],
       close: async () => undefined,
     };
-    let deferredWork: Promise<unknown> | undefined;
-    const waitUntil = vi.fn((work: Promise<unknown>) => {
-      deferredWork = work;
-    });
-
     const response = await handleStudioIMessageWebhook(
       signedRequest(messagePayload({ messageId: "help-delivery-001", text: "/help" })),
       {
         getRuntime: async () => runtime,
-        drain: drainStudio,
-        waitUntil,
       },
     );
 
     expect(response.status).toBe(200);
-    expect(waitUntil).toHaveBeenCalledTimes(1);
-    if (!deferredWork) throw new Error("expected the durable drain to be scheduled");
-    await deferredWork;
+    expect(sendText).not.toHaveBeenCalled();
+    expect(submit).not.toHaveBeenCalled();
+
+    await drainStudio(runtime);
 
     const sentTexts = sendText.mock.calls.map(([, text]) => text);
     const welcomeOne = "Hey — I’m Air by WZRD ⚡ Your image + video studio in iMessage.";

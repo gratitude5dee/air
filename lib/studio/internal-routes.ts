@@ -31,6 +31,12 @@ export async function handleStudioDrain(
   drain: StudioDrain,
   options: StudioInternalRouteOptions = {},
 ): Promise<Response> {
+  // Only Vercel's Cron GET and the documented operator POST may make the
+  // durable drain progress. A bearer credential must not turn an arbitrary
+  // HTTP method into a side-effecting recovery entrypoint.
+  if (request.method !== "GET" && request.method !== "POST") {
+    return methodNotAllowedResponse("GET, POST");
+  }
   const environment = loadAuthorizedEnvironment(request, options);
   if (environment === "unauthorized") return privateEmptyResponse(401);
   if (environment === "unavailable") return privateEmptyResponse(503);

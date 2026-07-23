@@ -1,16 +1,11 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { StudioRuntime } from "../../lib/studio/runtime.js";
-import type { WebhookHandlerOptions } from "../../lib/studio/webhook-handler.js";
 
 const mocks = vi.hoisted(() => ({
-  drainStudio: vi.fn<(runtime: StudioRuntime) => Promise<void>>(),
-  handleStudioIMessageWebhook: vi.fn<(
-    request: Request,
-    options: WebhookHandlerOptions,
-  ) => Promise<Response>>(),
-  waitUntil: vi.fn<(work: Promise<unknown>) => void>(),
+  drainStudio: vi.fn(),
+  handleStudioIMessageWebhook: vi.fn<(request: Request) => Promise<Response>>(),
+  waitUntil: vi.fn(),
 }));
 
 vi.mock("@vercel/functions", () => ({ waitUntil: mocks.waitUntil }));
@@ -44,25 +39,16 @@ describe("Vercel iMessage webhook bridge", () => {
     vi.clearAllMocks();
   });
 
-  it("registers the post-receipt drain with Vercel's supported waitUntil hook", async () => {
+  it("calls the receipt-only handler without scheduling drain work", async () => {
     const response = nodeResponse();
-    const drainWork = Promise.resolve();
-    mocks.handleStudioIMessageWebhook.mockImplementation(async (_request, options) => {
-      options.waitUntil?.(drainWork);
-      return new Response(null, { status: 200 });
-    });
+    mocks.handleStudioIMessageWebhook.mockResolvedValue(new Response(null, { status: 200 }));
 
     await handler(nodeRequest(), response);
 
     expect(mocks.handleStudioIMessageWebhook).toHaveBeenCalledTimes(1);
-    expect(mocks.handleStudioIMessageWebhook).toHaveBeenCalledWith(
-      expect.any(Request),
-      expect.objectContaining({
-        drain: mocks.drainStudio,
-        waitUntil: mocks.waitUntil,
-      }),
-    );
-    expect(mocks.waitUntil).toHaveBeenCalledWith(drainWork);
+    expect(mocks.handleStudioIMessageWebhook).toHaveBeenCalledWith(expect.any(Request));
+    expect(mocks.drainStudio).not.toHaveBeenCalled();
+    expect(mocks.waitUntil).not.toHaveBeenCalled();
     expect(response.statusCode).toBe(200);
   });
 });

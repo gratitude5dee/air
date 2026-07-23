@@ -16,8 +16,6 @@ import type { StudioInboundEnvelope } from "./store.js";
 
 export interface WebhookHandlerOptions {
   readonly getRuntime?: (() => Promise<StudioRuntime>) | undefined;
-  readonly waitUntil?: ((work: Promise<unknown>) => void) | undefined;
-  readonly drain?: ((runtime: StudioRuntime) => Promise<void>) | undefined;
 }
 
 /**
@@ -137,17 +135,12 @@ export async function handleStudioIMessageWebhook(
     })),
   });
   try {
-    const persisted = await runtime.store.persistInbox({
+    await runtime.store.persistInbox({
       receiptId: runtime.store.receiptId(normalized.projectId, normalized.messageId),
       senderHash,
       threadHash,
       envelope,
     });
-    if (persisted.created && options.drain) {
-      const work = options.drain(runtime).catch(() => undefined);
-      if (options.waitUntil) options.waitUntil(work);
-      else void work;
-    }
   } catch {
     return new Response(null, { status: 503 });
   }

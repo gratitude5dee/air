@@ -101,6 +101,27 @@ describe("Studio Vercel internal routes", () => {
     expect(drain).not.toHaveBeenCalled();
   });
 
+  it("rejects unsupported drain methods before loading configuration or running work", async () => {
+    const loadEnvironment = vi.fn(darkEnvironment);
+    const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
+    const drain = vi.fn(async () => undefined);
+    const response = await handleStudioDrain(
+      new Request("https://air.example.test/internal/drain-inbox", {
+        method: "PUT",
+        headers: { authorization: "Bearer cron-secret" },
+      }),
+      drain,
+      { loadEnvironment, getRuntime },
+    );
+
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("GET, POST");
+    expect(await response.text()).toBe("");
+    expect(loadEnvironment).not.toHaveBeenCalled();
+    expect(getRuntime).not.toHaveBeenCalled();
+    expect(drain).not.toHaveBeenCalled();
+  });
+
   it("does not create a runtime for an unauthenticated readiness request", async () => {
     const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
     const response = await handleStudioReadiness(
