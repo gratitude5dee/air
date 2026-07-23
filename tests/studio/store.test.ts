@@ -1951,15 +1951,53 @@ describe("Air v2 studio durable store", () => {
     advance(90_001);
     const recoveryLease = await store.acquireJobResultPreparationLease(created.jobId, 1);
     if (!recoveryLease) throw new Error("expected recovered upload lease");
-    const recoveredJob = await store.getJob(created.jobId);
-    if (!recoveredJob) throw new Error("expected recovery job");
-    await expect(store.beginJobResultPreparation(recoveredJob, 1, recoveryLease.token))
+    await expect(store.recoverExpiredJobResultPreparation(created.jobId, 1, recoveryLease.token))
       .resolves.toMatchObject({ kind: "upload_unknown", preparation: { state: "upload_unknown" } });
 
     await expect(store.getPreparedJobResultOutput(created.jobId, 1)).resolves.toBeNull();
     await expect(store.getJobResultPreparation(created.jobId, 1)).resolves.toMatchObject({ state: "upload_unknown" });
     await expect(store.getJob(created.jobId)).resolves.toMatchObject({ state: "reconciliation_required" });
     await expect(store.publishPreparedJobResult(created.jobId, 1)).resolves.toEqual({ kind: "unavailable" });
+  });
+
+  it("keeps reserved and prepared Photon preparations inert in recovery-only mode", async () => {
+    const { store, cipher, now, releaseStamp } = await activeCanaryFixture();
+    const { senderHash, threadHash } = identities();
+    const created = job(cipher, senderHash, threadHash, "recovery-only-preparation", now(), releaseStamp);
+    const executing = await admitAndExecute(store, created);
+
+    await expect(store.ensureJobResultPreparation(created.jobId, 1)).resolves.toMatchObject({ state: "reserved" });
+    const reservedLease = await store.acquireJobResultPreparationLease(created.jobId, 1);
+    if (!reservedLease) throw new Error("expected reserved recovery lease");
+    try {
+      await expect(store.recoverExpiredJobResultPreparation(created.jobId, 1, reservedLease.token))
+        .resolves.toMatchObject({ kind: "reserved", preparation: { state: "reserved", stateVersion: 1 } });
+      await expect(store.getJob(created.jobId)).resolves.toMatchObject({ state: "executing" });
+    } finally {
+      await reservedLease.release();
+    }
+
+    const uploadLease = await store.acquireJobResultPreparationLease(created.jobId, 1);
+    if (!uploadLease) throw new Error("expected upload lease");
+    await expect(store.beginJobResultPreparation(executing, 1, uploadLease.token)).resolves.toMatchObject({ kind: "ready" });
+    await expect(store.finishJobResultPreparation(executing, 1, uploadLease.token, {
+      kind: "prepared",
+      output: { transport: "photon", attachmentGuid: "recovery-only-prepared-guid" },
+    })).resolves.toMatchObject({ kind: "prepared" });
+
+    const preparedLease = await store.acquireJobResultPreparationLease(created.jobId, 1);
+    if (!preparedLease) throw new Error("expected prepared recovery lease");
+    try {
+      await expect(store.recoverExpiredJobResultPreparation(created.jobId, 1, preparedLease.token))
+        .resolves.toMatchObject({ kind: "prepared", preparation: { state: "prepared" } });
+      await expect(store.getPreparedJobResultOutput(created.jobId, 1)).resolves.toEqual({
+        transport: "photon",
+        attachmentGuid: "recovery-only-prepared-guid",
+      });
+      await expect(store.getJob(created.jobId)).resolves.toMatchObject({ state: "executing" });
+    } finally {
+      await preparedLease.release();
+    }
   });
 
   it("persists an uploaded Photon GUID before cursor publication, then recovers without another upload", async () => {
@@ -2112,6 +2150,42 @@ describe("Air v2 studio durable store", () => {
     await expect(store.finishProviderObservation(subrun.subrunId, lease.token, { kind: "succeeded" }))
       .resolves.toMatchObject({ kind: "canceled", observation: { state: "canceled" } });
     await expect(store.getProviderSubrun(subrun.subrunId)).resolves.toMatchObject({ state: "submitted" });
+  });
+
+  it("persists an opaque provider failure disposition atomically with its terminal observation", async () => {
+    const reconciliationSetup = await activeCanaryFixture();
+    const { store, redis, prefix } = reconciliationSetup;
+    const { snapshot, subrun } = await submittedProviderSubrun(reconciliationSetup, "observation-reconciliation-disposition");
+    await expect(store.ensureProviderObservation(subrun, snapshot)).resolves.toBeTruthy();
+    const lease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!lease) throw new Error("expected reconciliation observation lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, lease.token)).resolves.toMatchObject({ kind: "ready" });
+    await expect(store.finishProviderObservation(subrun.subrunId, lease.token, {
+      kind: "failed",
+      failureDisposition: "reconciliation_required",
+    })).resolves.toMatchObject({
+      kind: "failed",
+      observation: { state: "failed", failureDisposition: "reconciliation_required" },
+    });
+    await expect(store.getProviderObservation(subrun.subrunId)).resolves.toMatchObject({
+      state: "failed",
+      failureDisposition: "reconciliation_required",
+    });
+    const observation = await store.getProviderObservation(subrun.subrunId);
+    if (!observation) throw new Error("expected terminal reconciliation observation");
+    const raw = await redis.get(`${prefix}:provider-observation:${observation.observationId}`);
+    expect(raw ?? "").toContain("reconciliation_required");
+    expect(raw ?? "").not.toContain("private-provider-request-observation-reconciliation-disposition");
+
+    const defaultSetup = await activeCanaryFixture();
+    const defaultSubrun = await submittedProviderSubrun(defaultSetup, "observation-default-failure-disposition");
+    await expect(defaultSetup.store.ensureProviderObservation(defaultSubrun.subrun, defaultSubrun.snapshot)).resolves.toBeTruthy();
+    const defaultLease = await defaultSetup.store.acquireProviderObservationLease(defaultSubrun.subrun.subrunId);
+    if (!defaultLease) throw new Error("expected default observation lease");
+    await expect(defaultSetup.store.beginProviderObservation(defaultSubrun.subrun.subrunId, defaultLease.token))
+      .resolves.toMatchObject({ kind: "ready" });
+    await expect(defaultSetup.store.finishProviderObservation(defaultSubrun.subrun.subrunId, defaultLease.token, { kind: "failed" }))
+      .resolves.toMatchObject({ kind: "failed", observation: { failureDisposition: "failed" } });
   });
 
   it("expires a due observation at its immutable deadline without starting a provider GET", async () => {

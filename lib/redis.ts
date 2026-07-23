@@ -1187,6 +1187,9 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_BEGIN_JOB_RESULT_PREPARATION_V1")) {
       return this.evalStudioBeginJobResultPreparation(options.keys, options.arguments);
     }
+    if (script.includes("AIR_STUDIO_RECOVER_EXPIRED_JOB_RESULT_PREPARATION_V1")) {
+      return this.evalStudioRecoverExpiredJobResultPreparation(options.keys, options.arguments);
+    }
     if (script.includes("AIR_STUDIO_FINISH_JOB_RESULT_PREPARATION_V1")) {
       return this.evalStudioFinishJobResultPreparation(options.keys, options.arguments);
     }
@@ -1247,7 +1250,7 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_BEGIN_PROVIDER_OBSERVATION_V1")) {
       return this.evalStudioBeginProviderObservation(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_FINISH_PROVIDER_OBSERVATION_V1")) {
+    if (script.includes("AIR_STUDIO_FINISH_PROVIDER_OBSERVATION_V2")) {
       return this.evalStudioFinishProviderObservation(options.keys, options.arguments);
     }
     if (script.includes("AIR_STUDIO_FINALIZE_PREPARED_PROVIDER_RESULT_V1")) {
@@ -1657,6 +1660,70 @@ export class MemoryRedis implements RedisLike {
       preparation.updatedAtMs = now;
       this.studioSetPersistentRecord(preparationKey, preparation);
       return response("ready");
+    } catch {
+      return unavailable();
+    }
+  }
+
+  /**
+   * Mirrors the recovery-only stale-upload fence. It intentionally has no
+   * authorization path from `reserved` to `uploading` and never touches a
+   * provider artifact or Photon output.
+   */
+  private evalStudioRecoverExpiredJobResultPreparation(keys: readonly string[], args: readonly string[]): string {
+    const unavailable = (): string => JSON.stringify({ kind: "unavailable" });
+    try {
+      this.assertStudioArity(keys, args, 5, 4);
+      const preparationKey = this.studioKey(keys, 0);
+      const referenceKey = this.studioKey(keys, 1);
+      const leaseKey = this.studioKey(keys, 2);
+      const jobKey = this.studioKey(keys, 3);
+      const readyJobKey = this.studioKey(keys, 4);
+      const token = this.studioArgument(args, 0);
+      const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
+      const jobId = this.studioArgument(args, 2);
+      const outputIndex = this.studioPositiveInteger(this.studioArgument(args, 3));
+      if (!this.studioSafeText(jobId, 160) || outputIndex > 4) return unavailable();
+      this.assertStringOrMissing(preparationKey);
+      this.assertStringOrMissing(referenceKey);
+      this.assertStringOrMissing(leaseKey);
+      this.assertStringOrMissing(jobKey);
+      this.assertZSetOrMissing(readyJobKey);
+      if (this.studioString(leaseKey) !== token) return JSON.stringify({ kind: "lease_lost" });
+
+      const preparation = this.studioJobResultPreparation(preparationKey);
+      if (
+        preparation === null
+        || preparation === "invalid"
+        || preparation.jobId !== jobId
+        || preparation.outputIndex !== outputIndex
+      ) return unavailable();
+      const response = (kind: string): string => JSON.stringify({ kind, preparation });
+      if (preparation.state !== "uploading") return response(preparation.state as string);
+
+      const job = this.studioRecordFailClosed(jobKey);
+      const jobCanReconcile = Boolean(
+        job
+        && job.jobId === jobId
+        && (job.state === "executing" || job.state === "ready" || job.state === "delivering")
+        && typeof job.stateVersion === "number"
+        && Number.isSafeInteger(job.stateVersion)
+        && job.stateVersion >= 1,
+      );
+      preparation.state = "upload_unknown";
+      preparation.stateVersion = this.studioStateVersion(preparation) + 1;
+      preparation.updatedAtMs = now;
+      this.studioSetPersistentRecord(preparationKey, preparation);
+      this.values.delete(referenceKey);
+      this.values.delete(leaseKey);
+      if (jobCanReconcile && job) {
+        job.state = "reconciliation_required";
+        job.stateVersion = (job.stateVersion as number) + 1;
+        job.updatedAtMs = now;
+        this.studioSetPersistentRecord(jobKey, job);
+        this.studioRemoveMember(readyJobKey, jobId);
+      }
+      return response("upload_unknown");
     } catch {
       return unavailable();
     }
@@ -3099,7 +3166,7 @@ export class MemoryRedis implements RedisLike {
   private evalStudioFinishProviderObservation(keys: readonly string[], args: readonly string[]): string {
     const unavailable = (): string => JSON.stringify({ kind: "unavailable" });
     try {
-      this.assertStudioArity(keys, args, 4, 7);
+      this.assertStudioArity(keys, args, 4, 8);
       const observationKey = this.studioKey(keys, 0);
       const leaseKey = this.studioKey(keys, 1);
       const subrunKey = this.studioKey(keys, 2);
@@ -3111,6 +3178,11 @@ export class MemoryRedis implements RedisLike {
       const observationId = this.studioArgument(args, 4);
       const subrunId = this.studioArgument(args, 5);
       const jobId = this.studioArgument(args, 6);
+      const failureDisposition = this.studioArgument(args, 7);
+      if (
+        (outcome === "failed" && failureDisposition !== "failed" && failureDisposition !== "reconciliation_required")
+        || (outcome !== "failed" && failureDisposition !== "")
+      ) return unavailable();
       if (this.studioString(leaseKey) !== token) return JSON.stringify({ kind: "lease_lost" });
       const observation = this.studioProviderObservation(observationKey);
       if (
@@ -3122,8 +3194,10 @@ export class MemoryRedis implements RedisLike {
         || observation.state !== "observing"
       ) return unavailable();
       const response = (kind: string): string => JSON.stringify({ kind, observation });
-      const terminal = (kind: string, state: string): string => {
+      const terminal = (kind: string, state: string, disposition?: string): string => {
         observation.state = state;
+        if (state === "failed") observation.failureDisposition = disposition;
+        else delete observation.failureDisposition;
         observation.stateVersion = this.studioStateVersion(observation) + 1;
         observation.updatedAtMs = now;
         this.studioSetRecord(observationKey, observation, terminalTtl);
@@ -3148,7 +3222,7 @@ export class MemoryRedis implements RedisLike {
       );
       if (!subrunValid || !jobValid) return terminal("canceled", "canceled");
       if (outcome === "succeeded") return terminal("succeeded", "succeeded");
-      if (outcome === "failed") return terminal("failed", "failed");
+      if (outcome === "failed") return terminal("failed", "failed", failureDisposition);
       if (outcome !== "pending") return unavailable();
       if (now >= (observation.deadlineAtMs as number)) return terminal("deadline_exceeded", "deadline_exceeded");
       if ((observation.pollAttempts as number) >= (observation.maxPollAttempts as number)) {
@@ -3961,6 +4035,7 @@ export class MemoryRedis implements RedisLike {
     const record = this.studioRecordFailClosed(key);
     if (record === null) return null;
     const state = record.state;
+    const failureDisposition = record.failureDisposition;
     const pollAttempts = record.pollAttempts;
     const maxPollAttempts = record.maxPollAttempts;
     const requestTimeoutMs = record.requestTimeoutMs;
@@ -3986,6 +4061,11 @@ export class MemoryRedis implements RedisLike {
         && state !== "attempts_exhausted"
         && state !== "reference_expired"
         && state !== "canceled")
+      || (state === "failed"
+        ? (failureDisposition !== undefined
+          && failureDisposition !== "failed"
+          && failureDisposition !== "reconciliation_required")
+        : failureDisposition !== undefined)
       || typeof pollAttempts !== "number"
       || !Number.isSafeInteger(pollAttempts)
       || pollAttempts < 0

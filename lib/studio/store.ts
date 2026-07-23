@@ -136,6 +136,18 @@ export type StudioJobResultPreparationFinishResult =
   | { readonly kind: "upload_unknown"; readonly preparation: StudioJobResultPreparationRecord }
   | { readonly kind: "lease_lost" | "unavailable" };
 
+/**
+ * A recovery worker may own a newly acquired preparation lease after an
+ * uploader died. This primitive deliberately never starts an upload: it only
+ * turns the pre-existing ambiguous `uploading` boundary into reconciliation.
+ */
+export type StudioJobResultPreparationRecoveryResult =
+  | {
+      readonly kind: "reserved" | "prepared" | "upload_unknown" | "failed" | "canceled";
+      readonly preparation: StudioJobResultPreparationRecord;
+    }
+  | { readonly kind: "lease_lost" | "unavailable" };
+
 /** Stored encrypted. No prompt, phone, GUID, or media bytes is visible in Redis metadata. */
 export interface StudioInboundEnvelope {
   readonly chatGuid: string;
@@ -342,6 +354,18 @@ export const STUDIO_PROVIDER_OBSERVATION_STATES = Object.freeze([
 export type StudioProviderObservationState = (typeof STUDIO_PROVIDER_OBSERVATION_STATES)[number];
 
 /**
+ * Opaque terminal intent for an observed provider failure. It distinguishes a
+ * definitive provider rejection from a result that must be audited instead of
+ * being silently collapsed into a failed paid job.
+ */
+export const STUDIO_PROVIDER_OBSERVATION_FAILURE_DISPOSITIONS = Object.freeze([
+  "failed",
+  "reconciliation_required",
+] as const);
+export type StudioProviderObservationFailureDisposition =
+  (typeof STUDIO_PROVIDER_OBSERVATION_FAILURE_DISPOSITIONS)[number];
+
+/**
  * Content-free durable polling control plane for one known provider request.
  * The immutable state-version fences bind this record to the exact submitted
  * subrun and executing job it was created for. The provider request ID stays
@@ -357,6 +381,8 @@ export interface StudioProviderObservationRecord {
   /** The exact executing job state this poller may observe. */
   readonly jobStateVersion: number;
   readonly state: StudioProviderObservationState;
+  /** Present only for `state: "failed"`; legacy missing values mean `failed`. */
+  readonly failureDisposition?: StudioProviderObservationFailureDisposition | undefined;
   /** Counted before each physical provider GET, including a crashed attempt. */
   readonly pollAttempts: number;
   readonly maxPollAttempts: number;
@@ -394,7 +420,11 @@ export type StudioProviderObservationBeginResult =
 export type StudioProviderObservationFinishOutcome =
   | { readonly kind: "pending" }
   | { readonly kind: "succeeded" }
-  | { readonly kind: "failed" };
+  | {
+      readonly kind: "failed";
+      /** Omitted by older callers and normalized durably to `failed`. */
+      readonly failureDisposition?: StudioProviderObservationFailureDisposition | undefined;
+    };
 
 export type StudioProviderObservationFinishResult =
   | {
@@ -2056,6 +2086,7 @@ export class StudioStore {
         observationId,
         subrunId,
         observation.jobId,
+        outcome.kind === "failed" ? outcome.failureDisposition ?? "failed" : "",
       ],
     });
     return parseProviderObservationFinishResult(typeof result === "string" ? result : null);
@@ -2126,6 +2157,38 @@ export class StudioStore {
       now: this.now,
       ttlMs: LEASE_TTL_MS,
     });
+  }
+
+  /**
+   * Resolves only the stale pre-upload crash boundary under a preparation
+   * lease that the caller has already acquired. A live uploader keeps that
+   * lease, so this method can never turn `reserved` into `uploading` or make a
+   * Photon call. If it finds an old `uploading` marker, the physical upload is
+   * ambiguous and the active job is atomically fenced into reconciliation.
+   */
+  public async recoverExpiredJobResultPreparation(
+    jobId: string,
+    outputIndex: number,
+    leaseToken: string,
+  ): Promise<StudioJobResultPreparationRecoveryResult> {
+    if (
+      !isSafeRecordString(jobId, 160)
+      || !isPositiveSafeInteger(outputIndex)
+      || outputIndex > 4
+      || !isSafeRecordString(leaseToken, 256)
+    ) return Object.freeze({ kind: "unavailable" });
+    const preparationId = this.jobResultPreparationId(jobId, outputIndex);
+    const result = await this.redis.eval(RECOVER_EXPIRED_JOB_RESULT_PREPARATION_LUA, {
+      keys: [
+        this.jobResultPreparationKey(preparationId),
+        this.jobResultPreparationReferenceKey(preparationId),
+        this.jobResultPreparationLeaseKey(preparationId),
+        this.jobKey(jobId),
+        this.readyJobKey(),
+      ],
+      arguments: [leaseToken, String(this.now()), jobId, String(outputIndex)],
+    });
+    return parseJobResultPreparationRecoveryResult(typeof result === "string" ? result : null);
   }
 
   /**
@@ -5203,6 +5266,9 @@ local function validObservation(record)
     and positiveInteger(record.stateVersion)
     and nonnegativeInteger(record.createdAtMs)
     and nonnegativeInteger(record.updatedAtMs)
+    and ((record.state == 'failed' and (record.failureDisposition == nil
+      or record.failureDisposition == 'failed' or record.failureDisposition == 'reconciliation_required'))
+      or (record.state ~= 'failed' and record.failureDisposition == nil))
 end
 if redis.call('GET', KEYS[2]) ~= ARGV[1] then return cjson.encode({ kind = 'lease_lost' }) end
 local raw = redis.call('GET', KEYS[1])
@@ -5220,6 +5286,7 @@ local function persistPersistent()
 end
 local function terminal(kind, state)
   observation.state = state
+  observation.failureDisposition = nil
   observation.stateVersion = observation.stateVersion + 1
   observation.updatedAtMs = tonumber(ARGV[2])
   redis.call('SET', KEYS[1], cjson.encode(observation), 'EX', ARGV[3])
@@ -5288,11 +5355,12 @@ return response('ready')
 `;
 
 const FINISH_PROVIDER_OBSERVATION_LUA = `
--- AIR_STUDIO_FINISH_PROVIDER_OBSERVATION_V1
+-- AIR_STUDIO_FINISH_PROVIDER_OBSERVATION_V2
 -- KEYS: opaque observation metadata, short observation lease, provider subrun
 --       metadata, job metadata
 -- ARGV: lease token, pending|succeeded|failed, now, terminal metadata ttl,
---       expected observation id, expected subrun id, expected job id
+--       expected observation id, expected subrun id, expected job id,
+--       failed|reconciliation_required disposition (only for failed)
 local function nonnegativeInteger(value)
   return type(value) == 'number' and value >= 0 and value == math.floor(value)
 end
@@ -5330,6 +5398,13 @@ local function validObservation(record)
     and positiveInteger(record.stateVersion)
     and nonnegativeInteger(record.createdAtMs)
     and nonnegativeInteger(record.updatedAtMs)
+    and ((record.state == 'failed' and (record.failureDisposition == nil
+      or record.failureDisposition == 'failed' or record.failureDisposition == 'reconciliation_required'))
+      or (record.state ~= 'failed' and record.failureDisposition == nil))
+end
+if (ARGV[2] == 'failed' and ARGV[8] ~= 'failed' and ARGV[8] ~= 'reconciliation_required')
+  or (ARGV[2] ~= 'failed' and ARGV[8] ~= '') then
+  return cjson.encode({ kind = 'unavailable' })
 end
 if redis.call('GET', KEYS[2]) ~= ARGV[1] then return cjson.encode({ kind = 'lease_lost' }) end
 local raw = redis.call('GET', KEYS[1])
@@ -5346,8 +5421,13 @@ end
 local function persistPersistent()
   redis.call('SET', KEYS[1], cjson.encode(observation))
 end
-local function terminal(kind, state)
+local function terminal(kind, state, failureDisposition)
   observation.state = state
+  if state == 'failed' then
+    observation.failureDisposition = failureDisposition
+  else
+    observation.failureDisposition = nil
+  end
   observation.stateVersion = observation.stateVersion + 1
   observation.updatedAtMs = tonumber(ARGV[3])
   redis.call('SET', KEYS[1], cjson.encode(observation), 'EX', ARGV[4])
@@ -5383,7 +5463,7 @@ local jobValid = job ~= nil
 if not subrunValid or not jobValid then return terminal('canceled', 'canceled') end
 
 if ARGV[2] == 'succeeded' then return terminal('succeeded', 'succeeded') end
-if ARGV[2] == 'failed' then return terminal('failed', 'failed') end
+if ARGV[2] == 'failed' then return terminal('failed', 'failed', ARGV[8]) end
 if ARGV[2] ~= 'pending' then return cjson.encode({ kind = 'unavailable' }) end
 
 local now = tonumber(ARGV[3])
@@ -5484,6 +5564,9 @@ local function validObservation(value)
     and positive(value.pollIntervalMs) and value.pollIntervalMs >= 250 and value.pollIntervalMs <= 300000
     and nonnegative(value.deadlineAtMs) and nonnegative(value.nextDueAtMs) and value.nextDueAtMs <= value.deadlineAtMs
     and positive(value.stateVersion) and nonnegative(value.createdAtMs) and nonnegative(value.updatedAtMs)
+    and ((value.state == 'failed' and (value.failureDisposition == nil
+      or value.failureDisposition == 'failed' or value.failureDisposition == 'reconciliation_required'))
+      or (value.state ~= 'failed' and value.failureDisposition == nil))
 end
 local function validPreparation(value, jobId)
   return type(value) == 'table' and value.schemaVersion == 1 and opaque(value.preparationId)
@@ -5632,6 +5715,98 @@ redis.call('SET', KEYS[4], cjson.encode(job))
 -- so a crash after finalization cannot strand the ordered outbox lifecycle.
 redis.call('ZADD', KEYS[15], now, job.jobId)
 return response('finalized')
+`;
+
+const RECOVER_EXPIRED_JOB_RESULT_PREPARATION_LUA = `
+-- AIR_STUDIO_RECOVER_EXPIRED_JOB_RESULT_PREPARATION_V1
+-- KEYS: opaque preparation metadata/reference/lease, job metadata, ready jobs
+-- ARGV: recovered lease token, now, job id, output index
+local function keyType(key)
+  local response = redis.call('TYPE', key)
+  return response and response.ok or ''
+end
+local function stringOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'string'
+end
+local function zsetOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'zset'
+end
+local function positive(value)
+  return type(value) == 'number' and value >= 1 and value == math.floor(value)
+end
+local function nonnegative(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+local function opaque(value)
+  return type(value) == 'string' and #value == 64 and string.match(value, '^[a-f0-9]+$') ~= nil
+end
+local function text(value, maximum)
+  return type(value) == 'string' and #value >= 1 and #value <= maximum
+    and string.match(value, '^%s') == nil and string.match(value, '%s$') == nil
+    and string.find(value, '[%z\r\n]') == nil
+end
+local function parse(key)
+  local raw = redis.call('GET', key)
+  if not raw then return nil end
+  local ok, value = pcall(cjson.decode, raw)
+  if not ok or type(value) ~= 'table' then return false end
+  return value
+end
+local function response(kind, preparation)
+  return cjson.encode({ kind = kind, preparation = preparation })
+end
+local function validPreparation(value, jobId, outputIndex)
+  return type(value) == 'table' and value.schemaVersion == 1 and opaque(value.preparationId)
+    and value.jobId == jobId and value.outputIndex == outputIndex
+    and (value.state == 'reserved' or value.state == 'uploading' or value.state == 'prepared'
+      or value.state == 'upload_unknown' or value.state == 'failed' or value.state == 'canceled')
+    and positive(value.stateVersion) and nonnegative(value.createdAtMs) and nonnegative(value.updatedAtMs)
+end
+
+local now = tonumber(ARGV[2])
+local outputIndex = tonumber(ARGV[4])
+if not text(ARGV[1], 256) or not nonnegative(now) or not text(ARGV[3], 160)
+  or not positive(outputIndex) or outputIndex > 4 then
+  return cjson.encode({ kind = 'unavailable' })
+end
+if not stringOrMissing(KEYS[1]) or not stringOrMissing(KEYS[2]) or not stringOrMissing(KEYS[3])
+  or not stringOrMissing(KEYS[4]) or not zsetOrMissing(KEYS[5]) then
+  return cjson.encode({ kind = 'unavailable' })
+end
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return cjson.encode({ kind = 'lease_lost' }) end
+
+local preparation = parse(KEYS[1])
+if preparation == false or not validPreparation(preparation, ARGV[3], outputIndex) then
+  return cjson.encode({ kind = 'unavailable' })
+end
+
+-- This recovery primitive has no upload authorization branch. In particular,
+-- 'reserved' remains reserved; only an already-recorded 'uploading' state can
+-- become terminally ambiguous after its former lease expired.
+if preparation.state ~= 'uploading' then
+  return response(preparation.state, preparation)
+end
+
+preparation.state = 'upload_unknown'
+preparation.stateVersion = preparation.stateVersion + 1
+preparation.updatedAtMs = now
+redis.call('SET', KEYS[1], cjson.encode(preparation))
+redis.call('DEL', KEYS[2])
+redis.call('DEL', KEYS[3])
+
+local job = parse(KEYS[4])
+if job ~= false and type(job) == 'table' and job.jobId == ARGV[3]
+  and (job.state == 'executing' or job.state == 'ready' or job.state == 'delivering')
+  and positive(job.stateVersion) then
+  job.state = 'reconciliation_required'
+  job.stateVersion = job.stateVersion + 1
+  job.updatedAtMs = now
+  redis.call('SET', KEYS[4], cjson.encode(job))
+  redis.call('ZREM', KEYS[5], ARGV[3])
+end
+return response('upload_unknown', preparation)
 `;
 
 const BEGIN_JOB_RESULT_PREPARATION_LUA = `
@@ -6209,6 +6384,26 @@ function parseProviderObservationFinishResult(raw: string | null): StudioProvide
   }
 }
 
+function parseJobResultPreparationRecoveryResult(
+  raw: string | null,
+): StudioJobResultPreparationRecoveryResult {
+  const parsed = parseStored<{ readonly kind?: unknown; readonly preparation?: unknown }>(raw);
+  if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
+  if (parsed.kind === "lease_lost" || parsed.kind === "unavailable") return Object.freeze({ kind: parsed.kind });
+  if (!isJobResultPreparationRecord(parsed.preparation)) return Object.freeze({ kind: "unavailable" });
+  const preparation = Object.freeze(parsed.preparation);
+  switch (parsed.kind) {
+    case "reserved":
+    case "prepared":
+    case "upload_unknown":
+    case "failed":
+    case "canceled":
+      return Object.freeze({ kind: parsed.kind, preparation });
+    default:
+      return Object.freeze({ kind: "unavailable" });
+  }
+}
+
 function parsePreparedProviderResultFinalizeResult(
   raw: string | null,
 ): Extract<StudioPreparedProviderResultFinalizeResult, { readonly kind: string }> {
@@ -6539,6 +6734,10 @@ function isProviderSubrunRecord(value: unknown): value is StudioProviderSubrunRe
 function isProviderObservationRecord(value: unknown): value is StudioProviderObservationRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Partial<StudioProviderObservationRecord>;
+  const hasValidFailureDisposition = record.failureDisposition === undefined
+    || STUDIO_PROVIDER_OBSERVATION_FAILURE_DISPOSITIONS.includes(
+      record.failureDisposition as StudioProviderObservationFailureDisposition,
+    );
   return record.schemaVersion === 1
     && isOpaqueStudioIdentifier(record.observationId)
     && isOpaqueStudioIdentifier(record.subrunId)
@@ -6570,13 +6769,25 @@ function isProviderObservationRecord(value: unknown): value is StudioProviderObs
     && typeof record.createdAtMs === "number"
     && isNonnegativeSafeInteger(record.createdAtMs)
     && typeof record.updatedAtMs === "number"
-    && isNonnegativeSafeInteger(record.updatedAtMs);
+    && isNonnegativeSafeInteger(record.updatedAtMs)
+    && hasValidFailureDisposition
+    && (record.state === "failed" || record.failureDisposition === undefined);
 }
 
 function isProviderObservationFinishOutcome(value: unknown): value is StudioProviderObservationFinishOutcome {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const outcome = value as { readonly kind?: unknown };
-  return outcome.kind === "pending" || outcome.kind === "succeeded" || outcome.kind === "failed";
+  const outcome = value as {
+    readonly kind?: unknown;
+    readonly failureDisposition?: unknown;
+  };
+  if (outcome.kind === "failed") {
+    return outcome.failureDisposition === undefined
+      || STUDIO_PROVIDER_OBSERVATION_FAILURE_DISPOSITIONS.includes(
+        outcome.failureDisposition as StudioProviderObservationFailureDisposition,
+      );
+  }
+  return (outcome.kind === "pending" || outcome.kind === "succeeded")
+    && outcome.failureDisposition === undefined;
 }
 
 function isReconciliationAuditRecord(value: unknown): value is StudioReconciliationAuditRecord {
