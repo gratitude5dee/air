@@ -519,6 +519,56 @@ describe("private provider result lifecycle", () => {
     }
   });
 
+  it("recovers an expired Photon upload marker into reconciliation without another provider or Photon call", async () => {
+    const setup = await fixture();
+    const job = await submitAccepted(setup, "expired-upload-marker-reconciles");
+    await expect(setup.store.ensureJobResultPreparation(job.jobId, 1)).resolves.toMatchObject({ state: "reserved" });
+    const uploadLease = await setup.store.acquireJobResultPreparationLease(job.jobId, 1);
+    if (!uploadLease) throw new Error("expected upload lease");
+    await expect(setup.store.beginJobResultPreparation(job, 1, uploadLease.token))
+      .resolves.toMatchObject({ kind: "ready", preparation: { state: "uploading" } });
+
+    // The original uploader died after the durable upload-start marker. A
+    // recovered preparation lease must classify that side effect as ambiguous,
+    // not leave the job `busy` forever and not re-open either physical path.
+    setup.advance(90_001);
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId))
+      .resolves.toEqual({ kind: "reconciliation_required" });
+
+    expect(setup.provider.observe).not.toHaveBeenCalled();
+    expect(setup.transport.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+    await expect(setup.store.getJobResultPreparation(job.jobId, 1))
+      .resolves.toMatchObject({ state: "upload_unknown" });
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "reconciliation_required" });
+  });
+
+  it("maps a persisted reconciliation failure disposition to reconciliation, not job failure", async () => {
+    const setup = await fixture();
+    const job = await submitAccepted(setup, "persisted-reconciliation-failure");
+    const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
+    if (!subrun) throw new Error("expected submitted subrun");
+    const payload = setup.store.decryptJobPayload(job);
+    if (!payload.execution) throw new Error("expected execution snapshot");
+    await expect(setup.store.ensureProviderObservation(subrun, payload.execution)).resolves.toBeTruthy();
+    const observationLease = await setup.store.acquireProviderObservationLease(subrun.subrunId);
+    if (!observationLease) throw new Error("expected observation lease");
+    await expect(setup.store.beginProviderObservation(subrun.subrunId, observationLease.token))
+      .resolves.toMatchObject({ kind: "ready" });
+    await expect(setup.store.finishProviderObservation(subrun.subrunId, observationLease.token, {
+      kind: "failed",
+      failureDisposition: "reconciliation_required",
+    })).resolves.toMatchObject({
+      kind: "failed",
+      observation: { state: "failed", failureDisposition: "reconciliation_required" },
+    });
+
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId))
+      .resolves.toEqual({ kind: "reconciliation_required" });
+    expect(setup.provider.observe).not.toHaveBeenCalled();
+    expect(setup.transport.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "reconciliation_required" });
+  });
+
   it("does not terminalize a job when a terminal provider result loses its observation lease", async () => {
     const setup = await fixture();
     const job = await submitAccepted(setup, "lost-observation-lease-terminal-result");
