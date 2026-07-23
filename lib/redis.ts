@@ -1250,6 +1250,9 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_FINISH_PROVIDER_OBSERVATION_V1")) {
       return this.evalStudioFinishProviderObservation(options.keys, options.arguments);
     }
+    if (script.includes("AIR_STUDIO_FINALIZE_PREPARED_PROVIDER_RESULT_V1")) {
+      return this.evalStudioFinalizePreparedProviderResult(options.keys, options.arguments);
+    }
     if (script.includes("AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V2")) {
       return this.evalStudioAttachProviderRequestReconciliation(options.keys, options.arguments);
     }
@@ -2849,7 +2852,12 @@ export class MemoryRedis implements RedisLike {
       return 2;
     }
     if (this.studioStateVersion(record) !== expectedVersion) return 0;
-    if (record.state !== "admitted" && record.state !== "executing") {
+    if (
+      record.state !== "admitted"
+      && record.state !== "executing"
+      && record.state !== "ready"
+      && record.state !== "delivering"
+    ) {
       this.studioRemoveMember(readyKey, jobId);
       this.values.delete(leaseKey);
       return 2;
@@ -3158,6 +3166,278 @@ export class MemoryRedis implements RedisLike {
       this.studioSetPersistentRecord(observationKey, observation);
       this.values.delete(leaseKey);
       return response("pending");
+    } catch {
+      return unavailable();
+    }
+  }
+
+  /** Mirrors the all-or-nothing provider success → result-delivery commit. */
+  private evalStudioFinalizePreparedProviderResult(keys: readonly string[], args: readonly string[]): string {
+    const unavailable = (): string => JSON.stringify({ kind: "unavailable" });
+    const response = (kind: "finalized" | "existing" | "lease_lost" | "release_blocked" | "payload_expiring" | "unavailable"): string =>
+      JSON.stringify({ kind });
+    try {
+      this.assertStudioArity(keys, args, 16, 14);
+      const observationKey = this.studioKey(keys, 0);
+      const observationLeaseKey = this.studioKey(keys, 1);
+      const subrunKey = this.studioKey(keys, 2);
+      const jobKey = this.studioKey(keys, 3);
+      const jobPayloadKey = this.studioKey(keys, 4);
+      const preparationKey = this.studioKey(keys, 5);
+      const preparationReferenceKey = this.studioKey(keys, 6);
+      const cursorKey = this.studioKey(keys, 7);
+      const preambleKey = this.studioKey(keys, 8);
+      const preamblePayloadKey = this.studioKey(keys, 9);
+      const attachmentKey = this.studioKey(keys, 10);
+      const attachmentPayloadKey = this.studioKey(keys, 11);
+      const readyOutboxKey = this.studioKey(keys, 12);
+      const resultLaneKey = this.studioKey(keys, 13);
+      const readyJobKey = this.studioKey(keys, 14);
+      const releaseFenceKey = this.studioKey(keys, 15);
+      const leaseToken = this.studioArgument(args, 0);
+      const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
+      const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 2));
+      const observationId = this.studioArgument(args, 3);
+      const subrunId = this.studioArgument(args, 4);
+      const jobId = this.studioArgument(args, 5);
+      const preambleId = this.studioArgument(args, 6);
+      const attachmentId = this.studioArgument(args, 7);
+      const preambleMetadata = this.studioArgument(args, 8);
+      const preamblePayload = this.studioArgument(args, 9);
+      const attachmentMetadata = this.studioArgument(args, 10);
+      const attachmentPayload = this.studioArgument(args, 11);
+      const releaseGeneration = this.studioNonnegativeInteger(this.studioArgument(args, 12));
+      const releasePhase = this.studioArgument(args, 13);
+      if (
+        !this.studioSafeText(leaseToken, 256)
+        || !isMemoryOpaqueStudioIdentifier(observationId)
+        || !isMemoryOpaqueStudioIdentifier(subrunId)
+        || !this.studioSafeText(jobId, 160)
+        || !isMemoryOpaqueStudioIdentifier(preambleId)
+        || !isMemoryOpaqueStudioIdentifier(attachmentId)
+        || (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production")
+      ) return unavailable();
+      this.assertStringOrMissing(observationKey);
+      this.assertStringOrMissing(observationLeaseKey);
+      this.assertStringOrMissing(subrunKey);
+      this.assertStringOrMissing(jobKey);
+      this.assertStringOrMissing(jobPayloadKey);
+      this.assertStringOrMissing(preparationKey);
+      this.assertStringOrMissing(preparationReferenceKey);
+      this.assertStringOrMissing(cursorKey);
+      this.assertStringOrMissing(preambleKey);
+      this.assertStringOrMissing(preamblePayloadKey);
+      this.assertStringOrMissing(attachmentKey);
+      this.assertStringOrMissing(attachmentPayloadKey);
+      this.assertZSetOrMissing(readyOutboxKey);
+      this.assertZSetOrMissing(resultLaneKey);
+      this.assertZSetOrMissing(readyJobKey);
+      this.assertStringOrMissing(releaseFenceKey);
+      if (this.studioString(observationLeaseKey) !== leaseToken) return response("lease_lost");
+
+      const observation = this.studioProviderObservation(observationKey);
+      const subrun = this.studioRecordFailClosed(subrunKey);
+      const job = this.studioRecordFailClosed(jobKey);
+      if (
+        observation === null
+        || observation === "invalid"
+        || !subrun
+        || !job
+        || observation.observationId !== observationId
+        || observation.subrunId !== subrunId
+        || observation.jobId !== jobId
+        || subrun.subrunId !== subrunId
+        || subrun.jobId !== jobId
+        || subrun.state !== "submitted"
+        || job.jobId !== jobId
+        || job.outputCount !== 1
+        || !this.studioValidReleaseStamp(job.releaseStamp)
+        || this.studioStateVersion(subrun) !== observation.subrunStateVersion
+        || !this.studioSameReleaseStamp(subrun.releaseStamp, job.releaseStamp)
+      ) return unavailable();
+      const observedJobStateVersion = observation.jobStateVersion;
+      if (
+        typeof observedJobStateVersion !== "number"
+        || !Number.isSafeInteger(observedJobStateVersion)
+        || observedJobStateVersion < 1
+      ) return unavailable();
+
+      const validOutbox = (
+        value: Record<string, unknown> | null,
+        outboxId: string,
+        sequence: number,
+        resultOutputIndex: number | undefined,
+        requireNew: boolean,
+      ): boolean => {
+        if (
+          !value
+          || value.schemaVersion !== 3
+          || value.outboxId !== outboxId
+          || value.jobId !== jobId
+          || value.senderHash !== job.senderHash
+          || value.lane !== "job-result"
+          || value.sequence !== sequence
+          || typeof value.attempts !== "number"
+          || !Number.isSafeInteger(value.attempts)
+          || value.attempts < 0
+          || typeof value.stateVersion !== "number"
+          || !Number.isSafeInteger(value.stateVersion)
+          || value.stateVersion < 1
+          || value.laneIdentity !== undefined
+          || value.pendingGuard !== undefined
+          || typeof value.createdAtMs !== "number"
+          || !Number.isSafeInteger(value.createdAtMs)
+          || value.createdAtMs < 0
+          || typeof value.dueAtMs !== "number"
+          || !Number.isSafeInteger(value.dueAtMs)
+          || value.dueAtMs < 0
+          || typeof value.updatedAtMs !== "number"
+          || !Number.isSafeInteger(value.updatedAtMs)
+          || value.updatedAtMs < 0
+          || !this.studioValidReleaseStamp(value.releaseStamp)
+        ) return false;
+        if (resultOutputIndex === undefined) {
+          if (value.resultOutputIndex !== undefined) return false;
+        } else if (value.resultOutputIndex !== resultOutputIndex) return false;
+        if (!requireNew) {
+          return value.state === "intent" || value.state === "sending" || value.state === "sent"
+            || value.state === "retryable_failure" || value.state === "failed" || value.state === "canceled"
+            || value.state === "send_unknown" || value.state === "confirmed_absent" || value.state === "requeued";
+        }
+        if (
+          value.state !== "intent"
+          || value.attempts !== 0
+          || value.stateVersion !== 1
+          || value.terminalReason !== undefined
+          || !this.studioSameReleaseStamp(value.releaseStamp, { generation: releaseGeneration, phase: releasePhase })
+        ) return false;
+        const allowed = resultOutputIndex === undefined
+          ? new Set([
+            "schemaVersion", "outboxId", "jobId", "senderHash", "lane", "sequence", "state",
+            "attempts", "stateVersion", "releaseStamp", "createdAtMs", "dueAtMs", "updatedAtMs",
+          ])
+          : new Set([
+            "schemaVersion", "outboxId", "jobId", "resultOutputIndex", "senderHash", "lane",
+            "sequence", "state", "attempts", "stateVersion", "releaseStamp", "createdAtMs",
+            "dueAtMs", "updatedAtMs",
+          ]);
+        return Object.keys(value).every((key) => allowed.has(key));
+      };
+
+      // Existing is deliberately strict: no half-written cursor, preamble, or
+      // observation may be mistaken for a successful result after a crash.
+      if (
+        observation.state === "succeeded"
+        && job.state === "ready"
+        && this.studioStateVersion(job) === observedJobStateVersion + 1
+      ) {
+        const cursor = this.studioResultCursor(cursorKey);
+        const preamble = this.studioRecordFailClosed(preambleKey);
+        const attachment = this.studioRecordFailClosed(attachmentKey);
+        const cursorMatches = cursor !== null
+          && cursor !== "invalid"
+          && cursor.jobId === jobId
+          && cursor.senderHash === job.senderHash
+          && cursor.threadHash === job.threadHash
+          && cursor.outputCount === 1
+          && cursor.nextOutputIndex === 2
+          && cursor.outputs.length === 1
+          && cursor.outputs[0]?.outputIndex === 1
+          && cursor.outputs[0]?.outboxId === attachmentId
+          && this.studioSameReleaseStamp(cursor.releaseStamp, job.releaseStamp);
+        if (
+          cursorMatches
+          && validOutbox(preamble, preambleId, 0, undefined, false)
+          && validOutbox(attachment, attachmentId, 1, 1, false)
+          && this.studioSameReleaseStamp(preamble?.releaseStamp, attachment?.releaseStamp)
+        ) return response("existing");
+        return unavailable();
+      }
+
+      if (
+        (observation.state !== "scheduled" && observation.state !== "observing")
+        || job.state !== "executing"
+        || this.studioStateVersion(job) !== observedJobStateVersion
+      ) return unavailable();
+      const preparation = this.studioJobResultPreparation(preparationKey);
+      const preparedReference = this.studioString(preparationReferenceKey);
+      const jobPayload = this.studioString(jobPayloadKey);
+      if (
+        preparation === null
+        || preparation === "invalid"
+        || preparation.jobId !== jobId
+        || preparation.outputIndex !== 1
+        || preparation.state !== "prepared"
+        || preparedReference === null
+        || jobPayload === null
+        || !this.studioEncryptedPayloadFromJson(preparedReference)
+        || !this.studioEncryptedPayloadFromJson(jobPayload)
+      ) return unavailable();
+      const jobPayloadTtl = this.studioRemainingTtl(jobPayloadKey);
+      const preparedReferenceTtl = this.studioRemainingTtl(preparationReferenceKey);
+      if (jobPayloadTtl < 1 || preparedReferenceTtl < 1) return response("payload_expiring");
+      if ((releasePhase !== "canary" && releasePhase !== "production") || releaseGeneration < 1) {
+        return response("release_blocked");
+      }
+      const fence = this.studioReleaseFence(releaseFenceKey);
+      if (
+        fence === null
+        || fence === "invalid"
+        || fence.generation !== releaseGeneration
+        || fence.phase !== releasePhase
+      ) return response("release_blocked");
+      if (
+        this.getEntry(cursorKey)
+        || this.getEntry(preambleKey)
+        || this.getEntry(preamblePayloadKey)
+        || this.getEntry(attachmentKey)
+        || this.getEntry(attachmentPayloadKey)
+        || [...(this.getZSet(resultLaneKey, false)?.value.values() ?? [])].some((score) => score === 0 || score === 1)
+      ) return unavailable();
+      const preamble = this.studioRecordFailClosedFromRaw(preambleMetadata);
+      const attachment = this.studioRecordFailClosedFromRaw(attachmentMetadata);
+      if (
+        !preamble
+        || !attachment
+        || !this.studioEncryptedPayloadFromJson(preamblePayload)
+        || !this.studioEncryptedPayloadFromJson(attachmentPayload)
+        || !validOutbox(preamble, preambleId, 0, undefined, true)
+        || !validOutbox(attachment, attachmentId, 1, 1, true)
+      ) return unavailable();
+
+      const deliveryTtl = Math.min(jobPayloadTtl, preparedReferenceTtl);
+      const cursor = {
+        schemaVersion: 1,
+        jobId,
+        senderHash: job.senderHash,
+        threadHash: job.threadHash,
+        outputCount: 1,
+        releaseStamp: job.releaseStamp,
+        nextOutputIndex: 2,
+        outputs: [{ outputIndex: 1, outboxId: attachmentId }],
+        createdAtMs: now,
+        updatedAtMs: now,
+      };
+      observation.state = "succeeded";
+      observation.stateVersion = this.studioStateVersion(observation) + 1;
+      observation.updatedAtMs = now;
+      job.state = "ready";
+      job.stateVersion = this.studioStateVersion(job) + 1;
+      job.updatedAtMs = now;
+      this.studioSetPersistentRecord(cursorKey, cursor);
+      this.studioSetPersistentRecord(preambleKey, preamble);
+      this.studioSet(preamblePayloadKey, preamblePayload, deliveryTtl);
+      this.studioSetPersistentRecord(attachmentKey, attachment);
+      this.studioSet(attachmentPayloadKey, attachmentPayload, deliveryTtl);
+      this.getZSet(readyOutboxKey, true).value.set(preambleId, preamble.dueAtMs as number);
+      this.getZSet(readyOutboxKey, true).value.set(attachmentId, attachment.dueAtMs as number);
+      this.getZSet(resultLaneKey, true).value.set(preambleId, 0);
+      this.getZSet(resultLaneKey, true).value.set(attachmentId, 1);
+      this.studioSetRecord(observationKey, observation, terminalTtl);
+      this.values.delete(observationLeaseKey);
+      this.studioSetPersistentRecord(jobKey, job);
+      this.getZSet(readyJobKey, true).value.set(jobId, now);
+      return response("finalized");
     } catch {
       return unavailable();
     }

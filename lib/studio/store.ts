@@ -611,6 +611,35 @@ export type StudioJobResultPublishResult =
   | { readonly kind: "release_blocked" }
   | { readonly kind: "unavailable" };
 
+/**
+ * The single text bubble which is durably ordered immediately before Air's
+ * first native result attachment. It is encrypted in the outbox payload;
+ * the plaintext never belongs in Redis metadata.
+ */
+export const STUDIO_RESULT_PREAMBLE_TEXT = "Here’s your result:";
+
+/**
+ * The coherent state committed by the provider-result finalizer. Both
+ * outboxes are persistent intents, so callers must still let the existing
+ * delivery worker perform the physical iMessage sends in sequence.
+ */
+export interface StudioPreparedProviderResultFinalization {
+  readonly job: StudioJobRecord;
+  readonly observation: StudioProviderObservationRecord;
+  readonly preamble: StudioOutboxRecord;
+  readonly attachment: StudioOutboxRecord;
+  readonly cursor: StudioJobResultCursor;
+}
+
+/**
+ * A provider result is only final once its native Photon GUID has already
+ * crossed the upload-to-Redis boundary. The finalizer never accepts provider
+ * bytes, URLs, or request IDs from a caller.
+ */
+export type StudioPreparedProviderResultFinalizeResult =
+  | ({ readonly kind: "finalized" | "existing" } & StudioPreparedProviderResultFinalization)
+  | { readonly kind: "lease_lost" | "release_blocked" | "payload_expiring" | "unavailable" };
+
 /** Opaque capability bound to one pending-assembly fencing transition. */
 export interface PendingWriteGuard {
   readonly threadHash: ThreadHash;
@@ -1767,6 +1796,19 @@ export class StudioStore {
   }
 
   /**
+   * Looks up Air's one deterministic provider subrun for a job without ever
+   * opening its encrypted provider-request reference. A mismatched/corrupt
+   * record is unavailable rather than being treated as a different job's
+   * provider capability.
+   */
+  public async getProviderSubrunForJob(jobId: string): Promise<StudioProviderSubrunRecord | null> {
+    if (!isSafeRecordString(jobId, 160)) return null;
+    const subrunId = deriveOpaqueId(this.secret, "studio-provider-subrun", jobId);
+    const subrun = await this.getProviderSubrun(subrunId);
+    return subrun?.jobId === jobId ? subrun : null;
+  }
+
+  /**
    * A lease spans only the bounded provider call. The final write verifies the
    * token atomically, so a late worker can never overwrite a newer recovery
    * decision after its lease has expired.
@@ -2252,6 +2294,163 @@ export class StudioStore {
     });
   }
 
+  /**
+   * Atomically turns one already-prepared native Photon output into Air's
+   * first result-delivery bundle. This is deliberately the only success path
+   * which advances a provider observation: it proves the same submitted
+   * subrun/executing-job fences that authorized the GET, records the text
+   * preamble and attachment together, then marks the job ready.
+   *
+   * The method receives no provider material. It opens only the encrypted
+   * Photon GUID that a prior upload transaction has already committed, and
+   * writes that GUID back only inside the attachment's encrypted outbox
+   * payload. A crash after that upload but before this call can therefore
+   * recover from a `scheduled` or `observing` observation without a second
+   * provider request, poll, or upload.
+   */
+  public async finalizePreparedProviderResult(
+    subrunId: string,
+    observationLeaseToken: string,
+  ): Promise<StudioPreparedProviderResultFinalizeResult> {
+    if (!isOpaqueStudioIdentifier(subrunId) || !isSafeRecordString(observationLeaseToken, 256)) {
+      return Object.freeze({ kind: "unavailable" });
+    }
+
+    const existing = await this.readPreparedProviderResultFinalization(subrunId);
+    const subrun = await this.getProviderSubrun(subrunId);
+    if (!subrun) return Object.freeze({ kind: "unavailable" });
+    const job = await this.getJob(subrun.jobId);
+    if (!job || job.jobId !== subrun.jobId) return Object.freeze({ kind: "unavailable" });
+    const observation = await this.getProviderObservation(subrunId);
+    if (!observation || observation.jobId !== subrun.jobId) return Object.freeze({ kind: "unavailable" });
+
+    const preambleId = this.jobResultPreambleOutboxId(subrun.jobId);
+    const attachmentId = this.jobResultOutboxId(subrun.jobId, 1);
+    let preambleMetadata = "";
+    let preamblePayload = "";
+    let attachmentMetadata = "";
+    let attachmentPayload = "";
+
+    if (!existing) {
+      if (
+        job.state !== "executing"
+        || job.outputCount !== 1
+        || !job.encryptedPayload
+      ) return Object.freeze({ kind: "unavailable" });
+
+      const preparation = await this.getJobResultPreparation(job.jobId, 1);
+      const output = await this.getPreparedJobResultOutput(job.jobId, 1);
+      if (!output) {
+        // Distinguish a known privacy-lifetime expiry from a malformed or
+        // unavailable prepared reference without exposing either value.
+        if (preparation?.state === "prepared") {
+          const [jobPayloadTtl, preparedReferenceTtl] = await Promise.all([
+            this.redis.pttl(this.jobPayloadKey(job.jobId)),
+            this.redis.pttl(this.jobResultPreparationReferenceKey(preparation.preparationId)),
+          ]);
+          if (jobPayloadTtl < 1 || preparedReferenceTtl < 1) {
+            return Object.freeze({ kind: "payload_expiring" });
+          }
+        }
+        return Object.freeze({ kind: "unavailable" });
+      }
+
+      let payload: StudioJobPayload;
+      try {
+        payload = this.decryptJobPayload(job);
+      } catch {
+        return Object.freeze({ kind: "payload_expiring" });
+      }
+      const thread = Object.freeze({
+        chatGuid: payload.chatGuid,
+        sendingLine: payload.sendingLine,
+        ...(payload.replyTargetId === undefined ? {} : { replyTargetId: payload.replyTargetId }),
+      });
+      try {
+        const preamble = this.buildOutboxRecord({
+          outboxId: preambleId,
+          jobId: job.jobId,
+          senderHash: job.senderHash,
+          lane: "job-result",
+          sequence: 0,
+          payload: Object.freeze({
+            kind: "text" as const,
+            text: STUDIO_RESULT_PREAMBLE_TEXT,
+            thread,
+          }),
+        });
+        const attachment = this.buildOutboxRecord({
+          outboxId: attachmentId,
+          jobId: job.jobId,
+          resultOutputIndex: 1,
+          senderHash: job.senderHash,
+          lane: "job-result",
+          sequence: 1,
+          payload: Object.freeze({
+            kind: "prepared-output" as const,
+            outputIndex: 1,
+            output,
+            thread,
+          }),
+        }, undefined, undefined, true);
+        preambleMetadata = JSON.stringify(outboxMetadata(preamble));
+        preamblePayload = JSON.stringify(requiredOutboxPayload(preamble));
+        attachmentMetadata = JSON.stringify(outboxMetadata(attachment));
+        attachmentPayload = JSON.stringify(requiredOutboxPayload(attachment));
+      } catch {
+        return Object.freeze({ kind: "unavailable" });
+      }
+    }
+
+    const result = await this.redis.eval(FINALIZE_PREPARED_PROVIDER_RESULT_LUA, {
+      keys: [
+        this.providerObservationKey(observation.observationId),
+        this.providerObservationLeaseKey(observation.observationId),
+        this.providerSubrunKey(subrunId),
+        this.jobKey(subrun.jobId),
+        this.jobPayloadKey(subrun.jobId),
+        this.jobResultPreparationKey(this.jobResultPreparationId(subrun.jobId, 1)),
+        this.jobResultPreparationReferenceKey(this.jobResultPreparationId(subrun.jobId, 1)),
+        this.jobResultCursorKey(subrun.jobId),
+        this.outboxKey(preambleId),
+        this.outboxPayloadKey(preambleId),
+        this.outboxKey(attachmentId),
+        this.outboxPayloadKey(attachmentId),
+        this.readyOutboxKey(),
+        this.outboxLaneKey({
+          outboxId: preambleId,
+          jobId: subrun.jobId,
+          senderHash: job.senderHash,
+          lane: "job-result",
+        }),
+        this.readyJobKey(),
+        this.releaseFenceKey(),
+      ],
+      arguments: [
+        observationLeaseToken,
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        observation.observationId,
+        subrunId,
+        subrun.jobId,
+        preambleId,
+        attachmentId,
+        preambleMetadata,
+        preamblePayload,
+        attachmentMetadata,
+        attachmentPayload,
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+      ],
+    });
+    const outcome = parsePreparedProviderResultFinalizeResult(typeof result === "string" ? result : null);
+    if (outcome.kind !== "finalized" && outcome.kind !== "existing") return outcome;
+    const finalization = await this.readPreparedProviderResultFinalization(subrunId);
+    return finalization
+      ? Object.freeze({ kind: outcome.kind, ...finalization })
+      : Object.freeze({ kind: "unavailable" });
+  }
+
   /** Read the encrypted provider reference only when a bounded recovery needs it. */
   public async getProviderSubrunReference(subrunId: string): Promise<StudioProviderSubrunReference | null> {
     if (!isOpaqueStudioIdentifier(subrunId)) return null;
@@ -2424,6 +2623,21 @@ export class StudioStore {
       createdAtMs: metadata.createdAtMs,
       updatedAtMs: metadata.updatedAtMs,
     });
+  }
+
+  /**
+   * Reads only the sequence-zero result preamble metadata. This deliberately
+   * strips the encrypted payload so delivery reconciliation can inspect the
+   * physical-send state without opening a route, message text, or media GUID.
+   */
+  public async getJobResultPreamble(jobId: string): Promise<StudioOutboxRecord | null> {
+    if (!isSafeRecordString(jobId, 160)) return null;
+    const job = await this.getJob(jobId);
+    if (!job || job.jobId !== jobId) return null;
+    const record = await this.getOutbox(this.jobResultPreambleOutboxId(jobId));
+    if (!isPreparedProviderResultPreamble(record, job, this.jobResultPreambleOutboxId(jobId))) return null;
+    const { encryptedPayload: _encryptedPayload, ...metadata } = record;
+    return Object.freeze(metadata);
   }
 
   /**
@@ -2677,6 +2891,58 @@ export class StudioStore {
   private async getJobResultCursorMetadata(jobId: string): Promise<StudioJobResultCursorMetadata | null> {
     const metadata = parseStored<StudioJobResultCursorMetadata>(await this.redis.get(this.jobResultCursorKey(jobId)));
     return metadata && isJobResultCursorMetadata(metadata) ? metadata : null;
+  }
+
+  /**
+   * Re-reads a completed finalization from durable metadata only. The helper
+   * intentionally does not decrypt either delivery payload, so an idempotent
+   * recovery cannot surface or extend the prepared Photon reference.
+   */
+  private async readPreparedProviderResultFinalization(
+    subrunId: string,
+  ): Promise<StudioPreparedProviderResultFinalization | null> {
+    const subrun = await this.getProviderSubrun(subrunId);
+    if (!subrun || subrun.state !== "submitted") return null;
+    const [job, observation, cursor] = await Promise.all([
+      this.getJob(subrun.jobId),
+      this.getProviderObservation(subrunId),
+      this.getJobResultCursor(subrun.jobId),
+    ]);
+    if (
+      !job
+      || job.jobId !== subrun.jobId
+      || job.state !== "ready"
+      || job.outputCount !== 1
+      || !isValidReleaseStamp(job.releaseStamp)
+      || !observation
+      || observation.subrunId !== subrunId
+      || observation.jobId !== subrun.jobId
+      || observation.state !== "succeeded"
+      || observation.subrunStateVersion !== subrun.stateVersion
+      || observation.jobStateVersion >= Number.MAX_SAFE_INTEGER
+      || job.stateVersion !== observation.jobStateVersion + 1
+      || !cursor
+      || cursor.jobId !== job.jobId
+      || cursor.outputCount !== 1
+      || cursor.nextOutputIndex !== 2
+      || cursor.outputs.length !== 1
+      || cursor.outputs[0]?.outputIndex !== 1
+      || !sameReleaseStamp(cursor.releaseStamp, job.releaseStamp)
+    ) return null;
+
+    const preambleId = this.jobResultPreambleOutboxId(job.jobId);
+    const attachment = cursor.outputs[0];
+    if (!attachment) return null;
+    const [preamble, attachmentOutbox] = await Promise.all([
+      this.getOutbox(preambleId),
+      this.getOutbox(attachment.outboxId),
+    ]);
+    if (
+      !isPreparedProviderResultPreamble(preamble, job, preambleId)
+      || !isPreparedProviderResultAttachment(attachmentOutbox, job, attachment.outboxId)
+      || !sameReleaseStamp(preamble.releaseStamp, attachmentOutbox.releaseStamp)
+    ) return null;
+    return Object.freeze({ job, observation, preamble, attachment: attachmentOutbox, cursor });
   }
 
   private buildReconciliationAudit(input: {
@@ -3076,6 +3342,9 @@ export class StudioStore {
   private jobResultPreparationLeaseKey(preparationId: string): string {
     return `${this.prefix}:job:result-preparation:lease:${preparationId}`;
   }
+  private jobResultPreambleOutboxId(jobId: string): string {
+    return deriveOpaqueId(this.secret, "studio-job-result-preamble", jobId);
+  }
   private jobResultOutboxId(jobId: string, outputIndex: number): string {
     return deriveOpaqueId(this.secret, "studio-job-result-outbox", `${jobId}\u0000${String(outputIndex)}`);
   }
@@ -3158,7 +3427,11 @@ export function canTransitionOutbox(from: StudioOutboxState, to: StudioOutboxSta
 
 /** Only these states may advance without an explicit operator reconciliation. */
 export function isJobQueueEligibleState(state: StudioJobState): boolean {
-  return state === "admitted" || state === "executing";
+  // Provider execution and result delivery have separate durable lanes, but
+  // they share the job scheduler for bounded recovery. A finalizer moves a
+  // job to `ready` only after both result intents exist; retaining ready and
+  // delivering jobs lets the engine reconcile their ordered iMessage sends.
+  return state === "admitted" || state === "executing" || state === "ready" || state === "delivering";
 }
 
 const JOB_TRANSITIONS: Readonly<Record<StudioJobState, readonly StudioJobState[]>> = Object.freeze({
@@ -4697,7 +4970,8 @@ if not raw then
 end
 local ok, record = pcall(cjson.decode, raw)
 if not ok or type(record) ~= 'table' or record.stateVersion ~= tonumber(ARGV[2]) then return 0 end
-if record.state ~= 'admitted' and record.state ~= 'executing' then
+if record.state ~= 'admitted' and record.state ~= 'executing'
+  and record.state ~= 'ready' and record.state ~= 'delivering' then
   redis.call('ZREM', KEYS[3], ARGV[5])
   redis.call('DEL', KEYS[2])
   return 2
@@ -5124,6 +5398,240 @@ observation.updatedAtMs = now
 persistPersistent()
 redis.call('DEL', KEYS[2])
 return response('pending')
+`;
+
+const FINALIZE_PREPARED_PROVIDER_RESULT_LUA = `
+-- AIR_STUDIO_FINALIZE_PREPARED_PROVIDER_RESULT_V1
+-- KEYS: observation/lease, submitted subrun, job/payload, prepared output
+--       metadata/reference, result cursor, preamble metadata/payload,
+--       attachment metadata/payload, ready outbox, result lane, ready job,
+--       shared release fence
+-- ARGV: lease token, now, terminal ttl, observation/subrun/job/preamble/
+--       attachment ids, proposed encrypted preamble/attachment, release stamp
+local function keyType(key)
+  local response = redis.call('TYPE', key)
+  return response and response.ok or ''
+end
+local function stringOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'string'
+end
+local function zsetOrMissing(key)
+  local kind = keyType(key)
+  return kind == 'none' or kind == 'zset'
+end
+local function positive(value)
+  return type(value) == 'number' and value >= 1 and value == math.floor(value)
+end
+local function nonnegative(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+local function opaque(value)
+  return type(value) == 'string' and #value == 64 and string.match(value, '^[a-f0-9]+$') ~= nil
+end
+local function text(value, maximum)
+  return type(value) == 'string' and #value >= 1 and #value <= maximum
+    and string.match(value, '^%s') == nil and string.match(value, '%s$') == nil
+    and string.find(value, '[%z\r\n]') == nil
+end
+local function stamp(value)
+  return type(value) == 'table' and nonnegative(value.generation)
+    and (value.phase == 'dark' or value.phase == 'canary' or value.phase == 'production')
+    and (value.phase == 'dark' or value.generation >= 1)
+end
+local function sameStamp(left, right)
+  return stamp(left) and stamp(right)
+    and left.generation == right.generation and left.phase == right.phase
+end
+local function encrypted(value)
+  return type(value) == 'table' and value.version == 1 and value.algorithm == 'aes-256-gcm'
+    and type(value.iv) == 'string' and type(value.ciphertext) == 'string' and type(value.tag) == 'string'
+end
+local function parse(key)
+  local raw = redis.call('GET', key)
+  if not raw then return nil end
+  local ok, value = pcall(cjson.decode, raw)
+  if not ok or type(value) ~= 'table' then return false end
+  return value
+end
+local function response(kind) return cjson.encode({ kind = kind }) end
+local function validSubrun(value)
+  return type(value) == 'table' and value.schemaVersion == 1 and opaque(value.subrunId)
+    and text(value.jobId, 160) and (value.provider == 'gmi' or value.provider == 'fal')
+    and text(value.modelSlug, 80) and text(value.workflowId, 160)
+    and value.stepId == 'provider-generation' and stamp(value.releaseStamp)
+    and opaque(value.submissionIntentId) and value.state == 'submitted'
+    and positive(value.stateVersion) and nonnegative(value.createdAtMs) and nonnegative(value.updatedAtMs)
+end
+local function validJob(value)
+  return type(value) == 'table' and value.schemaVersion == 3 and text(value.jobId, 160)
+    and opaque(value.senderHash) and opaque(value.threadHash)
+    and (value.mode == 'imagine' or value.mode == 'animate' or value.mode == 'edit-image' or value.mode == 'edit-video')
+    and text(value.modelSlug, 80) and (value.provider == 'gmi' or value.provider == 'fal')
+    and value.outputCount == 1 and nonnegative(value.reservedCents) and stamp(value.releaseStamp)
+    and positive(value.stateVersion) and nonnegative(value.createdAtMs) and nonnegative(value.updatedAtMs)
+end
+local function validObservation(value)
+  return type(value) == 'table' and value.schemaVersion == 1 and opaque(value.observationId)
+    and opaque(value.subrunId) and text(value.jobId, 160)
+    and positive(value.subrunStateVersion) and positive(value.jobStateVersion)
+    and (value.state == 'scheduled' or value.state == 'observing' or value.state == 'succeeded'
+      or value.state == 'failed' or value.state == 'deadline_exceeded' or value.state == 'attempts_exhausted'
+      or value.state == 'reference_expired' or value.state == 'canceled')
+    and nonnegative(value.pollAttempts) and positive(value.maxPollAttempts) and value.maxPollAttempts <= 10000
+    and value.pollAttempts <= value.maxPollAttempts
+    and positive(value.requestTimeoutMs) and value.requestTimeoutMs >= 1000 and value.requestTimeoutMs <= 900000
+    and positive(value.pollIntervalMs) and value.pollIntervalMs >= 250 and value.pollIntervalMs <= 300000
+    and nonnegative(value.deadlineAtMs) and nonnegative(value.nextDueAtMs) and value.nextDueAtMs <= value.deadlineAtMs
+    and positive(value.stateVersion) and nonnegative(value.createdAtMs) and nonnegative(value.updatedAtMs)
+end
+local function validPreparation(value, jobId)
+  return type(value) == 'table' and value.schemaVersion == 1 and opaque(value.preparationId)
+    and value.jobId == jobId and value.outputIndex == 1 and value.state == 'prepared'
+    and positive(value.stateVersion) and nonnegative(value.createdAtMs) and nonnegative(value.updatedAtMs)
+end
+local function validOutbox(value, job, outboxId, sequence, resultIndex, currentStamp, existing)
+  if type(value) ~= 'table' or value.schemaVersion ~= 3 or value.outboxId ~= outboxId
+    or value.jobId ~= job.jobId or value.senderHash ~= job.senderHash or value.lane ~= 'job-result'
+    or value.sequence ~= sequence or not nonnegative(value.attempts) or not positive(value.stateVersion)
+    or not stamp(value.releaseStamp) or value.laneIdentity ~= nil or value.pendingGuard ~= nil
+    or not nonnegative(value.createdAtMs) or not nonnegative(value.dueAtMs) or not nonnegative(value.updatedAtMs) then
+    return false
+  end
+  if resultIndex == nil then
+    if value.resultOutputIndex ~= nil then return false end
+  elseif value.resultOutputIndex ~= resultIndex then return false end
+  if existing then
+    return value.state == 'intent' or value.state == 'sending' or value.state == 'sent'
+      or value.state == 'retryable_failure' or value.state == 'failed' or value.state == 'canceled'
+      or value.state == 'send_unknown' or value.state == 'confirmed_absent' or value.state == 'requeued'
+  end
+  return value.state == 'intent' and value.attempts == 0 and value.stateVersion == 1
+    and value.terminalReason == nil and sameStamp(value.releaseStamp, currentStamp)
+end
+local function validCursor(value, job, attachmentId)
+  return type(value) == 'table' and value.schemaVersion == 1 and value.jobId == job.jobId
+    and value.senderHash == job.senderHash and value.threadHash == job.threadHash
+    and value.outputCount == 1 and sameStamp(value.releaseStamp, job.releaseStamp)
+    and value.nextOutputIndex == 2 and type(value.outputs) == 'table' and #value.outputs == 1
+    and type(value.outputs[1]) == 'table' and value.outputs[1].outputIndex == 1
+    and value.outputs[1].outboxId == attachmentId
+    and nonnegative(value.createdAtMs) and nonnegative(value.updatedAtMs)
+end
+
+local now = tonumber(ARGV[2])
+local terminalTtl = tonumber(ARGV[3])
+local generation = tonumber(ARGV[13])
+if not text(ARGV[1], 256) or not nonnegative(now) or not positive(terminalTtl)
+  or not opaque(ARGV[4]) or not opaque(ARGV[5]) or not text(ARGV[6], 160)
+  or not opaque(ARGV[7]) or not opaque(ARGV[8]) or not nonnegative(generation)
+  or (ARGV[14] ~= 'dark' and ARGV[14] ~= 'canary' and ARGV[14] ~= 'production') then
+  return response('unavailable')
+end
+if not stringOrMissing(KEYS[1]) or not stringOrMissing(KEYS[2]) or not stringOrMissing(KEYS[3])
+  or not stringOrMissing(KEYS[4]) or not stringOrMissing(KEYS[5]) or not stringOrMissing(KEYS[6])
+  or not stringOrMissing(KEYS[7]) or not stringOrMissing(KEYS[8]) or not stringOrMissing(KEYS[9])
+  or not stringOrMissing(KEYS[10]) or not stringOrMissing(KEYS[11]) or not stringOrMissing(KEYS[12])
+  or not zsetOrMissing(KEYS[13]) or not zsetOrMissing(KEYS[14]) or not zsetOrMissing(KEYS[15])
+  or not stringOrMissing(KEYS[16]) then return response('unavailable') end
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return response('lease_lost') end
+
+local observation = parse(KEYS[1])
+local subrun = parse(KEYS[3])
+local job = parse(KEYS[4])
+if observation == false or subrun == false or job == false or not validObservation(observation)
+  or not validSubrun(subrun) or not validJob(job)
+  or observation.observationId ~= ARGV[4] or observation.subrunId ~= ARGV[5] or observation.jobId ~= ARGV[6]
+  or subrun.subrunId ~= ARGV[5] or subrun.jobId ~= ARGV[6] or job.jobId ~= ARGV[6]
+  or observation.subrunStateVersion ~= subrun.stateVersion
+  or not sameStamp(subrun.releaseStamp, job.releaseStamp) then return response('unavailable') end
+
+-- A full prior atomic commit is the only condition under which this method
+-- returns existing. The re-acquired observation lease is still checked above.
+if observation.state == 'succeeded' and job.state == 'ready'
+  and job.stateVersion == observation.jobStateVersion + 1 then
+  local cursor = parse(KEYS[8])
+  local preamble = parse(KEYS[9])
+  local attachment = parse(KEYS[11])
+  if cursor ~= false and preamble ~= false and attachment ~= false
+    and validCursor(cursor, job, ARGV[8])
+    and validOutbox(preamble, job, ARGV[7], 0, nil, nil, true)
+    and validOutbox(attachment, job, ARGV[8], 1, 1, nil, true)
+    and sameStamp(preamble.releaseStamp, attachment.releaseStamp) then
+    return response('existing')
+  end
+  return response('unavailable')
+end
+
+if (observation.state ~= 'scheduled' and observation.state ~= 'observing')
+  or job.state ~= 'executing' or job.stateVersion ~= observation.jobStateVersion then
+  return response('unavailable')
+end
+local preparation = parse(KEYS[6])
+local preparedReference = parse(KEYS[7])
+local jobPayload = parse(KEYS[5])
+if preparation == false or preparedReference == false or jobPayload == false
+  or not validPreparation(preparation, job.jobId) or not encrypted(preparedReference)
+  or not encrypted(jobPayload) then return response('unavailable') end
+local payloadTtl = redis.call('PTTL', KEYS[5])
+local preparedTtl = redis.call('PTTL', KEYS[7])
+if not payloadTtl or not preparedTtl or payloadTtl < 1 or preparedTtl < 1 then
+  return response('payload_expiring')
+end
+if ARGV[14] ~= 'canary' and ARGV[14] ~= 'production' or generation < 1 then
+  return response('release_blocked')
+end
+local currentStamp = { generation = generation, phase = ARGV[14] }
+local fence = parse(KEYS[16])
+if fence == false or not fence or fence.schemaVersion ~= 1 or not sameStamp(fence, currentStamp) then
+  return response('release_blocked')
+end
+if redis.call('GET', KEYS[8])
+  or redis.call('EXISTS', KEYS[9]) == 1 or redis.call('EXISTS', KEYS[10]) == 1
+  or redis.call('EXISTS', KEYS[11]) == 1 or redis.call('EXISTS', KEYS[12]) == 1
+  or #redis.call('ZRANGEBYSCORE', KEYS[14], 0, 0, 'LIMIT', 0, 1) > 0
+  or #redis.call('ZRANGEBYSCORE', KEYS[14], 1, 1, 'LIMIT', 0, 1) > 0 then
+  return response('unavailable')
+end
+local preambleOk, preamble = pcall(cjson.decode, ARGV[9])
+local preamblePayloadOk, preamblePayload = pcall(cjson.decode, ARGV[10])
+local attachmentOk, attachment = pcall(cjson.decode, ARGV[11])
+local attachmentPayloadOk, attachmentPayload = pcall(cjson.decode, ARGV[12])
+if not preambleOk or not preamblePayloadOk or not attachmentOk or not attachmentPayloadOk
+  or not validOutbox(preamble, job, ARGV[7], 0, nil, currentStamp, false)
+  or not validOutbox(attachment, job, ARGV[8], 1, 1, currentStamp, false)
+  or not encrypted(preamblePayload) or not encrypted(attachmentPayload) then
+  return response('unavailable')
+end
+
+local deliveryTtl = math.min(payloadTtl, preparedTtl)
+local cursor = {
+  schemaVersion = 1, jobId = job.jobId, senderHash = job.senderHash, threadHash = job.threadHash,
+  outputCount = 1, releaseStamp = job.releaseStamp, nextOutputIndex = 2,
+  outputs = { { outputIndex = 1, outboxId = ARGV[8] } }, createdAtMs = now, updatedAtMs = now
+}
+observation.state = 'succeeded'
+observation.stateVersion = observation.stateVersion + 1
+observation.updatedAtMs = now
+job.state = 'ready'
+job.stateVersion = job.stateVersion + 1
+job.updatedAtMs = now
+redis.call('SET', KEYS[8], cjson.encode(cursor))
+redis.call('SET', KEYS[9], ARGV[9])
+redis.call('SET', KEYS[10], ARGV[10], 'PX', deliveryTtl)
+redis.call('SET', KEYS[11], ARGV[11])
+redis.call('SET', KEYS[12], ARGV[12], 'PX', deliveryTtl)
+redis.call('ZADD', KEYS[13], preamble.dueAtMs, ARGV[7])
+redis.call('ZADD', KEYS[13], attachment.dueAtMs, ARGV[8])
+redis.call('ZADD', KEYS[14], 0, ARGV[7])
+redis.call('ZADD', KEYS[14], 1, ARGV[8])
+redis.call('SET', KEYS[1], cjson.encode(observation), 'EX', terminalTtl)
+redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[4], cjson.encode(job))
+-- Result delivery remains its own durable recovery phase. Keep the job due
+-- so a crash after finalization cannot strand the ordered outbox lifecycle.
+redis.call('ZADD', KEYS[15], now, job.jobId)
+return response('finalized')
 `;
 
 const BEGIN_JOB_RESULT_PREPARATION_LUA = `
@@ -5701,6 +6209,26 @@ function parseProviderObservationFinishResult(raw: string | null): StudioProvide
   }
 }
 
+function parsePreparedProviderResultFinalizeResult(
+  raw: string | null,
+): Extract<StudioPreparedProviderResultFinalizeResult, { readonly kind: string }> {
+  const parsed = parseStored<{ readonly kind?: unknown }>(raw);
+  if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
+  switch (parsed.kind) {
+    case "finalized":
+    case "existing":
+    case "lease_lost":
+    case "release_blocked":
+    case "payload_expiring":
+    case "unavailable":
+      // Successful outcomes are hydrated immediately by the caller from the
+      // authoritative records, never from Lua-returned payload material.
+      return Object.freeze({ kind: parsed.kind }) as Extract<StudioPreparedProviderResultFinalizeResult, { readonly kind: string }>;
+    default:
+      return Object.freeze({ kind: "unavailable" });
+  }
+}
+
 function parseJobResultPreparationBeginResult(raw: string | null): StudioJobResultPreparationBeginResult {
   const parsed = parseStored<{ readonly kind?: unknown; readonly preparation?: unknown }>(raw);
   if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
@@ -5860,6 +6388,53 @@ function isJobResultPayloadBoundToJob(
   return thread.chatGuid === jobPayload.chatGuid
     && thread.sendingLine === jobPayload.sendingLine
     && thread.replyTargetId === jobPayload.replyTargetId;
+}
+
+function isPreparedProviderResultPreamble(
+  record: StudioOutboxRecord | null,
+  job: StudioJobRecord,
+  preambleId: string,
+): record is StudioOutboxRecord {
+  return isPreparedProviderResultOutbox(record, job, preambleId, 0)
+    && record.resultOutputIndex === undefined;
+}
+
+function isPreparedProviderResultAttachment(
+  record: StudioOutboxRecord | null,
+  job: StudioJobRecord,
+  attachmentId: string,
+): record is StudioOutboxRecord {
+  return isPreparedProviderResultOutbox(record, job, attachmentId, 1)
+    && record.resultOutputIndex === 1;
+}
+
+/**
+ * Metadata-only validation for an already-finalized result bundle. The
+ * encrypted payload is intentionally optional here: a durable terminal audit
+ * must stay readable after its privacy TTL has elapsed.
+ */
+function isPreparedProviderResultOutbox(
+  record: StudioOutboxRecord | null,
+  job: StudioJobRecord,
+  outboxId: string,
+  sequence: number,
+): record is StudioOutboxRecord {
+  return record !== null
+    && record.schemaVersion === 3
+    && record.outboxId === outboxId
+    && record.jobId === job.jobId
+    && record.senderHash === job.senderHash
+    && record.lane === "job-result"
+    && record.sequence === sequence
+    && STUDIO_OUTBOX_STATES.includes(record.state)
+    && isNonnegativeSafeInteger(record.attempts)
+    && isPositiveSafeInteger(record.stateVersion)
+    && isValidReleaseStamp(record.releaseStamp)
+    && record.laneIdentity === undefined
+    && record.pendingGuard === undefined
+    && isNonnegativeSafeInteger(record.createdAtMs)
+    && isNonnegativeSafeInteger(record.dueAtMs)
+    && isNonnegativeSafeInteger(record.updatedAtMs);
 }
 
 /**
