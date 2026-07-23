@@ -18,10 +18,18 @@ const MAX_CONTENT_TYPE_CHARS = 256;
  * `host` is an exact, canonical DNS name—not a wildcard, URL, or host:port.
  * `pathPrefix` must name a non-root object namespace such as
  * `/gmi-generated-assets/air/`.
+ *
+ * `signed-url` is deliberately narrow: Air currently accepts only a complete
+ * Google Cloud Storage V4 signed-query envelope. A provider-private result
+ * cannot be fetched through this generic URL boundary because it would need a
+ * provider-specific authenticated retrieval implementation instead of an
+ * ambient or unauthenticated HTTP request.
  */
 export interface StudioProviderArtifactFetchPolicy {
   readonly host: string;
   readonly pathPrefix: string;
+  /** The committed model contract for this exact provider output location. */
+  readonly access: "signed-url" | "provider-private";
 }
 
 export interface FetchStudioProviderArtifactInput {
@@ -54,6 +62,8 @@ export type StudioProviderArtifactFetchErrorCode =
   | "invalid_configuration"
   | "invalid_policy"
   | "invalid_url"
+  | "invalid_signed_url"
+  | "provider_private_transport_required"
   | "request_timeout"
   | "transport_failure"
   | "unexpected_status"
@@ -79,6 +89,7 @@ export class StudioProviderArtifactFetchError extends Error {
 interface NormalizedPolicy {
   readonly host: string;
   readonly pathPrefix: string;
+  readonly access: "signed-url" | "provider-private";
 }
 
 interface NormalizedInput {
@@ -208,7 +219,14 @@ function normalizePolicy(value: StudioProviderArtifactFetchPolicy): NormalizedPo
   if (!value || typeof value !== "object" || Array.isArray(value)) fail("invalid_policy");
   const rawHost = value.host;
   const pathPrefix = value.pathPrefix;
-  if (typeof rawHost !== "string" || typeof pathPrefix !== "string") fail("invalid_policy");
+  const access = value.access;
+  if (
+    typeof rawHost !== "string" ||
+    typeof pathPrefix !== "string" ||
+    (access !== "signed-url" && access !== "provider-private")
+  ) {
+    fail("invalid_policy");
+  }
 
   let hostUrl: URL;
   try {
@@ -250,7 +268,7 @@ function normalizePolicy(value: StudioProviderArtifactFetchPolicy): NormalizedPo
   if (segments.length === 0 || segments.some((segment) => !/^[A-Za-z0-9._~-]+$/.test(segment) || segment === "." || segment === "..")) {
     fail("invalid_policy");
   }
-  return Object.freeze({ host, pathPrefix });
+  return Object.freeze({ host, pathPrefix, access });
 }
 
 function isCanonicalDnsHost(host: string): boolean {
@@ -264,6 +282,11 @@ function isCanonicalDnsHost(host: string): boolean {
 }
 
 function normalizeArtifactUrl(value: string, policy: NormalizedPolicy): string {
+  // A provider-private result must be fetched by a dedicated provider adapter
+  // that can prove its authentication contract. Never fall back to a generic
+  // unauthenticated GET merely because an exact host/path was reviewed.
+  if (policy.access === "provider-private") fail("provider_private_transport_required");
+
   if (
     typeof value !== "string" ||
     !value ||
@@ -295,7 +318,61 @@ function normalizeArtifactUrl(value: string, policy: NormalizedPolicy): string {
   ) {
     fail("invalid_url");
   }
+  if (!hasCompleteGoogleCloudStorageV4Signature(url)) fail("invalid_signed_url");
   return url.toString();
+}
+
+/**
+ * Require the complete GCS V4 query signature envelope, rather than treating
+ * a provider's `is_public: false` field or a bare storage URL as proof that an
+ * object is private. The storage service validates the actual signature; this
+ * boundary ensures Air only attempts that authenticated retrieval shape.
+ */
+function hasCompleteGoogleCloudStorageV4Signature(url: URL): boolean {
+  const parameters = url.searchParams;
+  const algorithm = exactlyOneQueryParameter(parameters, "X-Goog-Algorithm");
+  const credential = exactlyOneQueryParameter(parameters, "X-Goog-Credential");
+  const date = exactlyOneQueryParameter(parameters, "X-Goog-Date");
+  const expires = exactlyOneQueryParameter(parameters, "X-Goog-Expires");
+  const signedHeaders = exactlyOneQueryParameter(parameters, "X-Goog-SignedHeaders");
+  const signature = exactlyOneQueryParameter(parameters, "X-Goog-Signature");
+
+  if (
+    (algorithm !== "GOOG4-RSA-SHA256" && algorithm !== "GOOG4-HMAC-SHA256") ||
+    credential === null ||
+    date === null ||
+    expires === null ||
+    signedHeaders === null ||
+    signature === null
+  ) {
+    return false;
+  }
+
+  if (!isGoogleCloudStorageV4Credential(credential)) return false;
+  if (!/^\d{8}T\d{6}Z$/u.test(date)) return false;
+  if (!/^[1-9]\d{0,5}$/u.test(expires)) return false;
+  const expiresSeconds = Number(expires);
+  // GCS V4 signed URLs can be valid for no more than seven days.
+  if (!Number.isSafeInteger(expiresSeconds) || expiresSeconds > 604_800) return false;
+  if (!hasCanonicalSignedHeaders(signedHeaders)) return false;
+  return /^[a-f0-9]{64}$/u.test(signature);
+}
+
+function exactlyOneQueryParameter(parameters: URLSearchParams, name: string): string | null {
+  const values = parameters.getAll(name);
+  return values.length === 1 ? values[0] ?? null : null;
+}
+
+function isGoogleCloudStorageV4Credential(value: string): boolean {
+  // `<access-key>/<yyyymmdd>/<region>/storage/goog4_request` after URL
+  // decoding. Keep every part bounded and printable before accepting it.
+  return /^[A-Za-z0-9._-]{1,256}\/\d{8}\/[A-Za-z0-9-]{1,64}\/storage\/goog4_request$/u.test(value);
+}
+
+function hasCanonicalSignedHeaders(value: string): boolean {
+  if (!/^[a-z0-9-]+(?:;[a-z0-9-]+)*$/u.test(value)) return false;
+  const names = value.split(";");
+  return names.includes("host") && new Set(names).size === names.length;
 }
 
 /**

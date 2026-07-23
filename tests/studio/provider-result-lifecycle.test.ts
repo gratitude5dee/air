@@ -30,7 +30,7 @@ import {
   type StudioJobRecordWithPayload,
   type StudioPreparedOutput,
 } from "../../lib/studio/store.js";
-import { drainStudio, drainStudioJobs } from "../../lib/studio/engine.js";
+import { drainStudio, drainStudioJobs, drainStudioOutbox } from "../../lib/studio/engine.js";
 import { executeStudioProviderSubrun } from "../../lib/studio/workflow-executor.js";
 
 const IDENTITY_SECRET = "provider-result-lifecycle-test-identity";
@@ -466,6 +466,36 @@ describe("private provider result lifecycle", () => {
     expectProviderSecretsAbsent(setup);
     expect(JSON.stringify(setup.store.decryptOutboxPayload(fullPreamble))).not.toContain(PROVIDER_REQUEST_ID);
     expect(JSON.stringify(setup.store.decryptOutboxPayload(attachment))).not.toContain(PRIVATE_RESULT_URL);
+  });
+
+  it("never dispatches a result attachment after a failed preamble survives a worker restart", async () => {
+    const setup = await fixture({ observations: [readyPrivateImage()] });
+    const job = await submitAccepted(setup, "failed-preamble-blocks-restarted-attachment");
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId)).resolves.toEqual({ kind: "ready" });
+
+    const [preamble, cursor] = await Promise.all([
+      setup.store.getJobResultPreamble(job.jobId),
+      setup.store.getJobResultCursor(job.jobId),
+    ]);
+    if (!preamble || !cursor) throw new Error("expected finalized result records");
+    const attachmentId = cursor.outputs[0]?.outboxId;
+    if (!attachmentId) throw new Error("expected result attachment");
+
+    const preambleClaim = await setup.store.claimNextOutbox();
+    if (!preambleClaim || preambleClaim.record.outboxId !== preamble.outboxId) {
+      throw new Error("expected result preamble claim");
+    }
+    // Simulate a process death after the known preamble failure committed but
+    // before the best-effort job reconciliation in the original worker.
+    await expect(setup.store.finishOutbox(preamble.outboxId, preambleClaim.leaseToken, "failed"))
+      .resolves.toBe(true);
+
+    await expect(drainStudioOutbox(setup.runtime)).resolves.toBe(1);
+
+    expect(setup.transport.sendPreparedOutput).not.toHaveBeenCalled();
+    expect(setup.transport.events).toEqual([]);
+    await expect(setup.store.getOutbox(attachmentId)).resolves.toMatchObject({ state: "failed" });
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "reconciliation_required" });
   });
 
   it.each([

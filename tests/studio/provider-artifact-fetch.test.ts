@@ -9,9 +9,23 @@ import {
 const policy = {
   host: "storage.googleapis.com",
   pathPrefix: "/gmi-generated-assets/air/",
+  access: "signed-url",
 } as const;
 
-const allowedUrl = "https://storage.googleapis.com/gmi-generated-assets/air/output-1.png?signature=private";
+const signedQuery = [
+  "X-Goog-Algorithm=GOOG4-RSA-SHA256",
+  "X-Goog-Credential=air%2F20260723%2Fauto%2Fstorage%2Fgoog4_request",
+  "X-Goog-Date=20260723T000000Z",
+  "X-Goog-Expires=900",
+  "X-Goog-SignedHeaders=host",
+  `X-Goog-Signature=${"a".repeat(64)}`,
+].join("&");
+
+function signedUrl(path = "output-1.png"): string {
+  return `https://storage.googleapis.com/gmi-generated-assets/air/${path}?${signedQuery}`;
+}
+
+const allowedUrl = signedUrl();
 
 function fetchErrorCode(error: unknown): string | null {
   return error instanceof StudioProviderArtifactFetchError ? error.code : null;
@@ -75,14 +89,14 @@ describe("provider artifact fetch boundary", () => {
       return new Response("should not be fetched");
     };
     const rejectedUrls = [
-      "http://storage.googleapis.com/gmi-generated-assets/air/output.png",
-      "https://evil.example/gmi-generated-assets/air/output.png",
+      `http://storage.googleapis.com/gmi-generated-assets/air/output.png?${signedQuery}`,
+      `https://evil.example/gmi-generated-assets/air/output.png?${signedQuery}`,
       "https://storage.googleapis.com/",
       "https://storage.googleapis.com/gmi-generated-assets/air/",
-      "https://storage.googleapis.com/gmi-generated-assets/air/%2e%2e/private.png",
-      "https://storage.googleapis.com/gmi-generated-assets/air/output.png#fragment",
-      "https://storage.googleapis.com:443/gmi-generated-assets/air/output.png",
-      "https://user:pass@storage.googleapis.com/gmi-generated-assets/air/output.png",
+      `https://storage.googleapis.com/gmi-generated-assets/air/%2e%2e/private.png?${signedQuery}`,
+      `https://storage.googleapis.com/gmi-generated-assets/air/output.png?${signedQuery}#fragment`,
+      `https://storage.googleapis.com:443/gmi-generated-assets/air/output.png?${signedQuery}`,
+      `https://user:pass@storage.googleapis.com/gmi-generated-assets/air/output.png?${signedQuery}`,
     ];
 
     for (const url of rejectedUrls) {
@@ -95,25 +109,71 @@ describe("provider artifact fetch boundary", () => {
 
   it("requires a canonical exact DNS host and a non-root static path prefix", async () => {
     const invalidPolicies = [
-      { host: "storage.googleapis.com:443", pathPrefix: "/gmi-generated-assets/air/" },
-      { host: "STORAGE.googleapis.com", pathPrefix: "/gmi-generated-assets/air/" },
-      { host: "storage.googleapis.com", pathPrefix: "/" },
-      { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets/%2f/" },
-      { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets/../air/" },
-      { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets//air/" },
+      { host: "storage.googleapis.com:443", pathPrefix: "/gmi-generated-assets/air/", access: "signed-url" },
+      { host: "STORAGE.googleapis.com", pathPrefix: "/gmi-generated-assets/air/", access: "signed-url" },
+      { host: "storage.googleapis.com", pathPrefix: "/", access: "signed-url" },
+      { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets/%2f/", access: "signed-url" },
+      { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets/../air/", access: "signed-url" },
+      { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets//air/", access: "signed-url" },
+      { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets/air/", access: "unauthenticated" },
     ] as const;
 
     for (const invalidPolicy of invalidPolicies) {
       await expect(fetchStudioProviderArtifact({
         url: allowedUrl,
-        policy: invalidPolicy,
+        // The runtime boundary receives registry-derived data, but this test
+        // intentionally supplies an untrusted invalid literal.
+        policy: invalidPolicy as unknown as typeof policy,
         fetch: async () => new Response("must not be reached"),
       })).rejects.toSatisfy((error: unknown) => fetchErrorCode(error) === "invalid_policy");
     }
   });
 
+  it("requires a complete GCS V4 signed URL before an allowed result is fetched", async () => {
+    let calls = 0;
+    const fetch = async (): Promise<Response> => {
+      calls += 1;
+      return new Response("must not be fetched");
+    };
+    const unsignedOrMalformedUrls = [
+      "https://storage.googleapis.com/gmi-generated-assets/air/bare-output.png",
+      "https://storage.googleapis.com/gmi-generated-assets/air/partial-output.png?X-Goog-Signature=private",
+      signedUrl("bad-algorithm.png").replace("GOOG4-RSA-SHA256", "not-a-signature"),
+      signedUrl("bad-expiry.png").replace("X-Goog-Expires=900", "X-Goog-Expires=0"),
+      `${signedUrl("duplicate-signature.png")}&X-Goog-Signature=${"b".repeat(64)}`,
+    ];
+
+    for (const url of unsignedOrMalformedUrls) {
+      await expect(fetchStudioProviderArtifact({ url, policy, fetch })).rejects.toSatisfy(
+        (error: unknown) => fetchErrorCode(error) === "invalid_signed_url",
+      );
+    }
+    expect(calls).toBe(0);
+  });
+
+  it("requires a provider-specific authenticated retrieval implementation for provider-private outputs", async () => {
+    let calls = 0;
+    const providerPrivatePolicy = {
+      host: "storage.googleapis.com",
+      pathPrefix: "/gmi-generated-assets/air/",
+      access: "provider-private",
+    } as const;
+
+    await expect(fetchStudioProviderArtifact({
+      url: signedUrl("provider-private.png"),
+      policy: providerPrivatePolicy,
+      fetch: async () => {
+        calls += 1;
+        return new Response("must not be fetched");
+      },
+    })).rejects.toSatisfy(
+      (error: unknown) => fetchErrorCode(error) === "provider_private_transport_required",
+    );
+    expect(calls).toBe(0);
+  });
+
   it("rejects non-200 responses and oversized or malformed Content-Length without exposing the URL", async () => {
-    const secretUrl = "https://storage.googleapis.com/gmi-generated-assets/air/private-output.png?signature=top-secret";
+    const secretUrl = signedUrl("private-output.png");
     const cases = [
       { response: new Response("ignored", { status: 403 }), code: "unexpected_status" },
       {
@@ -186,7 +246,7 @@ describe("provider artifact fetch boundary", () => {
       (error: unknown) => fetchErrorCode(error) === "response_stream_failure",
     );
 
-    const timeoutUrl = "https://storage.googleapis.com/gmi-generated-assets/air/timeout.png?signature=private";
+    const timeoutUrl = signedUrl("timeout.png");
     await expect(fetchStudioProviderArtifact({
       url: timeoutUrl,
       policy,

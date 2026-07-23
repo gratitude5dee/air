@@ -40,6 +40,10 @@ and privacy gates below.
 5. Do not use a failed result upload or a `submission_unknown`,
    `upload_unknown`, or `send_unknown` state as permission to retry a physical
    provider or Photon action. Those states require reconciliation.
+6. Do not treat `is_public: false` as proof that a result URL is private. A
+   signed result must use the reviewed signed-URL contract; a provider-private
+   result needs a dedicated authenticated retrieval implementation. Never use
+   a documented publicly accessible provider upload URL for user media.
 
 ## Release verification
 
@@ -157,7 +161,10 @@ complete every gate below, in order:
    force; it is a ceiling, not a license to substitute a model.
 3. Prove the exact input and result contracts. Result retrieval must be private
    or signed, non-public, and pinned to a specific host plus non-root path
-   prefix. Do not infer this from a generic documentation example.
+   prefix. A bare storage URL is insufficient even if a provider returns
+   `is_public: false`; Air currently accepts only a complete GCS V4 signed URL
+   at its generic retrieval boundary. Do not infer the contract from a generic
+   documentation example.
 4. Commit and review a registry entry that pins the exact GMI adapter, model
    ID, request/result schema fingerprints, required payload fields, input
    policy, output contract, price quote, polling bounds, and private retrieval
@@ -172,7 +179,8 @@ complete every gate below, in order:
 
 `/animate`, `/edit-image`, and `/edit-video` remain disabled after the first
 `/imagine` release. Each needs its own exact model, media-input, pricing, and
-private-output review.
+private-output review. In particular, a GMI upload response documented as a
+public URL is not an acceptable input-media transport for this private studio.
 
 ## Result delivery and incident response
 
@@ -182,11 +190,13 @@ enabled:
 - It can observe only a durably known submitted request; it never resubmits an
   ambiguous request.
 - It checks the registry's private/signed result allowlist before fetching an
-  artifact.
+  artifact. Bare storage URLs and malformed signatures are rejected before
+  fetch; provider-private artifacts need a dedicated authenticated retriever.
 - It prepares one Photon attachment, then atomically persists the text
   preamble, attachment outbox intent, cursor, observation success, and
   `executing → ready` transition. The preamble is dispatched before the
-  attachment.
+  attachment, and an attachment cannot leave after a durable preamble failure
+  survives a worker restart.
 - A crashed or ambiguous attachment upload becomes `upload_unknown` and
   `reconciliation_required`, without a GMI fetch or Photon re-upload.
 - A transport ambiguity becomes `send_unknown`; it is reconciled, not replayed

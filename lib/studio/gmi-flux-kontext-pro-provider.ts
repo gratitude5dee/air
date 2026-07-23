@@ -117,7 +117,17 @@ export class GmiFluxKontextProStudioProvider implements StudioProviderObservatio
       return retryableFailure();
     }
 
-    if (!observation || observation.requestId !== input.providerRequestId) return reconciliationRequired();
+    // The request ID binds the observation to one opaque provider job, while
+    // the exact model identity binds its state semantics to this adapter. Do
+    // not let a malformed or cross-model response terminalize, delay, or
+    // deliver a Flux job merely because it reused the request ID.
+    if (
+      !observation ||
+      observation.requestId !== input.providerRequestId ||
+      !hasExactFluxKontextProResponseModel(observation.response)
+    ) {
+      return reconciliationRequired();
+    }
     switch (observation.status) {
       case "dispatched":
       case "processing":
@@ -234,7 +244,7 @@ function hasExactFluxKontextProExecutionBinding(
  */
 function extractPrivateFluxOutputUrl(response: GmiJsonObject): string | null {
   if (!isPlainJsonObject(response)) return null;
-  if (response.model !== GMI_FLUX_KONTEXT_PRO_MODEL_ID || response.is_public !== false) return null;
+  if (!hasExactFluxKontextProResponseModel(response) || response.is_public !== false) return null;
   const outcome = response.outcome;
   if (!isPlainJsonObject(outcome)) return null;
   const mediaUrls = outcome.media_urls;
@@ -242,6 +252,10 @@ function extractPrivateFluxOutputUrl(response: GmiJsonObject): string | null {
   const first = mediaUrls[0];
   if (!isPlainJsonObject(first) || first.id !== "0" || typeof first.url !== "string") return null;
   return first.url;
+}
+
+function hasExactFluxKontextProResponseModel(response: GmiJsonObject): boolean {
+  return isPlainJsonObject(response) && response.model === GMI_FLUX_KONTEXT_PRO_MODEL_ID;
 }
 
 function isPlainJsonObject(value: unknown): value is GmiJsonObject {

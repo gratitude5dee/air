@@ -102,7 +102,21 @@ function queueClient(result: GmiSubmitResult): GmiFluxKontextProRequestQueueClie
 const outputPolicy = Object.freeze({
   host: "storage.googleapis.com",
   pathPrefix: "/gmi-generated-assets/air/",
+  access: "signed-url" as const,
 });
+
+const gcsV4SignedQuery = [
+  "X-Goog-Algorithm=GOOG4-RSA-SHA256",
+  "X-Goog-Credential=air%2F20260723%2Fauto%2Fstorage%2Fgoog4_request",
+  "X-Goog-Date=20260723T000000Z",
+  "X-Goog-Expires=900",
+  "X-Goog-SignedHeaders=host",
+  `X-Goog-Signature=${"a".repeat(64)}`,
+].join("&");
+
+function signedFluxOutputUrl(path = "opaque-output.jpg"): string {
+  return `https://storage.googleapis.com/gmi-generated-assets/air/${path}?${gcsV4SignedQuery}`;
+}
 
 describe("GMI Flux Kontext Pro StudioProvider", () => {
   it("uses an injected queue client for the exact prompt-only Flux request", async () => {
@@ -212,7 +226,11 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
     const getRequestStatus = vi.fn(async () => ({
       requestId: "gmi-flux-observation-001",
       status: "processing" as const,
-      response: { request_id: "gmi-flux-observation-001", status: "processing" },
+      response: {
+        request_id: "gmi-flux-observation-001",
+        model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+        status: "processing",
+      },
     }));
     const submitRequest = vi.fn(async () => ({
       classification: "accepted" as const,
@@ -243,7 +261,7 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
         outcome: {
           media_urls: [{
             id: "0",
-            url: "https://storage.googleapis.com/gmi-generated-assets/air/opaque-output.jpg?X-Goog-Signature=private",
+            url: signedFluxOutputUrl(),
           }],
         },
       },
@@ -290,6 +308,7 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
       outcome: { media_urls: [{ id: "0", url: "https://storage.googleapis.com/gmi-generated-assets/air/output.jpg" }] },
     };
     const malformedResponses = [
+      baseResponse,
       { ...baseResponse, is_public: true },
       { ...baseResponse, model: "other-model" },
       { ...baseResponse, outcome: { media_urls: [] } },
@@ -315,6 +334,33 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
     }
   });
 
+  it("requires exact Flux model identity before every observation state is handled", async () => {
+    const states = ["processing", "success", "failed", "cancelled"] as const;
+    const modelValues = [undefined, "other-model"] as const;
+
+    for (const status of states) {
+      for (const model of modelValues) {
+        const getRequestStatus = vi.fn(async () => ({
+          requestId: "gmi-flux-observation-001",
+          status,
+          response: {
+            request_id: "gmi-flux-observation-001",
+            status,
+            ...(model === undefined ? {} : { model }),
+          },
+        }));
+        const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("must not fetch"));
+        const provider = new GmiFluxKontextProStudioProvider(
+          { submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }), getRequestStatus },
+          { outputPolicy, fetch },
+        );
+
+        await expect(provider.observe(observationInput())).resolves.toEqual({ kind: "reconciliation_required" });
+        expect(fetch).not.toHaveBeenCalled();
+      }
+    }
+  });
+
   it("keeps temporary status reads retryable but terminal provider failures definitive", async () => {
     const retryable = new GmiFluxKontextProStudioProvider(
       {
@@ -329,7 +375,11 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
         getRequestStatus: async () => ({
           requestId: "gmi-flux-observation-001",
           status: "failed" as const,
-          response: { request_id: "gmi-flux-observation-001", status: "failed" },
+          response: {
+            request_id: "gmi-flux-observation-001",
+            model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+            status: "failed",
+          },
         }),
       },
       { outputPolicy },

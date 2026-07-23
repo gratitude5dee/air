@@ -152,6 +152,7 @@ export function createConfiguredStudioProvider(
       outputPolicy: Object.freeze({
         host: model.outputRetrieval.host,
         pathPrefix: model.outputRetrieval.pathPrefix,
+        access: model.outputRetrieval.access,
       }),
     });
   } catch {

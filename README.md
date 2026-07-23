@@ -110,7 +110,9 @@ and enabled, it protects the post-submit path as follows:
    is terminalized for reconciliation rather than resubmitted.
 2. It permits result retrieval only through the registry's exact reviewed
    host/path prefix and private or signed access contract. The registry must
-   assert `publiclyAccessible: false`.
+   assert `publiclyAccessible: false`; a signed result currently requires a
+   complete GCS V4 signed-query envelope, while a `provider-private` result
+   needs a dedicated authenticated retriever rather than a generic HTTP GET.
 3. A validated result is prepared as one native Photon attachment. An expired
    or ambiguous upload becomes `upload_unknown` and
    `reconciliation_required`; Air does not refetch the provider result or
@@ -137,7 +139,8 @@ the following are recorded and deployed together:
    authority.
 3. The output contract is proven private/signed for this exact model, including
    its exact result host and non-root path prefix. Generic provider examples
-   are not sufficient.
+   are not sufficient. In particular, a bare storage URL is not evidence of
+   private access even when a provider labels the response `is_public: false`.
 4. A reviewed committed registry entry pins the adapter, request/result schema
    fingerprints, input policy, output policy, price quote, polling bounds, and
    one-image contract. The release must then pass typecheck, tests, and the
@@ -149,7 +152,9 @@ the following are recorded and deployed together:
 
 `/animate`, `/edit-image`, and `/edit-video` remain disabled after an
 `/imagine` activation until each has its own exact model, media, price, and
-private-output evidence.
+private-output evidence. Air must not use a GMI upload flow that returns a
+documented publicly accessible input URL for allowlisted user media; those
+modes require a separately verified private input-object contract.
 
 ## Configuration and release fence
 

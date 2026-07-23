@@ -230,6 +230,15 @@ export async function authorizeStudioJobResultDispatch(
     return job.state === "ready" || job.state === "delivering" ? "allowed" : "blocked";
   }
 
+  // The lane keeps the normal preamble → attachment sequence, but a known
+  // preamble failure deliberately releases that lane so it cannot block all
+  // recovery forever. A worker can then restart between terminalizing the
+  // preamble and reconciling the job. Never let that restarted worker infer
+  // attachment authorization from the job state alone: the exact durable
+  // preamble must have physically completed first.
+  const preamble = await runtime.store.getJobResultPreamble(job.jobId);
+  if (!preamble || preamble.state !== "sent") return "blocked";
+
   if (job.state === "delivering") return "allowed";
   if (job.state !== "ready") return job.state === "executing" ? "defer" : "blocked";
 
