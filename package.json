@@ -21,6 +21,7 @@
     "@photon-ai/advanced-imessage": "1.0.0",
     "@spectrum-ts/core": "10.0.0",
     "@upstash/redis": "1.38.0",
+    "@vercel/functions": "3.7.5",
     "redis": "5.11.0",
     "zod": "4.4.3"
   },
