@@ -9,7 +9,7 @@ retrieval, a provider submission, or a generation command.
 
 - Source of truth: `codex/air-direct-studio`. Zap is retained only to drain or
   roll back legacy jobs that it already accepted; it is not a new-work path.
-- Live deployment: `dpl_5ihyMswovHd4Aymcd6tJ5XtPTeTq`, aliased to
+- Live deployment: `dpl_9gttp6wLuZ4A8MeKmAPztoT6Av17`, aliased to
   [`https://air.wzrd.tech`](https://air.wzrd.tech).
 - Verified public probe: `GET /healthz` returned `{"ok":true,"version":"2"}`.
 - Vercel has encrypted `GMI_API_KEY` configuration for Preview and Production.
@@ -164,7 +164,9 @@ complete every gate below, in order:
    prefix. A bare storage URL is insufficient even if a provider returns
    `is_public: false`; Air currently accepts only a complete GCS V4 signed URL
    at its generic retrieval boundary. Do not infer the contract from a generic
-   documentation example.
+   documentation example. The public [Flux quickstart](https://docs.gmicloud.ai/model-quickstarts/image/flux-kontext-pro)
+   is specifically insufficient: its success example combines `is_public:false`
+   with a bare storage URL and does not document access semantics.
 4. Commit and review a registry entry that pins the exact GMI adapter, model
    ID, request/result schema fingerprints, required payload fields, input
    policy, output contract, price quote, polling bounds, and private retrieval

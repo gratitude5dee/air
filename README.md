@@ -9,7 +9,7 @@ deployment.
 ## Live status
 
 The current direct release is Vercel deployment
-`dpl_5ihyMswovHd4Aymcd6tJ5XtPTeTq` from `codex/air-direct-studio`, aliased to
+`dpl_9gttp6wLuZ4A8MeKmAPztoT6Av17` from `codex/air-direct-studio`, aliased to
 [`https://air.wzrd.tech`](https://air.wzrd.tech). Its public health endpoint
 returned `{"ok":true,"version":"2"}` after deployment.
 
@@ -24,6 +24,9 @@ This is **not** a paid-generation activation:
   exactly reviewed, enabled registry entry.
 - The already-approved shared `$100` ceiling remains a background hard safety
   control. It is not a user-confirmation step and it is not a model approval.
+- This release rejects bare, malformed, or cross-model provider results before
+  any artifact fetch and prevents an attachment from leaving after a failed
+  result preamble on a restarted worker.
 - The direct Photon webhook configuration and an owner-originated allowlisted
   `/help` reply have not yet been observed on this deployment. Text delivery
   is therefore deployed but not yet accepted as a handset smoke result.
@@ -141,6 +144,9 @@ the following are recorded and deployed together:
    its exact result host and non-root path prefix. Generic provider examples
    are not sufficient. In particular, a bare storage URL is not evidence of
    private access even when a provider labels the response `is_public: false`.
+   GMI's [Flux quickstart](https://docs.gmicloud.ai/model-quickstarts/image/flux-kontext-pro)
+   currently demonstrates that exact ambiguity, so it establishes the model
+   identifier—not Air's private-delivery contract.
 4. A reviewed committed registry entry pins the adapter, request/result schema
    fingerprints, input policy, output policy, price quote, polling bounds, and
    one-image contract. The release must then pass typecheck, tests, and the
