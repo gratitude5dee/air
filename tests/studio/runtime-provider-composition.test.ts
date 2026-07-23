@@ -149,7 +149,7 @@ describe("strict GMI runtime composition", () => {
     }
   });
 
-  it("fails closed for a missing key, an absent default, and every reviewed-contract mismatch", () => {
+  it("fails closed for a missing/mismatched registry version, missing key, absent default, and every reviewed-contract mismatch", () => {
     const noDefault = reviewedFluxRegistry(undefined, {});
     const mismatchedRegistries = [
       reviewedFluxRegistry((model) => ({
@@ -180,6 +180,10 @@ describe("strict GMI runtime composition", () => {
       })),
     ];
 
+    for (const modelRegistryVersion of [undefined, "2.1.1"] as const) {
+      expect(createConfiguredStudioProvider(environment({ modelRegistryVersion }), reviewedFluxRegistry()))
+        .toBeInstanceOf(UnprovisionedStudioProvider);
+    }
     expect(createConfiguredStudioProvider(environment({ gmiApiKey: undefined }), reviewedFluxRegistry()))
       .toBeInstanceOf(UnprovisionedStudioProvider);
     expect(createConfiguredStudioProvider(environment(), noDefault)).toBeInstanceOf(UnprovisionedStudioProvider);

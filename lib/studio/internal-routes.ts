@@ -8,7 +8,7 @@ import {
   type StudioEnvironment,
 } from "./config.js";
 import { AIR_MODEL_REGISTRY, AIR_MODEL_REGISTRY_VERSION, listEnabledModels } from "./model-registry.js";
-import { getStudioRuntime, type StudioRuntime } from "./runtime.js";
+import { getStudioDeliveryTransport, getStudioRuntime, type StudioRuntime } from "./runtime.js";
 import type { StudioReleaseFenceStatus } from "./store.js";
 import { authorizeStudioDrain } from "./webhook-handler.js";
 
@@ -105,7 +105,23 @@ export async function handleStudioReadiness(
     try {
       const freshness = await runtime.store.getCronFreshness(environment.deploymentMode);
       redis = "reachable";
-      if (!runtime.transport.verified) problems.push("transport_unverified");
+      // Inbound receipt persistence deliberately never mints an outbound
+      // Photon token. An authenticated readiness probe, however, is the right
+      // place to verify that a currently active delivery release can obtain
+      // one without putting that failure in front of signed webhook durability.
+      let transportVerified = runtime.transport.verified;
+      if (!transportVerified && runtime.getDeliveryTransport !== undefined && canDeliverStudioMessages(environment)) {
+        try {
+          transportVerified = (await getStudioDeliveryTransport(runtime)).verified;
+        } catch {
+          transportVerified = false;
+        }
+      }
+      if (!transportVerified && runtime.getDeliveryTransport === undefined) {
+        problems.push("transport_unverified");
+      } else if (!transportVerified && canDeliverStudioMessages(environment)) {
+        problems.push("transport_unverified");
+      }
       if (providerWorkEnabled && !runtime.provider.verified) problems.push("provider_unprovisioned");
       // Vercel only schedules Cron jobs on production deployments. Preview and
       // development readiness still verify Redis but must not claim a missed

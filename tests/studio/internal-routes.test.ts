@@ -293,6 +293,32 @@ describe("Studio Vercel internal routes", () => {
     expect(getReleaseFenceStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("probes a deferred Photon transport only for an active delivery release", async () => {
+    const environment = productionDeliveryEnvironment();
+    const getDeliveryTransport = vi.fn(async () => ({ verified: false }));
+    const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+      loadEnvironment: () => environment,
+      getRuntime: async () => ({
+        store: {
+          getCronFreshness: vi.fn(async () => "fresh" as const),
+          getReleaseFenceStatus: vi.fn(async () => ({
+            kind: "current" as const,
+            stamp: { generation: environment.releaseGeneration, phase: environment.releasePhase },
+          })),
+        },
+        transport: { verified: false },
+        getDeliveryTransport,
+        provider: { verified: false },
+      }) as unknown as StudioRuntime,
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual(expect.objectContaining({
+      problems: expect.arrayContaining(["transport_unverified"]),
+    }));
+    expect(getDeliveryTransport).toHaveBeenCalledTimes(1);
+  });
+
   it("fails closed for missing, mismatched, or invalid delivery release fences without disclosing their stamps", async () => {
     const environment = productionDeliveryEnvironment();
     const cases = [

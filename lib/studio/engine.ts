@@ -19,6 +19,7 @@ import {
   listEnabledModels,
   resolveDefaultModel,
   resolveEnabledModel,
+  validateRegistryVersion,
   type AirModelRegistry,
   type StudioModel,
 } from "./model-registry.js";
@@ -26,9 +27,10 @@ import {
   isStudioPreparedOutputTransport,
   isSafeTransportText,
   type IMessageThreadReference,
+  type StudioIMessageTransport,
   type TransportOutcome,
 } from "./imessage-transport.js";
-import type { StudioRuntime } from "./runtime.js";
+import { getStudioDeliveryTransport, type StudioRuntime } from "./runtime.js";
 import type {
   StudioAttachmentReference,
   StudioInboxRecord,
@@ -167,8 +169,16 @@ export async function drainStudioWithStats(runtime: StudioRuntime): Promise<Stud
  * reviewed provider adapter must be explicitly active first.
  */
 export async function drainStudioJobs(runtime: StudioRuntime): Promise<number> {
-  const maySubmit = canSubmitPaidStudioProvider(runtime.environment) && runtime.provider.verified;
-  const mayRecover = canRecoverPaidStudioProvider(runtime.environment) && runtime.provider.verified;
+  // The version is a release binding, not a display-only readiness signal.
+  // Do not submit, poll, or fetch a provider result through an injected or
+  // stale runtime when its configured registry version differs from the
+  // immutable registry in use.
+  const registryVersionCurrent = validateRegistryVersion(
+    runtime.environment.modelRegistryVersion,
+    studioRegistry(runtime),
+  ).ok;
+  const maySubmit = registryVersionCurrent && canSubmitPaidStudioProvider(runtime.environment) && runtime.provider.verified;
+  const mayRecover = registryVersionCurrent && canRecoverPaidStudioProvider(runtime.environment) && runtime.provider.verified;
   // A ready/delivering result contains no provider side effect: retain its
   // durable recovery loop even during a submit rollback so an already-sent
   // Photon attachment can reach a truthful terminal job state.
@@ -260,7 +270,18 @@ async function advanceClaimedStudioJob(
  * for the later verified transport/release gate.
  */
 export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number> {
-  if (!canDeliverStudioMessages(runtime.environment) || !runtime.transport.verified) return 0;
+  if (!canDeliverStudioMessages(runtime.environment)) return 0;
+
+  // Photon credential issuance is intentionally deferred until a durable
+  // outbox drain. A failed mint happens before any physical message RPC, so
+  // leave every intent untouched for the next bounded recovery attempt.
+  let transport: StudioIMessageTransport;
+  try {
+    transport = await getStudioDeliveryTransport(runtime);
+  } catch {
+    return 0;
+  }
+  if (!transport.verified) return 0;
 
   let delivered = 0;
   for (let index = 0; index < MAX_OUTBOX_PER_DRAIN; index += 1) {
@@ -280,7 +301,7 @@ export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number>
       await runtime.store.finishOutbox(claim.record.outboxId, claim.leaseToken, "failed");
       continue;
     }
-    const outcome = await dispatchOutboxEntry(runtime, claim.record, claim.leaseToken, payload);
+    const outcome = await dispatchOutboxEntry(runtime, transport, claim.record, claim.leaseToken, payload);
     // A dark/rollback guard can revoke a media acknowledgement after its
     // queue claim but before the physical iMessage send. The store has already
     // terminalized that intent as canceled, so there is nothing to finish.
@@ -660,6 +681,20 @@ async function handleCreation(
   }
 
   const registry = studioRegistry(runtime);
+  // Never reserve spend or create an executable job from a registry whose
+  // configured release version does not exactly match the committed data.
+  // This remains a user-safe, non-provider response rather than revealing
+  // configuration details or attempting a best-effort fallback.
+  if (!validateRegistryVersion(runtime.environment.modelRegistryVersion, registry).ok) {
+    await enqueueResponse(
+      runtime,
+      record,
+      envelope,
+      `registry-unavailable-${mode}`,
+      "Air’s verified model configuration is unavailable right now. No generation was submitted.",
+    );
+    return "processed";
+  }
   const selection = selectedModel(settings, mode, registry);
   if (!selection.model) {
     await enqueueResponse(runtime, record, envelope, `missing-model-${mode}`, noModelText(mode));
@@ -1233,6 +1268,7 @@ function stableJobId(receiptId: string): string {
 
 async function dispatchOutboxEntry(
   runtime: StudioRuntime,
+  transport: StudioIMessageTransport,
   record: StudioOutboxRecord,
   leaseToken: string,
   payload: StudioOutboxPayload,
@@ -1253,7 +1289,7 @@ async function dispatchOutboxEntry(
     if (!payload.targetMessageId) return Object.freeze({ kind: "failed", code: "missing_tapback_target" });
     if (!await runtime.store.authorizeOutboxDelivery(record, leaseToken)) return null;
     try {
-      return await runtime.transport.addLikeTapback(thread, payload.targetMessageId, idempotencyKey);
+      return await transport.addLikeTapback(thread, payload.targetMessageId, idempotencyKey);
     } catch {
       return Object.freeze({ kind: "send_unknown", code: "tapback_dispatch_unknown" });
     }
@@ -1263,7 +1299,7 @@ async function dispatchOutboxEntry(
   try {
     if (!await runtime.store.authorizeOutboxDelivery(record, leaseToken)) return null;
     try {
-      await runtime.transport.showTyping(thread);
+      await transport.showTyping(thread);
       typingStarted = true;
     } catch {
       // Typing is strictly best-effort and never blocks a durable message.
@@ -1277,12 +1313,12 @@ async function dispatchOutboxEntry(
       if (!payload.text || !isSafeTransportText(payload.text)) {
         return Object.freeze({ kind: "failed", code: "invalid_text_payload" });
       }
-      return await runtime.transport.sendText(thread, payload.text, idempotencyKey);
+      return await transport.sendText(thread, payload.text, idempotencyKey);
     }
-    if (payload.kind !== "prepared-output" || !isStudioPreparedOutputTransport(runtime.transport)) {
+    if (payload.kind !== "prepared-output" || !isStudioPreparedOutputTransport(transport)) {
       return Object.freeze({ kind: "failed", code: "prepared_output_transport_unavailable" });
     }
-    return await runtime.transport.sendPreparedOutput(thread, payload.output, idempotencyKey);
+    return await transport.sendPreparedOutput(thread, payload.output, idempotencyKey);
   } catch {
     // A rejected send promise can occur after the transport accepted bytes, so
     // it is intentionally unknown rather than a retryable failure.
@@ -1290,7 +1326,7 @@ async function dispatchOutboxEntry(
   } finally {
     if (typingStarted) {
       try {
-        await runtime.transport.stopTyping(thread);
+        await transport.stopTyping(thread);
       } catch {
         // No action: a failed stop must not alter the message outcome.
       }

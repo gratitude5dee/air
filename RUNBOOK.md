@@ -1,97 +1,217 @@
-# Air delivery-only iMessage release runbook
+# Air direct production runbook
 
-This procedure makes `air.wzrd.tech` available for one allowlisted, text-only
-iMessage smoke test. It does not authorize image/video generation, provider
-submission/recovery, uploads, polling, artifact delivery, or any paid action.
-The owner sends the test text; release automation never sends an iMessage.
+This runbook covers the direct Vercel deployment at `air.wzrd.tech`. It keeps
+the current release private, fail-closed, and non-billable while the GMI model
+contract and real iMessage path are proved. It does not authorize secret
+retrieval, a provider submission, or a generation command.
 
-## Current delivery-only production baseline
+## Current handoff
 
-As verified on 2026-07-18, Vercel production deployment
-`dpl_5mUTyh6EsHJWpibszP8LrBLTTdSu` is aliased to `air.wzrd.tech`. It contains
-the delivery-only runtime through source commit `5304722`. Its public health
-endpoint returns Air Studio version 2, the authenticated release fence is
-production generation 1, and the Vercel Cron has recorded successful minute
-drains. This is not a Photon-webhook or real-line acceptance record: the
-existing dashboard target and one owner-sent `/help` reply still need to be
-verified before claiming the smoke test passed. Record the new deployment
-identity in the release handoff after every production deployment; do not
-treat this baseline as proof that later code is live.
+- Source of truth: `codex/air-direct-studio`. Zap is retained only to drain or
+  roll back legacy jobs that it already accepted; it is not a new-work path.
+- Live deployment: `dpl_D1R2wKXNQdAC7n2wbPsPV8GUgBb5`, aliased to
+  [`https://air.wzrd.tech`](https://air.wzrd.tech).
+- Verified public probe: `GET /healthz` returned `{"ok":true,"version":"2"}`.
+- Vercel has encrypted `GMI_API_KEY` configuration for Preview and Production.
+  Only the environment-variable name/status was inspected; no value was read.
+- The committed registry still has zero enabled models. The direct provider is
+  therefore unprovisioned at runtime, even with the server-only key present.
+- No real Photon webhook delivery or allowlisted handset `/help` response has
+  been observed for this deployment. Do not mark the iMessage path accepted
+  until that test is completed.
 
-## Preconditions
+The existing shared `$100` cap is a hard background safety control. It does
+not add a per-request approval step, and it does not substitute for the model
+and privacy gates below.
 
-1. Work from the existing Vercel project named `air`; do not create a new
-   project or replace the existing Redis/Photon resources.
-2. Run `npm ci`, `npm run typecheck`, `npm test`, and `npm run build` from the
-   exact revision being deployed.
-3. Configure the existing signed-ingress and privacy fields in Vercel:
-   `IMESSAGE_PROJECT_ID`, `IMESSAGE_PROJECT_SECRET`,
-   `IMESSAGE_WEBHOOK_SECRET`, Redis credentials, `AIR_ID_HASH_SECRET`,
-   `AIR_QUEUE_ENCRYPTION_KEY`, `AIR_ALLOWED_SENDER_HASHES`, `CRON_SECRET`, and
-   `AIR_MODEL_REGISTRY_VERSION=2.1.0`.
-4. Use this exact effective side-effect policy:
+## Non-negotiable operator rules
 
-   ```text
-   AIR_RELEASE_PHASE=production
-   AIR_RELEASE_GENERATION=1
-   AIR_RELEASE_FENCE_SECRET=<independent operator secret>
-   AIR_ACCEPT_NEW_JOBS=false
-   AIR_ALLOW_PROVIDER_SUBMIT=false
-   AIR_ALLOW_PROVIDER_RECOVERY=false
-   AIR_DELIVERY_ENABLED=true
-   AIR_JOB_SPEND_CAP_USD=0
-   AIR_DAILY_SPEND_CAP_USD=0
-   AIR_CANARY_TOTAL_CAP_USD=0
-   AIR_CANARY_FAL_CAP_USD=0
-   ```
+1. Do not retrieve, print, commit, paste, or send any secret. Inspect Vercel
+   environment variables by name/status only; never use an environment pull
+   as a shortcut.
+2. Do not create a second Vercel Cron. The only scheduled job is the minute
+   drain at `/internal/drain-inbox`; `/internal/provider-audit` is manually
+   invoked and authenticated.
+3. Do not turn on a model by flipping a policy flag. The model registry, exact
+   adapter binding, private-output contract, price evidence, release fence,
+   and positive bounded spend policy must agree.
+4. Do not log raw webhook bodies, phone numbers, prompts, provider responses,
+   request IDs, artifact URLs, media bytes, or transport credentials.
+5. Do not use a failed result upload or a `submission_unknown`,
+   `upload_unknown`, or `send_unknown` state as permission to retry a physical
+   provider or Photon action. Those states require reconciliation.
 
-   Keep `GMI_API_KEY` absent. Do not enable a model or alter the zero-model
-   registry. The runtime also treats either zero spend cap as a hard provider
-   kill switch, so a provider call cannot be enabled by a policy flip alone.
-5. Confirm `LOG_LEVEL` is unset or `silent`; do not configure OTLP exporters.
-   The runtime fails closed if either could emit sensitive Photon metadata.
+## Release verification
 
-## Deploy and arm
+Before a future direct deployment, run the checks from the exact source
+revision:
 
-1. Deploy the verified revision to the existing production Vercel project and
-   verify `/healthz` at `https://air.wzrd.tech` reports Air Studio version 2.
-2. Check protected `/internal/readiness`. Before the shared fence is advanced,
-   a send path must not be treated as live.
-3. Read the current secret-free fence epoch with authenticated
-   `GET /internal/release-fence`, then explicitly create/advance it through
-   `POST /internal/release-fence`, authenticated with
-   `AIR_RELEASE_FENCE_SECRET` and the returned literal previous generation.
-   A deployment or Cron invocation never arms the fence by itself.
-4. Wait for Vercel's production minute Cron, then verify protected readiness
-   reports a fresh Cron heartbeat, verified transport, zero enabled models,
-   and no provider problem.
-5. In the Photon dashboard, set the existing project's signed webhook target
-   to `https://air.wzrd.tech/webhooks/imessage` with the existing matching
-   signing secret. The Photon CLI has no webhook-management command.
+```sh
+npm ci
+npm run typecheck
+npm test
+npm run verify:build
+npm run build
+```
 
-## Owner smoke test
+Deploy only to the existing Vercel project, then record the new deployment ID,
+commit, and alias in this section. Confirm the public health route without
+printing configuration:
 
-From the existing allowlisted iMessage number, send `/help` to Air. Confirm
-the text response arrives. On that number's first successful contact, Air also
-queues its two ordered welcome bubbles, so up to three text messages are
-expected; later `/help` requests have only the help response. This may take
-one Cron interval after the signed webhook receipt is accepted. Do not send an
-image, video, attachment, or a generation command during this release.
+```sh
+curl --fail-with-body -sS https://air.wzrd.tech/healthz
+```
 
-## Stop and rollback
+The expected response is the static version response. It does not prove
+Redis, Photon, GMI, a release fence, or paid generation.
 
-- If readiness is unhealthy, the webhook signature is invalid, a send becomes
-  `send_unknown`, or any unexpected provider activity is observed, stop the
-  smoke test. Do not resend automatically.
-- Disable delivery with a new higher release generation and explicit shared
-  fence transition before restoring the prior Vercel deployment/alias. A
-  stale worker must never deliver an older generation's outbox item.
-- Do not delete Redis records, rotate secrets blindly, or create a replacement
-  Photon/Vercel project as a rollback shortcut.
+For a names-only environment check, use the Vercel project/team already in
+scope. The output must be treated as deployment metadata, not secret material:
 
-## Future provider work remains prohibited
+```sh
+vercel env ls production --scope 5dee-studios
+```
 
-Any later image/video capability requires a separate explicit approval,
-authenticated catalog/schema/pricing evidence, a bounded budget, provider
-release fencing, and a real-media delivery review. None of those gates are
-part of this text-only release.
+Do not run `vercel env pull`, do not call a command that echoes a value, and do
+not include an environment value in a support transcript.
+
+## Protected GMI catalog/schema audit
+
+The GMI key may be used only through the deployed read-only audit until a
+separate activation release is approved. From an operator-controlled terminal
+where `CRON_SECRET` is already set, run:
+
+```sh
+curl --fail-with-body -sS \
+  -H "Authorization: Bearer ${CRON_SECRET}" \
+  https://air.wzrd.tech/internal/provider-audit
+```
+
+Never reveal the header value. The response is intentionally safe to retain as
+review evidence and has this shape:
+
+```json
+{
+  "modelId": "flux-kontext-pro",
+  "available": true,
+  "catalogFingerprint": "sha256:<digest>",
+  "schemaFingerprint": "sha256:<digest>",
+  "parameters": [{ "name": "…", "declaredType": "…", "required": true }],
+  "pricing": "manual_console_required"
+}
+```
+
+The route makes only the fixed GMI model-list and exact-model-detail calls. It
+cannot submit, poll, cancel, upload, fetch a result, update a registry, or
+advance a release fence. It returns no raw provider response, key, prompt,
+request ID, result URL, or price.
+
+Interpret the result conservatively:
+
+- `401` means stop and correct the operator authentication path without
+  exposing the credential.
+- `503` means stop and inspect deployment configuration or provider
+  availability through the normal private operator path; do not broaden the
+  route or add logging.
+- `available: false`, a mismatched model ID, or an unexpected parameter schema
+  means `/imagine` stays disabled.
+- `pricing: "manual_console_required"` means obtain the exact account-specific
+  price from GMI Console/Model Hub. Public docs and third-party price pages are
+  not enough.
+
+This audit does not prove result privacy. Before activation, record the exact
+private/signed result host and non-root path prefix for this model and proof
+that the result is not publicly accessible.
+
+## Photon webhook and handset `/help` smoke
+
+This remains the missing live acceptance test.
+
+1. In the existing Photon project, confirm the signed webhook target is
+   `https://air.wzrd.tech/webhooks/imessage` and it uses the already-matching
+   signing secret. Do not create a replacement project, rotate secrets, or
+   expose a line number while checking.
+2. From the already allowlisted owner number, send exactly `/help` to Air. Do
+   not send an attachment or a generation command during this smoke.
+3. Wait through one minute-drain interval. A first successful contact can
+   deliver two ordered welcome bubbles plus the help response; a later `/help`
+   should deliver only the help response.
+4. Record only the timestamp, deployment ID, signed-webhook acceptance, and
+   whether the expected text arrived. Keep the phone number, message body,
+   headers, and identifiers out of logs and handoff notes.
+
+If the response does not arrive, stop. Inspect Photon delivery status and
+Vercel function logs with redaction, verify the signature/target pairing, and
+do not resend attachments or test generation as a diagnostic shortcut. Until
+this result is observed, “iMessage live” remains unproven.
+
+## `/imagine` activation gate
+
+Do not enable paid work in this release. A later `/imagine` activation must
+complete every gate below, in order:
+
+1. Preserve the protected audit response showing exact
+   `flux-kontext-pro` availability and its reviewed parameter schema.
+2. Record the exact account-specific GMI price and an upper bound for the
+   single-image request. Keep the already-approved shared `$100` ceiling in
+   force; it is a ceiling, not a license to substitute a model.
+3. Prove the exact input and result contracts. Result retrieval must be private
+   or signed, non-public, and pinned to a specific host plus non-root path
+   prefix. Do not infer this from a generic documentation example.
+4. Commit and review a registry entry that pins the exact GMI adapter, model
+   ID, request/result schema fingerprints, required payload fields, input
+   policy, output contract, price quote, polling bounds, and private retrieval
+   policy. Run the full release verification suite and deploy it.
+5. Complete the handset `/help` smoke above.
+6. In a separately reviewed release, advance the shared release fence with its
+   authenticated compare-and-swap and explicitly configure admission,
+   provider-submit, provider-recovery, and delivery policies alongside
+   positive bounded spend caps. A flag or key alone must still fail closed.
+7. Submit only the reviewed one-image `/imagine` canary and observe its direct
+   lifecycle without copying a provider URL or media into logs.
+
+`/animate`, `/edit-image`, and `/edit-video` remain disabled after the first
+`/imagine` release. Each needs its own exact model, media-input, pricing, and
+private-output review.
+
+## Result delivery and incident response
+
+The direct lifecycle is intentionally conservative once a reviewed model is
+enabled:
+
+- It can observe only a durably known submitted request; it never resubmits an
+  ambiguous request.
+- It checks the registry's private/signed result allowlist before fetching an
+  artifact.
+- It prepares one Photon attachment, then atomically persists the text
+  preamble, attachment outbox intent, cursor, observation success, and
+  `executing → ready` transition. The preamble is dispatched before the
+  attachment.
+- A crashed or ambiguous attachment upload becomes `upload_unknown` and
+  `reconciliation_required`, without a GMI fetch or Photon re-upload.
+- A transport ambiguity becomes `send_unknown`; it is reconciled, not replayed
+  automatically.
+
+For a rollback or provider safety incident:
+
+1. Stop new admission and provider work through an explicitly reviewed higher
+   release generation/fence transition before moving a Vercel alias.
+2. Preserve encrypted Redis state; do not delete records or rotate secrets
+   blindly.
+3. Reconcile only established evidence through the controlled operational path.
+   Do not make a new provider or Photon request to “see whether it worked.”
+4. Use Zap only for legacy accepted-job drain/rollback support, never to accept
+   a new Air request or replace the direct runtime.
+
+## Handoff checklist
+
+Record the following without secrets or personal data:
+
+- direct branch commit and Vercel deployment ID;
+- public health response/version;
+- GMI audit result fingerprints and reviewed parameter summary (if run);
+- account price evidence reference and the private-output contract review
+  status;
+- release-fence generation/phase (not its secret);
+- Photon webhook target check and handset `/help` outcome;
+- any reconciliation-required job count/state, with opaque IDs only.

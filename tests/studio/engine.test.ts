@@ -38,6 +38,8 @@ function createDarkFixture(options: {
   readonly canaryTotalCents?: number;
   readonly canaryFalCents?: number;
   readonly canaryBudgetId?: string;
+  readonly modelRegistryVersion?: string | undefined;
+  readonly getDeliveryTransport?: (() => Promise<StudioIMessageTransport>) | undefined;
 } = {}) {
   const now = 1_784_990_400_000;
   const cipher = createQueueCipher(Buffer.alloc(32, 23).toString("base64"));
@@ -93,7 +95,7 @@ function createDarkFixture(options: {
     allowedSenderHashes: [senderHash],
     cronSecret: "test-cron-secret",
     publicBaseUrl: "https://air.example.test",
-    modelRegistryVersion: "2.1.0",
+    modelRegistryVersion: options.modelRegistryVersion ?? "2.1.0",
     dailyUserJobLimit: 3,
     activeJobLimit: 1,
     ...(releasePhase === "canary"
@@ -118,6 +120,7 @@ function createDarkFixture(options: {
     cipher,
     store,
     transport,
+    ...(options.getDeliveryTransport === undefined ? {} : { getDeliveryTransport: options.getDeliveryTransport }),
     provider: options.provider ?? new UnprovisionedStudioProvider(),
     ...(options.registry === undefined ? {} : { registry: options.registry }),
     storageTransport: "rest",
@@ -360,6 +363,41 @@ describe("Air studio dark engine", () => {
 
     await expect(drainStudioOutbox(fixture.runtime)).resolves.toBe(0);
     await expect(fixture.store.getOutbox(outboxId)).resolves.toMatchObject({ state: "intent", attempts: 0 });
+    expect(fixture.transport.showTyping).not.toHaveBeenCalled();
+    expect(fixture.transport.sendText).not.toHaveBeenCalled();
+  });
+
+  it("keeps a durable outbox intent unclaimed when deferred Photon setup is unavailable", async () => {
+    const getDeliveryTransport = vi.fn(async (): Promise<StudioIMessageTransport> => {
+      throw new Error("photon-token-service-unavailable");
+    });
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      deliveryEnabled: true,
+      transportVerified: false,
+      getDeliveryTransport,
+    });
+    await armFixtureReleaseFence(fixture);
+    const outboxId = "lazy-transport-unavailable-intent";
+    await fixture.store.createOutbox({
+      outboxId,
+      senderHash: fixture.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: {
+        kind: "text",
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+        text: "Delivery must wait for a later Photon recovery drain.",
+      },
+    });
+
+    await expect(drainStudioOutbox(fixture.runtime)).resolves.toBe(0);
+
+    expect(getDeliveryTransport).toHaveBeenCalledTimes(1);
+    await expect(fixture.store.getOutbox(outboxId)).resolves.toMatchObject({
+      state: "intent",
+      attempts: 0,
+    });
     expect(fixture.transport.showTyping).not.toHaveBeenCalled();
     expect(fixture.transport.sendText).not.toHaveBeenCalled();
   });
@@ -702,6 +740,45 @@ describe("Air studio dark engine", () => {
       return outbox ? textFromOutboxPayload(fixture.store.decryptOutboxPayload(outbox)) : undefined;
     }));
     expect(payloads).toContain("Air has no verified paid execution path enabled in this deployment. No generation was submitted.");
+  });
+
+  it("refuses paid admission and provider work when the configured registry version mismatches", async () => {
+    const provider = {
+      verified: true,
+      submit: vi.fn(async () => Object.freeze({ kind: "accepted" as const, providerRequestId: "must-not-submit" })),
+    } satisfies StudioProviderPort;
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      allowProviderSubmit: true,
+      provider,
+      registry: reviewedImagineRegistry(),
+      modelRegistryVersion: "2.1.1",
+      perJobCents: 100,
+      dailyCents: 100,
+    });
+    await armFixtureReleaseFence(fixture);
+    const admit = vi.spyOn(fixture.store, "admitJobWithInitialNotifications");
+    const receiptId = await persistInbound(fixture, "registry-mismatch-no-admission-001", "/imagine a glass lantern");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "processed" });
+    await expect(fixture.store.getActiveJob(fixture.senderHash)).resolves.toBeNull();
+    expect(admit).not.toHaveBeenCalled();
+    await expect(drainStudioJobs(fixture.runtime)).resolves.toBe(0);
+    expect(provider.submit).not.toHaveBeenCalled();
+
+    const outboxIds = await fixture.redis.zRangeByScore(
+      `${STUDIO_REDIS_PREFIX}:outbox:ready`,
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    const payloads = await Promise.all(outboxIds.map(async (outboxId) => {
+      const outbox = await fixture.store.getOutbox(outboxId);
+      return outbox ? textFromOutboxPayload(fixture.store.decryptOutboxPayload(outbox)) : undefined;
+    }));
+    expect(payloads).toContain("Air’s verified model configuration is unavailable right now. No generation was submitted.");
   });
 
   it("reports a shared canary-budget reservation refusal without submitting", async () => {

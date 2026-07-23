@@ -6,12 +6,15 @@ import {
   canDeliverStudioMessages,
   canRecoverPaidStudioProvider,
 } from "./config.js";
-import { isStudioPreparedOutputTransport } from "./imessage-transport.js";
+import {
+  isStudioPreparedOutputTransport,
+  type StudioIMessageTransport,
+} from "./imessage-transport.js";
 import {
   isStudioProviderObservationPort,
   type StudioProviderObservationResult,
 } from "./provider-port.js";
-import type { StudioRuntime } from "./runtime.js";
+import { getStudioDeliveryTransport, type StudioRuntime } from "./runtime.js";
 import {
   canTransitionJob,
   type StudioExecutionSnapshot,
@@ -63,9 +66,22 @@ export async function advanceStudioProviderResultLifecycle(
     || !runtime.provider.verified
     || !isStudioProviderObservationPort(runtime.provider)
     || !canDeliverStudioMessages(runtime.environment)
-    || !runtime.transport.verified
-    || !isStudioPreparedOutputTransport(runtime.transport)
   ) return frozen({ kind: "disabled" });
+
+  // Private provider output must not be fetched unless a verified Photon
+  // delivery binding is available to retain its opaque prepared GUID. Resolve
+  // that binding only here, after durable job recovery reaches the outbound
+  // boundary; a failed token mint leaves the known provider request untouched
+  // for a later recovery drain.
+  let transport: StudioIMessageTransport;
+  try {
+    transport = await getStudioDeliveryTransport(runtime);
+  } catch {
+    return frozen({ kind: "disabled" });
+  }
+  if (!transport.verified || !isStudioPreparedOutputTransport(transport)) {
+    return frozen({ kind: "disabled" });
+  }
 
   let payload: ReturnType<StudioRuntime["store"]["decryptJobPayload"]>;
   try {
@@ -179,6 +195,7 @@ export async function advanceStudioProviderResultLifecycle(
       case "ready":
         return await prepareReadyProviderResult({
           runtime,
+          transport,
           job,
           snapshot: payload.execution,
           thread: Object.freeze({
@@ -288,6 +305,7 @@ export async function reconcileStudioJobResultDelivery(
 
 async function prepareReadyProviderResult(input: {
   readonly runtime: StudioRuntime;
+  readonly transport: StudioIMessageTransport;
   readonly job: StudioJobRecord;
   readonly snapshot: StudioExecutionSnapshot;
   readonly thread: {
@@ -304,8 +322,8 @@ async function prepareReadyProviderResult(input: {
   readonly subrun: StudioProviderSubrunRecord;
   readonly observationLeaseToken: string;
 }): Promise<StudioProviderResultLifecycleResult> {
-  const { runtime, job, snapshot, thread, artifacts, subrun, observationLeaseToken } = input;
-  if (!isStudioPreparedOutputTransport(runtime.transport)) return frozen({ kind: "disabled" });
+  const { runtime, transport, job, snapshot, thread, artifacts, subrun, observationLeaseToken } = input;
+  if (!isStudioPreparedOutputTransport(transport)) return frozen({ kind: "disabled" });
   // The first enabled adapter is intentionally fixed to Flux's one-image
   // contract. Future multi-output modes need their own atomic multi-output
   // finalizer rather than treating an array as independently retryable.
@@ -381,7 +399,7 @@ async function prepareReadyProviderResult(input: {
 
     let prepared;
     try {
-      prepared = await runtime.transport.prepareValidatedProviderArtifact(thread, artifact);
+      prepared = await transport.prepareValidatedProviderArtifact(thread, artifact);
     } catch {
       prepared = frozen({ kind: "send_unknown" as const, code: "prepared_output_upload_unknown" });
     }

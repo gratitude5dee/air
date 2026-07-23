@@ -12,6 +12,7 @@ import { UnverifiedPhotonTransport, type StudioIMessageTransport } from "./imess
 import {
   AIR_MODEL_REGISTRY,
   resolveDefaultModel,
+  validateRegistryVersion,
   type AirModelRegistry,
   type StudioModel,
 } from "./model-registry.js";
@@ -31,7 +32,19 @@ export interface StudioRuntime {
   readonly environment: StudioEnvironment;
   readonly cipher: QueueCipher;
   readonly store: StudioStore;
+  /**
+   * The inert fallback is deliberately available for compatibility and dark
+   * release checks. Call `getStudioDeliveryTransport` immediately before an
+   * outbound action so receipt durability never depends on Photon token
+   * issuance.
+   */
   readonly transport: StudioIMessageTransport;
+  /**
+   * Production runtime composition creates this resolver without contacting
+   * Photon. It is optional so already-constructed test and drain runtimes
+   * retain their exact injected transport behavior.
+   */
+  readonly getDeliveryTransport?: (() => Promise<StudioIMessageTransport>) | undefined;
   /** Never live by default; the executor rejects this unverified provider. */
   readonly provider: StudioProviderPort;
   /** Committed registry; tests may inject a reviewed fixture without mutating code defaults. */
@@ -61,6 +74,18 @@ export async function getStudioRuntime(): Promise<StudioRuntime> {
   return runtimePromise;
 }
 
+/**
+ * Resolves the direct Photon binding only at a delivery boundary. A rejected
+ * token issuance is intentionally surfaced to the caller rather than cached:
+ * the durable outbox can retry later, while signed inbound receipt persistence
+ * remains independent of all outbound credentials.
+ */
+export async function getStudioDeliveryTransport(runtime: StudioRuntime): Promise<StudioIMessageTransport> {
+  return runtime.getDeliveryTransport === undefined
+    ? runtime.transport
+    : await runtime.getDeliveryTransport();
+}
+
 export async function createStudioRuntime(
   environment: StudioEnvironment = loadStudioEnvironment(),
   transport?: StudioIMessageTransport,
@@ -69,10 +94,22 @@ export async function createStudioRuntime(
   if (!environment.idHashSecret || !environment.queueEncryptionKey || environment.storageTransport === "unconfigured") {
     throw new Error("studio runtime configuration is incomplete");
   }
-  const configuredTransport = transport ?? await createConfiguredIMessageTransport(environment);
   const configuredProvider = createConfiguredStudioProvider(environment, AIR_MODEL_REGISTRY, provider);
   const connection = await connectExistingRedis(environment);
-  return runtimeFromConnectedRedis(environment, connection, configuredTransport, configuredProvider);
+  // Do not mint a Photon token while acknowledging an inbound webhook. The
+  // receipt reaches Redis first; a later outbox/job-delivery drain resolves
+  // the transport immediately before a physical Photon action.
+  const configuredTransport = transport ?? new UnverifiedPhotonTransport();
+  const getDeliveryTransport = transport === undefined
+    ? createLazyIMessageTransportResolver(() => createConfiguredIMessageTransport(environment))
+    : undefined;
+  return runtimeFromConnectedRedis(
+    environment,
+    connection,
+    configuredTransport,
+    configuredProvider,
+    getDeliveryTransport,
+  );
 }
 
 /**
@@ -86,6 +123,14 @@ export function createConfiguredStudioProvider(
   registry: AirModelRegistry = AIR_MODEL_REGISTRY,
   injectedProvider?: StudioProviderPort,
 ): StudioProviderPort {
+  // A stale environment value is not merely a readiness concern. It means the
+  // runtime cannot prove that the immutable registry it is about to bind is
+  // the one the release was configured to run. Keep both real composition and
+  // test-only injection fail-closed so a version-drift deployment cannot make
+  // a paid provider reachable.
+  if (!validateRegistryVersion(environment.modelRegistryVersion, registry).ok) {
+    return new UnprovisionedStudioProvider();
+  }
   if (injectedProvider !== undefined) return injectedProvider;
 
   const model = reviewedFluxKontextProImagineDefault(registry);
@@ -208,11 +253,40 @@ async function createConfiguredIMessageTransport(environment: StudioEnvironment)
   });
 }
 
+/**
+ * Retain one successfully verified transport for the lifetime of this Vercel
+ * runtime, while allowing a failed initial token issuance to be retried by a
+ * future durable drain. No Photon package is imported until this resolver is
+ * actually invoked.
+ */
+export function createLazyIMessageTransportResolver(
+  createTransport: () => Promise<StudioIMessageTransport>,
+): () => Promise<StudioIMessageTransport> {
+  let resolved: StudioIMessageTransport | undefined;
+  let inFlight: Promise<StudioIMessageTransport> | undefined;
+
+  return async (): Promise<StudioIMessageTransport> => {
+    if (resolved !== undefined) return resolved;
+    if (inFlight === undefined) {
+      inFlight = createTransport()
+        .then((transport) => {
+          resolved = transport;
+          return transport;
+        })
+        .finally(() => {
+          inFlight = undefined;
+        });
+    }
+    return await inFlight;
+  };
+}
+
 function runtimeFromConnectedRedis(
   environment: StudioEnvironment,
   connection: ConnectedRedis,
   transport: StudioIMessageTransport,
   provider: StudioProviderPort,
+  getDeliveryTransport?: (() => Promise<StudioIMessageTransport>) | undefined,
 ): StudioRuntime {
   const cipher = createQueueCipher(environment.queueEncryptionKey as string);
   const store = new StudioStore({
@@ -229,6 +303,7 @@ function runtimeFromConnectedRedis(
     cipher,
     store,
     transport,
+    ...(getDeliveryTransport === undefined ? {} : { getDeliveryTransport }),
     provider,
     registry: AIR_MODEL_REGISTRY,
     storageTransport: environment.storageTransport === "rest" ? "rest" : "tcp",

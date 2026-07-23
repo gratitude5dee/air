@@ -1,63 +1,59 @@
 # Air
 
 Air is a private, allowlisted image-and-video studio operated entirely through
-iMessage. The source supports a narrowly scoped **delivery-only iMessage
-smoke release**: allowlisted users can receive bounded text help/status
-responses, while all image/video generation and every provider action remain
-disabled. The direct-studio delivery-only release is now promoted at
-`air.wzrd.tech`; Photon webhook binding and the owner-controlled real-line
-`/help` smoke remain the last verification steps.
+iMessage. Its direct Vercel runtime is the source of truth; it does not route
+new work through Zap, Eve, a chat adapter, or an LLM runtime. Zap remains
+available only to drain or roll back jobs that were accepted by an older
+deployment.
 
-There is no Eve, Zap, chat adapter, or LLM runtime in the Air request path.
-When enabled in a later approved release, Air will use the direct GMI Request
-Queue boundary; it does not delegate generation to another application.
+## Live status
 
-## Privacy and durability
+The current direct release is Vercel deployment
+`dpl_D1R2wKXNQdAC7n2wbPsPV8GUgBb5` from `codex/air-direct-studio`, aliased to
+[`https://air.wzrd.tech`](https://air.wzrd.tech). Its public health endpoint
+returned `{"ok":true,"version":"2"}` after deployment.
+
+This is **not** a paid-generation activation:
+
+- The committed `2.1.0` model registry has zero enabled models and no mode
+  defaults. `/imagine`, `/animate`, `/edit-image`, and `/edit-video` cannot
+  reserve spend or call a provider.
+- `GMI_API_KEY` is present as an encrypted, server-only Vercel environment
+  variable for Preview and Production. Its value was not retrieved. A key by
+  itself cannot provision the runtime: provider composition requires one
+  exactly reviewed, enabled registry entry.
+- The already-approved shared `$100` ceiling remains a background hard safety
+  control. It is not a user-confirmation step and it is not a model approval.
+- The direct Photon webhook configuration and an owner-originated allowlisted
+  `/help` reply have not yet been observed on this deployment. Text delivery
+  is therefore deployed but not yet accepted as a handset smoke result.
+
+## Privacy and ingress guarantees
 
 - Only direct messages from HMAC-hashed allowlisted senders are eligible.
-- The sole unauthenticated ingress is `POST /webhooks/imessage`. It checks the
-  raw Photon/Spectrum signature before parsing JSON, then encrypts and
-  idempotently persists a receipt before returning `200`.
-- Prompts, sender identifiers, thread identifiers, attachment references,
-  settings, and outbox payloads are encrypted in the existing Redis resource.
-  Media bytes are never stored in Redis or logs.
-- Once an inbox receipt reaches a terminal state, its encrypted prompt,
-  attachment, and thread envelope is atomically erased; only pseudonymous
-  receipt metadata remains for bounded idempotency/audit retention.
-- Job admission metadata likewise remains recoverable without expiry while
-  nonterminal, but its encrypted prompt/input/thread snapshot is a separate,
-  immutable 24-hour record. A future executor must terminalize an expired
-  snapshot as a known privacy failure rather than reconstructing it.
-- Pending media is encrypted for an absolute maximum of ten minutes. Each
-  project/sender/chat/line scope has a durable opaque receipt sequence, so a
-  retry cannot overwrite a newer pending item, revive a cancellation, or
-  extend that retention window. Media-first corrections are durable `dueAt`
-  entries delayed 500 ms rather than an open-function debounce.
-- First-contact settings, both ordered welcome-message intents, and an opaque
-  non-expiring enrollment marker are committed in one Redis transaction. A
-  crash or duplicate webhook therefore cannot leave a user marked onboarded
-  with a missing bubble, or create a second welcome sequence.
-- The release starts with every side-effect switch explicitly `false`. Missing
-  switches also fail closed.
-- A zero per-job or daily spend cap is a hard provider kill switch even if a
-  later operator accidentally enables a raw provider policy flag.
-- Provider ambiguity and iMessage delivery ambiguity are never retried
-  blindly. The direct Photon transport supplies the durable outbox ID as the
-  provider `clientMessageId`, disables client retry, and turns a failed send
-  RPC into `send_unknown` for reconciliation rather than replaying it.
-- Direct transport is text-only. Attachment upload/fetch, tapbacks, reply
-  dispatch, media generation, provider submission, provider polling, and
-  provider recovery all remain disabled.
+- `POST /webhooks/imessage` is the sole unauthenticated ingress. It verifies
+  the raw Photon/Spectrum signature before JSON parsing, then encrypts and
+  idempotently persists the receipt before returning `200`.
+- Prompts, sender/thread identifiers, attachment references, settings, and
+  outbox payloads are encrypted in Redis. Media bytes, API keys, raw provider
+  replies, provider URLs, and raw iMessage content are not logged.
+- Terminal inbox records erase their encrypted prompt, attachment, and thread
+  envelope; only bounded pseudonymous idempotency/audit metadata remains.
+- Pending media is encrypted for at most ten minutes. Admission snapshots and
+  outbox payloads have independent, bounded retention and cannot be extended
+  by a retry.
+- Every outbound intent is stamped with the shared release generation. A stale
+  or missing fence cancels or pauses delivery before transport dispatch.
 
 ```mermaid
 flowchart LR
   I["Allowlisted iMessage user"] --> P["Photon / Spectrum webhook"]
   P --> W["Raw-signature verification"]
-  W --> R["Encrypted existing Redis inbox"]
-  R --> D["Vercel drain and durable outbox"]
-  D -. "zero-model / zero-spend provider gate" .-> G["Direct GMI Request Queue"]
-  D --> T["Direct Photon transport (text only)"]
+  W --> R["Encrypted Redis receipt and outbox"]
+  R --> D["Vercel minute drain"]
+  D --> T["Direct Photon transport"]
   T --> I
+  D -. "disabled until reviewed registry + evidence" .-> G["Direct GMI Request Queue"]
 ```
 
 ## Route surface
@@ -68,109 +64,123 @@ flowchart LR
 | `/healthz` | `GET` | Static health response with no dependency details. |
 | `/webhooks/imessage` | `POST` | Signed iMessage receipt ingress. |
 | `/internal/drain-inbox` | `GET`, `POST` | `CRON_SECRET` bearer-protected minute recovery route. |
+| `/internal/provider-audit` | `GET` | Manually invoked, `CRON_SECRET` bearer-protected, read-only GMI contract review. |
 | `/internal/readiness` | `GET` | `CRON_SECRET` bearer-protected, secret-safe readiness report. |
 | `/internal/release-fence` | `GET`, `POST` | `AIR_RELEASE_FENCE_SECRET` bearer-protected epoch read and release-generation CAS. |
 
-`vercel.json` declares the recovery cron exactly once, every minute, with a
-60-second function limit. The operator routes do not reveal configuration
-values, raw messages, sender hashes, or provider responses. Readiness probes
-only a fixed Redis operational key; it reports coarse Redis and Cron status,
-the configured switches, and their effective release-phase-gated state.
+`vercel.json` declares exactly one Cron: `/internal/drain-inbox` every minute,
+with a 60-second function limit. The provider-audit route is intentionally not
+a Cron and is never reachable without its bearer check.
 
-## Current deployment state
+## Safe server-only GMI audit
 
-The committed model registry contains **zero enabled models**. This is
-intentional: no GMI catalog, model schema, input-hosting rule, or price quote
-has been verified by authenticated evidence. Consequently `/models` is empty
-and creation commands cannot reserve spend or call a provider.
+`GET /internal/provider-audit` is the only live use of the GMI credential in
+the current release. It is deliberately narrow:
 
-The existing Vercel project is `air` at `air.wzrd.tech`. As verified on
-2026-07-18, production deployment `dpl_5mUTyh6EsHJWpibszP8LrBLTTdSu` is the
-promoted delivery-only runtime (source through `5304722`). Its public health
-endpoint reports Air Studio version 2 and Vercel records a successful
-protected drain every minute. The shared release fence is production
-generation 1. The production smoke release enables only
-`AIR_DELIVERY_ENABLED`; it leaves every provider and
-paid-generation switch false, keeps the registry at zero enabled models, and
-does not configure GMI or fal credentials. Photon webhook binding and the real
-allowlisted `/help` response are intentionally not claimed until they are
-observed.
+- It accepts only `GET` with the existing `CRON_SECRET` bearer credential.
+- It makes only the fixed, read-only catalog and exact-model-detail requests
+  for `flux-kontext-pro`.
+- It cannot submit, poll, cancel, upload, fetch an artifact, enable a model,
+  or modify the registry or release fence.
+- Its response contains a fixed model ID, availability, minimized parameter
+  names/types/requiredness, and deterministic evidence fingerprints. It does
+  not return raw GMI payloads, API keys, prompts, request IDs, result URLs, or
+  prices. `pricing: "manual_console_required"` is expected.
 
-## Configuration
+An operator may invoke it from a terminal where they already hold the secret;
+never paste `CRON_SECRET` into chat, source, a URL, or logs:
 
-Use [`.env.example`](.env.example) as a names-only template. Production and
-preview secrets belong in Vercel, never in Git or logs. The existing Upstash
-REST pair is preferred in serverless; `REDIS_URL` is a validated fallback.
-
-For a protected dark deployment, set every side-effect switch explicitly:
-
-```text
-AIR_RELEASE_PHASE=dark
-AIR_RELEASE_GENERATION=0
-AIR_ACCEPT_NEW_JOBS=false
-AIR_ALLOW_PROVIDER_SUBMIT=false
-AIR_ALLOW_PROVIDER_RECOVERY=false
-AIR_DELIVERY_ENABLED=false
-AIR_MODEL_REGISTRY_VERSION=2.1.0
+```sh
+curl --fail-with-body -sS \
+  -H "Authorization: Bearer ${CRON_SECRET}" \
+  https://air.wzrd.tech/internal/provider-audit
 ```
 
-Keep `GMI_API_KEY` absent for the dark deployment. The key is only relevant
-after a separate Fable approval authorizes an authenticated catalog/schema
-verification and a limited canary.
+A `401` or `503` is a stop condition, not a reason to expose a secret or
+broaden the endpoint. A successful audit is evidence for review only; it does
+not activate `/imagine`.
 
-For the approved delivery-only smoke release, use a positive production
-generation and an independent `AIR_RELEASE_FENCE_SECRET`, keep all three
-provider/job switches `false`, set `AIR_DELIVERY_ENABLED=true`, and retain all
-spend caps at zero. The full procedure is in [RUNBOOK.md](RUNBOOK.md).
+## Dormant direct provider-result delivery path
 
-## Release fence
+The direct result lifecycle is implemented and tested, but it remains dormant
+until the registry and release gates are satisfied. When a model is reviewed
+and enabled, it protects the post-submit path as follows:
 
-Every Studio outbox intent carries the deployment's `{ generation, phase }`.
-An authenticated operator reads the secret-free shared epoch with `GET` and
-explicitly creates or advances it using `POST /internal/release-fence` and a
-literal `If-Match` generation;
-deploying code or running Cron never arms it. The first record is dark
-generation `0` with `If-Match: -1`; later deployments advance exactly one
-generation at a time. The endpoint returns no state details and is not part of
-this dark preview procedure.
+1. It observes only a durably known provider request; an ambiguous submission
+   is terminalized for reconciliation rather than resubmitted.
+2. It permits result retrieval only through the registry's exact reviewed
+   host/path prefix and private or signed access contract. The registry must
+   assert `publiclyAccessible: false`.
+3. A validated result is prepared as one native Photon attachment. An expired
+   or ambiguous upload becomes `upload_unknown` and
+   `reconciliation_required`; Air does not refetch the provider result or
+   repeat the Photon upload.
+4. One atomic finalizer persists the text preamble, the attachment intent,
+   the delivery cursor, the successful observation, and `executing → ready`.
+   Dispatch enforces preamble-before-attachment ordering.
+5. A transport ambiguity becomes `send_unknown` for reconciliation, never an
+   automatic physical resend. A release-fence mismatch blocks stale outbox
+   delivery before dispatch.
 
-At outbox publication, a nonmatching generation is refused. At claim and
-immediately before physical dispatch, an already-persisted stale record is
-canceled without delivery. A missing or corrupt active fence pauses safely
-before dispatch. This protects generic onboarding, help, status, maintenance,
-and pending-assembly messages alike.
-It cannot revoke a transport call already authorized by an older worker, so a
-future real-line rollback drill must reconcile any such `send_unknown` record.
+These safeguards do not establish that a provider model is approved, private,
+priced, or live. They are failure boundaries for a later reviewed release.
 
-The codebase now contains a fake-backed, **unprovisioned** provider-submission
-foundation. It persists an encrypted admission snapshot and a durable
-submission intent before an injected provider port could be called; an
-ambiguous outcome becomes `submission_unknown` and is never replayed. The
-deployed runtime supplies an unverified provider port and does not invoke this
-executor from ingress or Cron, so it does not make a provider path live.
+## Conditions to activate `/imagine`
 
-The store also contains dark-only, fake-tested reconciliation primitives. They
-compare exact record versions, record only opaque actor/audit metadata, and
-never call a provider or transport. A verified provider request ID can be
-attached to an ambiguous subrun; an ambiguous iMessage send can be confirmed
-or requeued exactly once as a new delivery attempt. Requeue preserves the
-original lane and payload's remaining 24-hour TTL; an expired payload becomes
-the terminal `artifact_expired` state rather than being refetched or resent.
-No reconciliation HTTP endpoint is exposed in the dark preview.
+`/imagine` is the first proposed paid mode. It remains disabled until all of
+the following are recorded and deployed together:
 
-Provider catalog/schema evidence, price authority, media upload/download,
-polling, output delivery, real transport proof, and a bounded rollback drill
-remain mandatory canary gates. The outbox and pre-submit fences are not an
-activation approval.
+1. The protected audit confirms exact `flux-kontext-pro` availability and its
+   request schema, producing reviewable catalog and schema fingerprints.
+2. An operator reviews the account-specific GMI Console/Model Hub price and
+   records an exact bounded quote; public documentation is not price
+   authority.
+3. The output contract is proven private/signed for this exact model, including
+   its exact result host and non-root path prefix. Generic provider examples
+   are not sufficient.
+4. A reviewed committed registry entry pins the adapter, request/result schema
+   fingerprints, input policy, output policy, price quote, polling bounds, and
+   one-image contract. The release must then pass typecheck, tests, and the
+   Vercel build verifier.
+5. The direct Photon webhook and allowlisted handset `/help` smoke have passed.
+6. A separately reviewed release advances the shared release fence and keeps
+   the existing `$100` hard ceiling in force. Flags alone can never enable
+   spend.
 
-## Checks and dark-preview runbook
+`/animate`, `/edit-image`, and `/edit-video` remain disabled after an
+`/imagine` activation until each has its own exact model, media, price, and
+private-output evidence.
+
+## Configuration and release fence
+
+Use [`.env.example`](.env.example) as a names-only dark-development template;
+it intentionally leaves `GMI_API_KEY` absent. Production secrets belong in
+Vercel and must be checked by name/status only, never pulled into a local file
+or printed. In particular, `GMI_API_KEY`, Photon credentials, Redis tokens,
+allowlist hashes, `CRON_SECRET`, and `AIR_RELEASE_FENCE_SECRET` stay
+server-only.
+
+Paid provider work requires all of the following at runtime: an active release
+phase, explicit admission/submit policy, explicit positive per-job and daily
+caps, a matching release fence, and a verified provider composed from the
+committed registry. Provider recovery has its own explicit policy so a
+rollback can stop new work without guessing about an already known request.
+
+The fence is advanced only through authenticated compare-and-swap. Deploying
+code or allowing the minute Cron to run does not arm a release. At publication,
+claim, and dispatch, a nonmatching generation is blocked; the fence cannot
+undo a transport call already authorized by an older worker, so that edge
+remains a reconciliation event.
+
+## Checks
 
 ```sh
 npm ci
 npm run typecheck
 npm test
+npm run verify:build
 npm run build
 ```
 
-See [RUNBOOK.md](RUNBOOK.md) for the exact non-billable preview procedure,
-rollback, and the approval gates for provider and iMessage enablement.
+See [RUNBOOK.md](RUNBOOK.md) for the current deployment handoff, protected
+audit procedure, handset smoke test, activation gates, and rollback behavior.
