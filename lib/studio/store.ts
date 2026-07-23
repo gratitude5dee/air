@@ -77,6 +77,65 @@ export interface StudioPreparedOutput {
   readonly attachmentGuid: string;
 }
 
+/**
+ * The upload of a provider artifact is a separate physical Photon side
+ * effect.  It is deliberately tracked before bytes leave Air so a worker
+ * crash between Photon accepting an upload and Redis receiving its GUID can
+ * never look safe to retry.
+ */
+export const STUDIO_JOB_RESULT_PREPARATION_STATES = Object.freeze([
+  "reserved",
+  "uploading",
+  "prepared",
+  "upload_unknown",
+  "failed",
+  "canceled",
+] as const);
+export type StudioJobResultPreparationState = (typeof STUDIO_JOB_RESULT_PREPARATION_STATES)[number];
+
+/**
+ * Content-free, durable ownership record for one output's Photon upload.
+ * The small Photon GUID itself is separately encrypted and expires with the
+ * immutable job payload; this metadata intentionally contains no provider
+ * artifact reference, filename, route, or user content.
+ */
+export interface StudioJobResultPreparationRecord {
+  readonly schemaVersion: 1;
+  readonly preparationId: string;
+  readonly jobId: string;
+  readonly outputIndex: number;
+  readonly state: StudioJobResultPreparationState;
+  readonly stateVersion: number;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+/** The encrypted reference stores only an already-uploaded native Photon GUID. */
+interface StudioJobResultPreparationReference {
+  readonly output: StudioPreparedOutput;
+}
+
+export type StudioJobResultPreparationBeginResult =
+  | { readonly kind: "ready"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "prepared"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "upload_unknown"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "failed" | "canceled"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "release_blocked" | "payload_expiring"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "lease_lost" | "unavailable" };
+
+export type StudioJobResultPreparationFinishOutcome =
+  | { readonly kind: "prepared"; readonly output: StudioPreparedOutput }
+  | { readonly kind: "retryable_failure" }
+  | { readonly kind: "failed" }
+  | { readonly kind: "upload_unknown" };
+
+export type StudioJobResultPreparationFinishResult =
+  | { readonly kind: "prepared"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "retryable_failure"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "failed"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "upload_unknown"; readonly preparation: StudioJobResultPreparationRecord }
+  | { readonly kind: "lease_lost" | "unavailable" };
+
 /** Stored encrypted. No prompt, phone, GUID, or media bytes is visible in Redis metadata. */
 export interface StudioInboundEnvelope {
   readonly chatGuid: string;
@@ -685,6 +744,12 @@ const JOB_CLAIM_SCAN_LIMIT = 16;
  * provider call can be rolled back after it has begun.
  */
 export const STUDIO_PROVIDER_REFERENCE_COMMIT_WINDOW_MS = LEASE_TTL_MS + 5_000;
+/**
+ * A Photon upload must leave the same bounded persistence margin as a
+ * provider submission. If the immutable job payload cannot survive that
+ * window, Air does not start a physical upload it could not durably bind.
+ */
+export const STUDIO_RESULT_PREPARATION_COMMIT_WINDOW_MS = LEASE_TTL_MS + 5_000;
 const MAX_INBOX_RETRY_DELAY_MS = 24 * 60 * 60 * 1_000;
 const OUTBOX_RETRY_BACKOFF_MS = 30_000;
 const CRON_HEARTBEAT_TTL_SECONDS = 24 * 60 * 60;
@@ -1710,6 +1775,239 @@ export class StudioStore {
     return record && isProviderSubrunRecord(record) ? Object.freeze(record) : null;
   }
 
+  /**
+   * Creates the opaque upload record before a Photon upload is allowed to
+   * start. The ID is deterministic for one `{job, output}` pair, so a retry
+   * can only observe the same preparation state; it can never allocate a
+   * second physical-upload intent.
+   */
+  public async ensureJobResultPreparation(
+    jobId: string,
+    outputIndex: number,
+  ): Promise<StudioJobResultPreparationRecord | null> {
+    if (!isSafeRecordString(jobId, 160) || !isPositiveSafeInteger(outputIndex) || outputIndex > 4) return null;
+    const job = await this.getJob(jobId);
+    // A fresh Photon upload is only meaningful while the provider result is
+    // still being observed. Existing prepared records remain readable after
+    // this state changes through `getJobResultPreparation` below.
+    if (
+      !job
+      || job.jobId !== jobId
+      || job.state !== "executing"
+      || outputIndex > job.outputCount
+      || !job.encryptedPayload
+    ) return null;
+
+    const preparationId = this.jobResultPreparationId(jobId, outputIndex);
+    const now = this.now();
+    const template: StudioJobResultPreparationRecord = Object.freeze({
+      schemaVersion: 1,
+      preparationId,
+      jobId,
+      outputIndex,
+      state: "reserved",
+      stateVersion: 1,
+      createdAtMs: now,
+      updatedAtMs: now,
+    });
+    const created = await this.redis.set(this.jobResultPreparationKey(preparationId), JSON.stringify(template), { nx: true });
+    if (created === "OK") return template;
+    const existing = await this.getJobResultPreparation(jobId, outputIndex);
+    if (!existing || !sameJobResultPreparationIdentity(existing, template)) return null;
+    return existing;
+  }
+
+  /** Reads content-free upload state for one deterministic provider output. */
+  public async getJobResultPreparation(
+    jobId: string,
+    outputIndex: number,
+  ): Promise<StudioJobResultPreparationRecord | null> {
+    if (!isSafeRecordString(jobId, 160) || !isPositiveSafeInteger(outputIndex) || outputIndex > 4) return null;
+    const preparationId = this.jobResultPreparationId(jobId, outputIndex);
+    const record = parseStored<StudioJobResultPreparationRecord>(await this.redis.get(this.jobResultPreparationKey(preparationId)));
+    if (!record || !isJobResultPreparationRecord(record)) return null;
+    if (record.preparationId !== preparationId || record.jobId !== jobId || record.outputIndex !== outputIndex) return null;
+    return Object.freeze(record);
+  }
+
+  /** One lease spans only the upload-to-durable-GUID boundary. */
+  public async acquireJobResultPreparationLease(
+    jobId: string,
+    outputIndex: number,
+  ): Promise<RedisLease | null> {
+    if (!isSafeRecordString(jobId, 160) || !isPositiveSafeInteger(outputIndex) || outputIndex > 4) return null;
+    return acquireRedisLease(this.redis, this.jobResultPreparationLeaseKey(this.jobResultPreparationId(jobId, outputIndex)), {
+      now: this.now,
+      ttlMs: LEASE_TTL_MS,
+    });
+  }
+
+  /**
+   * Writes `uploading` before the Photon RPC. If a predecessor's lease has
+   * expired while that state is present, the operation is irrevocably marked
+   * `upload_unknown` and the job is fenced into reconciliation instead of
+   * uploading the provider artifact a second time.
+   */
+  public async beginJobResultPreparation(
+    job: Pick<StudioJobRecord, "jobId" | "state" | "stateVersion">,
+    outputIndex: number,
+    leaseToken: string,
+  ): Promise<StudioJobResultPreparationBeginResult> {
+    if (
+      !isSafeRecordString(job.jobId, 160)
+      || !isPositiveSafeInteger(outputIndex)
+      || outputIndex > 4
+      || !isSafeRecordString(leaseToken, 256)
+    ) return Object.freeze({ kind: "unavailable" });
+    const preparationId = this.jobResultPreparationId(job.jobId, outputIndex);
+    const result = await this.redis.eval(BEGIN_JOB_RESULT_PREPARATION_LUA, {
+      keys: [
+        this.jobResultPreparationKey(preparationId),
+        this.jobResultPreparationReferenceKey(preparationId),
+        this.jobResultPreparationLeaseKey(preparationId),
+        this.releaseFenceKey(),
+        this.jobKey(job.jobId),
+        this.jobPayloadKey(job.jobId),
+        this.readyJobKey(),
+        this.jobResultCursorKey(job.jobId),
+      ],
+      arguments: [
+        leaseToken,
+        String(this.now()),
+        String(this.releaseStamp.generation),
+        this.releaseStamp.phase,
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        job.jobId,
+        String(job.stateVersion),
+        String(STUDIO_RESULT_PREPARATION_COMMIT_WINDOW_MS),
+        String(outputIndex),
+      ],
+    });
+    return parseJobResultPreparationBeginResult(typeof result === "string" ? result : null);
+  }
+
+  /**
+   * Commits the local outcome after the upload RPC. A successful GUID is
+   * encrypted under the preparation ID and receives the job payload's
+   * remaining TTL. The result cursor/outbox is intentionally a later,
+   * recoverable step: a crash after this commit can publish without another
+   * Photon upload.
+   */
+  public async finishJobResultPreparation(
+    job: Pick<StudioJobRecord, "jobId" | "state" | "stateVersion">,
+    outputIndex: number,
+    leaseToken: string,
+    outcome: StudioJobResultPreparationFinishOutcome,
+  ): Promise<StudioJobResultPreparationFinishResult> {
+    if (
+      !isSafeRecordString(job.jobId, 160)
+      || !isPositiveSafeInteger(outputIndex)
+      || outputIndex > 4
+      || !isSafeRecordString(leaseToken, 256)
+    ) return Object.freeze({ kind: "unavailable" });
+    const preparationId = this.jobResultPreparationId(job.jobId, outputIndex);
+    const normalizedOutcome = outcome.kind === "prepared" && !isStudioPreparedOutput(outcome.output)
+      ? ({ kind: "upload_unknown" } as const)
+      : outcome;
+    const encryptedReference = normalizedOutcome.kind === "prepared"
+      ? this.cipher.encrypt({ output: normalizedOutcome.output }, `job-result-preparation:${preparationId}`)
+      : undefined;
+    const result = await this.redis.eval(FINISH_JOB_RESULT_PREPARATION_LUA, {
+      keys: [
+        this.jobResultPreparationKey(preparationId),
+        this.jobResultPreparationReferenceKey(preparationId),
+        this.jobResultPreparationLeaseKey(preparationId),
+        this.jobKey(job.jobId),
+        this.jobPayloadKey(job.jobId),
+        this.readyJobKey(),
+      ],
+      arguments: [
+        leaseToken,
+        normalizedOutcome.kind,
+        encryptedReference === undefined ? "" : JSON.stringify(encryptedReference),
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        job.jobId,
+        String(outputIndex),
+      ],
+    });
+    return parseJobResultPreparationFinishResult(typeof result === "string" ? result : null);
+  }
+
+  /**
+   * Returns the GUID only from a completed encrypted preparation record. A
+   * caller cannot manufacture this shape from an inbound attachment or a
+   * provider URL; the durable reference must be present and decrypt cleanly.
+   */
+  public async getPreparedJobResultOutput(
+    jobId: string,
+    outputIndex: number,
+  ): Promise<StudioPreparedOutput | null> {
+    const preparation = await this.getJobResultPreparation(jobId, outputIndex);
+    if (!preparation || preparation.state !== "prepared") return null;
+    const encrypted = parseStored<EncryptedPayload>(
+      await this.redis.get(this.jobResultPreparationReferenceKey(preparation.preparationId)),
+    );
+    if (!encrypted) return null;
+    try {
+      const reference = this.cipher.decrypt<StudioJobResultPreparationReference>(
+        encrypted,
+        `job-result-preparation:${preparation.preparationId}`,
+      );
+      return isStudioPreparedOutput(reference.output) ? Object.freeze(reference.output) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Publishes an already-durable Photon GUID through the existing sequential
+   * result cursor. It never receives provider bytes or URLs and therefore
+   * cannot re-run the upload side effect after a recovery.
+   */
+  public async publishPreparedJobResult(
+    jobId: string,
+    outputIndex: number,
+  ): Promise<StudioJobResultPublishResult> {
+    if (!isSafeRecordString(jobId, 160) || !isPositiveSafeInteger(outputIndex) || outputIndex > 4) {
+      return Object.freeze({ kind: "unavailable" });
+    }
+    // Once the cursor exists it is the durable publication authority, even
+    // after the short-lived encrypted Photon reference has expired. This is
+    // the recovery path for a crash after cursor publication but before a
+    // caller observed its response.
+    const existingCursor = await this.getJobResultCursor(jobId);
+    const existingOutput = existingCursor?.outputs.find((output) => output.outputIndex === outputIndex);
+    if (existingCursor && existingOutput) {
+      const outbox = await this.getOutbox(existingOutput.outboxId);
+      if (outbox) return Object.freeze({ kind: "existing", cursor: existingCursor, outbox });
+    }
+    const output = await this.getPreparedJobResultOutput(jobId, outputIndex);
+    if (!output) return Object.freeze({ kind: "unavailable" });
+    const job = await this.getJob(jobId);
+    if (!job) return Object.freeze({ kind: "unavailable" });
+    let payload: StudioJobPayload;
+    try {
+      payload = this.decryptJobPayload(job);
+    } catch {
+      return Object.freeze({ kind: "unavailable" });
+    }
+    return this.publishJobResult({
+      jobId,
+      outputIndex,
+      payload: Object.freeze({
+        kind: "prepared-output" as const,
+        outputIndex,
+        output,
+        thread: Object.freeze({
+          chatGuid: payload.chatGuid,
+          sendingLine: payload.sendingLine,
+          ...(payload.replyTargetId === undefined ? {} : { replyTargetId: payload.replyTargetId }),
+        }),
+      }),
+    });
+  }
+
   /** Read the encrypted provider reference only when a bounded recovery needs it. */
   public async getProviderSubrunReference(subrunId: string): Promise<StudioProviderSubrunReference | null> {
     if (!isOpaqueStudioIdentifier(subrunId)) return null;
@@ -2522,6 +2820,18 @@ export class StudioStore {
   private readyJobKey(): string { return `${this.prefix}:job:ready`; }
   private jobLeaseKey(jobId: string): string { return `${this.prefix}:job:lease:${jobId}`; }
   private jobResultCursorKey(jobId: string): string { return `${this.prefix}:job:result-cursor:${jobId}`; }
+  private jobResultPreparationId(jobId: string, outputIndex: number): string {
+    return deriveOpaqueId(this.secret, "studio-job-result-preparation", `${jobId}\u0000${String(outputIndex)}`);
+  }
+  private jobResultPreparationKey(preparationId: string): string {
+    return `${this.prefix}:job:result-preparation:${preparationId}`;
+  }
+  private jobResultPreparationReferenceKey(preparationId: string): string {
+    return `${this.prefix}:job:result-preparation:reference:${preparationId}`;
+  }
+  private jobResultPreparationLeaseKey(preparationId: string): string {
+    return `${this.prefix}:job:result-preparation:lease:${preparationId}`;
+  }
   private jobResultOutboxId(jobId: string, outputIndex: number): string {
     return deriveOpaqueId(this.secret, "studio-job-result-outbox", `${jobId}\u0000${String(outputIndex)}`);
   }
@@ -2605,7 +2915,10 @@ const JOB_TRANSITIONS: Readonly<Record<StudioJobState, readonly StudioJobState[]
   // not reached a provider. It may terminalize as a known privacy failure.
   admitted: ["executing", "canceled", "failed"],
   executing: ["executing", "ready", "failed", "canceled", "reconciliation_required"],
-  ready: ["delivering", "canceled"],
+  // An expired Photon-upload lease means the remote attachment may exist but
+  // its GUID was never committed. A ready result must therefore be able to
+  // enter the same no-retry reconciliation state as an executing one.
+  ready: ["delivering", "canceled", "reconciliation_required"],
   delivering: ["delivered", "failed", "reconciliation_required"],
   delivered: [],
   failed: [],
@@ -4320,6 +4633,246 @@ redis.call('DEL', KEYS[3])
 return cjson.encode(record)
 `;
 
+const BEGIN_JOB_RESULT_PREPARATION_LUA = `
+-- AIR_STUDIO_BEGIN_JOB_RESULT_PREPARATION_V1
+-- KEYS: opaque preparation metadata, encrypted prepared Photon GUID, upload
+--       lease, shared release fence, job metadata, encrypted job payload,
+--       durable job-ready index, durable result cursor
+-- ARGV: lease token, now, release generation, release phase, terminal ttl,
+--       job id, expected job version, minimum payload remaining ms, output index
+local function positiveInteger(value)
+  return type(value) == 'number' and value >= 1 and value == math.floor(value)
+end
+
+local function nonnegativeInteger(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+
+local function opaque(value)
+  return type(value) == 'string' and #value == 64 and string.match(value, '^[a-f0-9]+$') ~= nil
+end
+
+local function validPreparation(record)
+  return type(record) == 'table'
+    and record.schemaVersion == 1
+    and opaque(record.preparationId)
+    and type(record.jobId) == 'string' and #record.jobId > 0 and #record.jobId <= 160
+    and positiveInteger(record.outputIndex) and record.outputIndex <= 4
+    and (record.state == 'reserved' or record.state == 'uploading' or record.state == 'prepared'
+      or record.state == 'upload_unknown' or record.state == 'failed' or record.state == 'canceled')
+    and positiveInteger(record.stateVersion)
+    and nonnegativeInteger(record.createdAtMs)
+    and nonnegativeInteger(record.updatedAtMs)
+end
+
+local function response(kind, preparation)
+  return cjson.encode({ kind = kind, preparation = preparation })
+end
+
+local function activeRelease()
+  if ARGV[4] ~= 'canary' and ARGV[4] ~= 'production' then return false end
+  local generation = tonumber(ARGV[3])
+  if not positiveInteger(generation) then return false end
+  local raw = redis.call('GET', KEYS[4])
+  if not raw then return false end
+  local ok, fence = pcall(cjson.decode, raw)
+  return ok and type(fence) == 'table'
+    and fence.schemaVersion == 1
+    and fence.generation == generation
+    and fence.phase == ARGV[4]
+end
+
+local raw = redis.call('GET', KEYS[1])
+if not raw then return cjson.encode({ kind = 'unavailable' }) end
+local ok, preparation = pcall(cjson.decode, raw)
+if not ok or not validPreparation(preparation)
+  or preparation.jobId ~= ARGV[6]
+  or preparation.outputIndex ~= tonumber(ARGV[9]) then return cjson.encode({ kind = 'unavailable' }) end
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return cjson.encode({ kind = 'lease_lost' }) end
+
+local function reconcileUnknown()
+  preparation.state = 'upload_unknown'
+  preparation.stateVersion = preparation.stateVersion + 1
+  preparation.updatedAtMs = tonumber(ARGV[2])
+  redis.call('SET', KEYS[1], cjson.encode(preparation))
+  redis.call('DEL', KEYS[2])
+  redis.call('DEL', KEYS[3])
+  local jobRaw = redis.call('GET', KEYS[5])
+  if jobRaw then
+    local jobOk, job = pcall(cjson.decode, jobRaw)
+    if jobOk and type(job) == 'table'
+      and job.jobId == ARGV[6]
+      and (job.state == 'executing' or job.state == 'ready' or job.state == 'delivering') then
+      job.state = 'reconciliation_required'
+      job.stateVersion = tonumber(job.stateVersion or 0) + 1
+      job.updatedAtMs = tonumber(ARGV[2])
+      redis.call('SET', KEYS[5], cjson.encode(job))
+      redis.call('ZREM', KEYS[7], ARGV[6])
+    end
+  end
+  return response('upload_unknown', preparation)
+end
+
+if preparation.state == 'uploading' then return reconcileUnknown() end
+if preparation.state == 'prepared' then
+  if redis.call('PTTL', KEYS[2]) < 1 then
+    -- A cursor/outbox may have committed immediately before a worker crash.
+    -- Its short-lived preparation reference can later expire, but that is not
+    -- an unknown upload and must not taint an already-durable delivery.
+    local cursorRaw = redis.call('GET', KEYS[8])
+    local cursorOk, cursor = pcall(cjson.decode, cursorRaw or '')
+    local published = cursorOk and type(cursor) == 'table'
+      and cursor.jobId == ARGV[6] and type(cursor.outputs) == 'table'
+      and type(cursor.outputs[tonumber(ARGV[9])]) == 'table'
+      and cursor.outputs[tonumber(ARGV[9])].outputIndex == tonumber(ARGV[9])
+    if not published then return reconcileUnknown() end
+  end
+  return response('prepared', preparation)
+end
+if preparation.state == 'upload_unknown' or preparation.state == 'failed' or preparation.state == 'canceled' then
+  return response(preparation.state, preparation)
+end
+if preparation.state ~= 'reserved' then return cjson.encode({ kind = 'unavailable' }) end
+
+local jobRaw = redis.call('GET', KEYS[5])
+local jobOk, job = pcall(cjson.decode, jobRaw or '')
+if not jobOk or type(job) ~= 'table' or job.jobId ~= ARGV[6] then
+  preparation.state = 'canceled'
+  preparation.stateVersion = preparation.stateVersion + 1
+  preparation.updatedAtMs = tonumber(ARGV[2])
+  redis.call('SET', KEYS[1], cjson.encode(preparation), 'EX', tonumber(ARGV[5]))
+  redis.call('DEL', KEYS[2])
+  redis.call('DEL', KEYS[3])
+  return response('canceled', preparation)
+end
+if job.state ~= 'executing' or tonumber(job.stateVersion) ~= tonumber(ARGV[7]) then
+  return cjson.encode({ kind = 'unavailable' })
+end
+if redis.call('PTTL', KEYS[6]) <= tonumber(ARGV[8]) then
+  return response('payload_expiring', preparation)
+end
+if not activeRelease() then return response('release_blocked', preparation) end
+
+preparation.state = 'uploading'
+preparation.stateVersion = preparation.stateVersion + 1
+preparation.updatedAtMs = tonumber(ARGV[2])
+redis.call('SET', KEYS[1], cjson.encode(preparation))
+return response('ready', preparation)
+`;
+
+const FINISH_JOB_RESULT_PREPARATION_LUA = `
+-- AIR_STUDIO_FINISH_JOB_RESULT_PREPARATION_V1
+-- KEYS: opaque preparation metadata, encrypted prepared Photon GUID, upload
+--       lease, job metadata, encrypted job payload, durable job-ready index
+-- ARGV: lease token, outcome, encrypted prepared reference, now, terminal ttl,
+--       job id, output index
+local function positiveInteger(value)
+  return type(value) == 'number' and value >= 1 and value == math.floor(value)
+end
+
+local function nonnegativeInteger(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+
+local function opaque(value)
+  return type(value) == 'string' and #value == 64 and string.match(value, '^[a-f0-9]+$') ~= nil
+end
+
+local function validPreparation(record)
+  return type(record) == 'table'
+    and record.schemaVersion == 1
+    and opaque(record.preparationId)
+    and type(record.jobId) == 'string' and #record.jobId > 0 and #record.jobId <= 160
+    and positiveInteger(record.outputIndex) and record.outputIndex <= 4
+    and (record.state == 'reserved' or record.state == 'uploading' or record.state == 'prepared'
+      or record.state == 'upload_unknown' or record.state == 'failed' or record.state == 'canceled')
+    and positiveInteger(record.stateVersion)
+    and nonnegativeInteger(record.createdAtMs)
+    and nonnegativeInteger(record.updatedAtMs)
+end
+
+local function encrypted(value)
+  return type(value) == 'table'
+    and value.version == 1
+    and value.algorithm == 'aes-256-gcm'
+    and type(value.iv) == 'string'
+    and type(value.ciphertext) == 'string'
+    and type(value.tag) == 'string'
+end
+
+local function response(kind, preparation)
+  return cjson.encode({ kind = kind, preparation = preparation })
+end
+
+local raw = redis.call('GET', KEYS[1])
+if not raw then return cjson.encode({ kind = 'unavailable' }) end
+local ok, preparation = pcall(cjson.decode, raw)
+if not ok or not validPreparation(preparation)
+  or preparation.jobId ~= ARGV[6]
+  or preparation.outputIndex ~= tonumber(ARGV[7]) then return cjson.encode({ kind = 'unavailable' }) end
+if redis.call('GET', KEYS[3]) ~= ARGV[1] then return cjson.encode({ kind = 'lease_lost' }) end
+if preparation.state ~= 'uploading' then return cjson.encode({ kind = 'unavailable' }) end
+
+local function reconcileUnknown()
+  preparation.state = 'upload_unknown'
+  preparation.stateVersion = preparation.stateVersion + 1
+  preparation.updatedAtMs = tonumber(ARGV[4])
+  redis.call('SET', KEYS[1], cjson.encode(preparation))
+  redis.call('DEL', KEYS[2])
+  redis.call('DEL', KEYS[3])
+  local jobRaw = redis.call('GET', KEYS[4])
+  if jobRaw then
+    local jobOk, job = pcall(cjson.decode, jobRaw)
+    if jobOk and type(job) == 'table'
+      and job.jobId == ARGV[6]
+      and (job.state == 'executing' or job.state == 'ready' or job.state == 'delivering') then
+      job.state = 'reconciliation_required'
+      job.stateVersion = tonumber(job.stateVersion or 0) + 1
+      job.updatedAtMs = tonumber(ARGV[4])
+      redis.call('SET', KEYS[4], cjson.encode(job))
+      redis.call('ZREM', KEYS[6], ARGV[6])
+    end
+  end
+  return response('upload_unknown', preparation)
+end
+
+if ARGV[2] == 'prepared' then
+  local refOk, reference = pcall(cjson.decode, ARGV[3])
+  local payloadTtl = redis.call('PTTL', KEYS[5])
+  if not refOk or not encrypted(reference) or payloadTtl < 1 then return reconcileUnknown() end
+  preparation.state = 'prepared'
+  preparation.stateVersion = preparation.stateVersion + 1
+  preparation.updatedAtMs = tonumber(ARGV[4])
+  redis.call('SET', KEYS[1], cjson.encode(preparation))
+  redis.call('SET', KEYS[2], ARGV[3], 'PX', payloadTtl)
+  redis.call('DEL', KEYS[3])
+  return response('prepared', preparation)
+end
+
+if ARGV[2] == 'retryable_failure' then
+  preparation.state = 'reserved'
+  preparation.stateVersion = preparation.stateVersion + 1
+  preparation.updatedAtMs = tonumber(ARGV[4])
+  redis.call('SET', KEYS[1], cjson.encode(preparation))
+  redis.call('DEL', KEYS[2])
+  redis.call('DEL', KEYS[3])
+  return response('retryable_failure', preparation)
+end
+
+if ARGV[2] == 'failed' then
+  preparation.state = 'failed'
+  preparation.stateVersion = preparation.stateVersion + 1
+  preparation.updatedAtMs = tonumber(ARGV[4])
+  redis.call('SET', KEYS[1], cjson.encode(preparation), 'EX', tonumber(ARGV[5]))
+  redis.call('DEL', KEYS[2])
+  redis.call('DEL', KEYS[3])
+  return response('failed', preparation)
+end
+
+if ARGV[2] == 'upload_unknown' then return reconcileUnknown() end
+return cjson.encode({ kind = 'unavailable' })
+`;
+
 const ATTACH_PROVIDER_REQUEST_RECONCILIATION_LUA = `
 -- AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V2
 -- KEYS: subrun metadata, encrypted provider reference, execution lease, job metadata,
@@ -4615,6 +5168,43 @@ function parseProviderSubmissionBeginResult(raw: string | null): StudioProviderS
   }
 }
 
+function parseJobResultPreparationBeginResult(raw: string | null): StudioJobResultPreparationBeginResult {
+  const parsed = parseStored<{ readonly kind?: unknown; readonly preparation?: unknown }>(raw);
+  if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
+  if (parsed.kind === "lease_lost" || parsed.kind === "unavailable") return Object.freeze({ kind: parsed.kind });
+  if (!isJobResultPreparationRecord(parsed.preparation)) return Object.freeze({ kind: "unavailable" });
+  const preparation = Object.freeze(parsed.preparation);
+  switch (parsed.kind) {
+    case "ready":
+    case "prepared":
+    case "upload_unknown":
+    case "failed":
+    case "canceled":
+    case "release_blocked":
+    case "payload_expiring":
+      return Object.freeze({ kind: parsed.kind, preparation });
+    default:
+      return Object.freeze({ kind: "unavailable" });
+  }
+}
+
+function parseJobResultPreparationFinishResult(raw: string | null): StudioJobResultPreparationFinishResult {
+  const parsed = parseStored<{ readonly kind?: unknown; readonly preparation?: unknown }>(raw);
+  if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
+  if (parsed.kind === "lease_lost" || parsed.kind === "unavailable") return Object.freeze({ kind: parsed.kind });
+  if (!isJobResultPreparationRecord(parsed.preparation)) return Object.freeze({ kind: "unavailable" });
+  const preparation = Object.freeze(parsed.preparation);
+  switch (parsed.kind) {
+    case "prepared":
+    case "retryable_failure":
+    case "failed":
+    case "upload_unknown":
+      return Object.freeze({ kind: parsed.kind, preparation });
+    default:
+      return Object.freeze({ kind: "unavailable" });
+  }
+}
+
 function isExecutionSnapshotForJob(snapshot: StudioExecutionSnapshot, job: StudioJobRecord): boolean {
   return snapshot.schemaVersion === 2
     && snapshot.workflow.workflowVersion === 1
@@ -4799,6 +5389,24 @@ function isStudioPreparedOutput(value: unknown): value is StudioPreparedOutput {
     && isSafeRecordString(output.attachmentGuid, 4_096);
 }
 
+function isJobResultPreparationRecord(value: unknown): value is StudioJobResultPreparationRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<StudioJobResultPreparationRecord>;
+  return record.schemaVersion === 1
+    && isOpaqueStudioIdentifier(record.preparationId)
+    && isSafeRecordString(record.jobId, 160)
+    && typeof record.outputIndex === "number"
+    && isPositiveSafeInteger(record.outputIndex)
+    && record.outputIndex <= 4
+    && STUDIO_JOB_RESULT_PREPARATION_STATES.includes(record.state as StudioJobResultPreparationState)
+    && typeof record.stateVersion === "number"
+    && isPositiveSafeInteger(record.stateVersion)
+    && typeof record.createdAtMs === "number"
+    && isNonnegativeSafeInteger(record.createdAtMs)
+    && typeof record.updatedAtMs === "number"
+    && isNonnegativeSafeInteger(record.updatedAtMs);
+}
+
 function isProviderSubrunRecord(value: unknown): value is StudioProviderSubrunRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<StudioProviderSubrunRecord>;
@@ -4847,6 +5455,15 @@ function sameProviderSubrunIdentity(
     && left.submissionIntentId === right.submissionIntentId
     && left.releaseStamp.generation === right.releaseStamp.generation
     && left.releaseStamp.phase === right.releaseStamp.phase;
+}
+
+function sameJobResultPreparationIdentity(
+  left: StudioJobResultPreparationRecord,
+  right: StudioJobResultPreparationRecord,
+): boolean {
+  return left.preparationId === right.preparationId
+    && left.jobId === right.jobId
+    && left.outputIndex === right.outputIndex;
 }
 
 function isOpaqueStudioIdentifier(value: unknown): value is string {

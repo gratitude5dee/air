@@ -217,6 +217,22 @@ async function admitAndExecute(store: StudioStore, created: StudioJobRecordWithP
   return executing;
 }
 
+async function activeCanaryFixture() {
+  const base = fixture();
+  expect(await base.store.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+  const releaseStamp: StudioReleaseStamp = Object.freeze({ generation: 1, phase: "canary" });
+  const store = new StudioStore({
+    redis: base.redis,
+    cipher: base.cipher,
+    identityHashSecret: identitySecret,
+    prefix: base.prefix,
+    clock: base.now,
+    releaseStamp,
+  });
+  expect(await store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+  return Object.freeze({ ...base, store, releaseStamp });
+}
+
 function resultAttachmentPayload(outputIndex: number) {
   return Object.freeze({
     kind: "prepared-output" as const,
@@ -1892,6 +1908,98 @@ describe("Air v2 studio durable store", () => {
     });
   });
 
+  it("treats an expired Photon upload lease as reconciliation, never a second upload", async () => {
+    const { store, cipher, now, advance, releaseStamp } = await activeCanaryFixture();
+    const { senderHash, threadHash } = identities();
+    const created = job(cipher, senderHash, threadHash, "upload-crash-job", now(), releaseStamp);
+    const executing = await admitAndExecute(store, created);
+
+    await expect(store.ensureJobResultPreparation(created.jobId, 1)).resolves.toMatchObject({ state: "reserved" });
+    const firstLease = await store.acquireJobResultPreparationLease(created.jobId, 1);
+    if (!firstLease) throw new Error("expected first upload lease");
+    await expect(store.beginJobResultPreparation(executing, 1, firstLease.token))
+      .resolves.toMatchObject({ kind: "ready", preparation: { state: "uploading" } });
+
+    // Simulates a worker dying after Photon may have accepted bytes but before
+    // it committed the returned attachment GUID to Redis.
+    advance(90_001);
+    const recoveryLease = await store.acquireJobResultPreparationLease(created.jobId, 1);
+    if (!recoveryLease) throw new Error("expected recovered upload lease");
+    const recoveredJob = await store.getJob(created.jobId);
+    if (!recoveredJob) throw new Error("expected recovery job");
+    await expect(store.beginJobResultPreparation(recoveredJob, 1, recoveryLease.token))
+      .resolves.toMatchObject({ kind: "upload_unknown", preparation: { state: "upload_unknown" } });
+
+    await expect(store.getPreparedJobResultOutput(created.jobId, 1)).resolves.toBeNull();
+    await expect(store.getJobResultPreparation(created.jobId, 1)).resolves.toMatchObject({ state: "upload_unknown" });
+    await expect(store.getJob(created.jobId)).resolves.toMatchObject({ state: "reconciliation_required" });
+    await expect(store.publishPreparedJobResult(created.jobId, 1)).resolves.toEqual({ kind: "unavailable" });
+  });
+
+  it("persists an uploaded Photon GUID before cursor publication, then recovers without another upload", async () => {
+    const { store, redis, cipher, prefix, now, releaseStamp } = await activeCanaryFixture();
+    const { senderHash, threadHash } = identities();
+    const created = job(cipher, senderHash, threadHash, "prepared-upload-job", now(), releaseStamp);
+    const executing = await admitAndExecute(store, created);
+    await store.ensureJobResultPreparation(created.jobId, 1);
+    const lease = await store.acquireJobResultPreparationLease(created.jobId, 1);
+    if (!lease) throw new Error("expected upload lease");
+    await expect(store.beginJobResultPreparation(executing, 1, lease.token)).resolves.toMatchObject({ kind: "ready" });
+
+    const attachmentGuid = "photon-guid-persisted-before-outbox";
+    await expect(store.finishJobResultPreparation(executing, 1, lease.token, {
+      kind: "prepared",
+      output: { transport: "photon", attachmentGuid },
+    })).resolves.toMatchObject({ kind: "prepared", preparation: { state: "prepared" } });
+
+    // This is the crash window that used to lose the only GUID. The encrypted
+    // preparation reference is now sufficient to create the result cursor on
+    // a later recovery, with no provider bytes or second Photon upload.
+    const preparation = await store.getJobResultPreparation(created.jobId, 1);
+    if (!preparation) throw new Error("expected prepared upload record");
+    const rawReference = await redis.get(`${prefix}:job:result-preparation:reference:${preparation.preparationId}`);
+    expect(rawReference ?? "").not.toContain(attachmentGuid);
+    await expect(store.getPreparedJobResultOutput(created.jobId, 1)).resolves.toEqual({
+      transport: "photon",
+      attachmentGuid,
+    });
+
+    const published = await store.publishPreparedJobResult(created.jobId, 1);
+    if (published.kind !== "published") throw new Error("expected durable result publication");
+    await expect(store.decryptOutboxPayload(published.outbox)).toEqual({
+      kind: "prepared-output",
+      outputIndex: 1,
+      output: { transport: "photon", attachmentGuid },
+      thread: {
+        chatGuid: "iMessage;-;+14155550199",
+        sendingLine: "+14155550000",
+        replyTargetId: "reply-target-guid",
+      },
+    });
+    await expect(store.publishPreparedJobResult(created.jobId, 1)).resolves.toMatchObject({
+      kind: "existing",
+      outbox: { outboxId: published.outbox.outboxId },
+    });
+  });
+
+  it("returns a preparation to reserved only for a known pre-upload retryable failure", async () => {
+    const { store, cipher, now, releaseStamp } = await activeCanaryFixture();
+    const { senderHash, threadHash } = identities();
+    const created = job(cipher, senderHash, threadHash, "retryable-upload-job", now(), releaseStamp);
+    const executing = await admitAndExecute(store, created);
+    await store.ensureJobResultPreparation(created.jobId, 1);
+    const firstLease = await store.acquireJobResultPreparationLease(created.jobId, 1);
+    if (!firstLease) throw new Error("expected first upload lease");
+    await expect(store.beginJobResultPreparation(executing, 1, firstLease.token)).resolves.toMatchObject({ kind: "ready" });
+    await expect(store.finishJobResultPreparation(executing, 1, firstLease.token, { kind: "retryable_failure" }))
+      .resolves.toMatchObject({ kind: "retryable_failure", preparation: { state: "reserved" } });
+
+    const retryLease = await store.acquireJobResultPreparationLease(created.jobId, 1);
+    if (!retryLease) throw new Error("expected retry upload lease");
+    await expect(store.beginJobResultPreparation(executing, 1, retryLease.token))
+      .resolves.toMatchObject({ kind: "ready", preparation: { state: "uploading" } });
+  });
+
   it("keeps unresolved job metadata durable while bounding its encrypted snapshot to 24 hours", async () => {
     const { redis, store, cipher, prefix, now, advance } = fixture();
     const { senderHash, threadHash } = identities();
@@ -2075,6 +2183,7 @@ describe("Air v2 studio durable store", () => {
   it("exposes only legal state edges", () => {
     expect(canTransitionJob("admitted", "ready")).toBe(false);
     expect(canTransitionJob("executing", "reconciliation_required")).toBe(true);
+    expect(canTransitionJob("ready", "reconciliation_required")).toBe(true);
     expect(canTransitionOutbox("sending", "send_unknown")).toBe(true);
     expect(canTransitionOutbox("send_unknown", "intent")).toBe(false);
   });

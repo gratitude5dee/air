@@ -1184,6 +1184,12 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_ADVANCE_RELEASE_FENCE_V1")) {
       return this.evalStudioAdvanceReleaseFence(options.keys, options.arguments);
     }
+    if (script.includes("AIR_STUDIO_BEGIN_JOB_RESULT_PREPARATION_V1")) {
+      return this.evalStudioBeginJobResultPreparation(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_FINISH_JOB_RESULT_PREPARATION_V1")) {
+      return this.evalStudioFinishJobResultPreparation(options.keys, options.arguments);
+    }
     if (script.includes("AIR_STUDIO_PUBLISH_JOB_RESULT_V1")) {
       return this.evalStudioPublishJobResult(options.keys, options.arguments);
     }
@@ -1536,6 +1542,201 @@ export class MemoryRedis implements RedisLike {
       this.getZSet(readyKey, true).value.set(outboxId, dueAtMs);
       this.getZSet(laneKey, true).value.set(outboxId, outputIndex);
       return JSON.stringify({ kind: "created" });
+    } catch {
+      return unavailable();
+    }
+  }
+
+  /** Mirrors the pre-upload crash fence for direct Photon result delivery. */
+  private evalStudioBeginJobResultPreparation(keys: readonly string[], args: readonly string[]): string {
+    const unavailable = (): string => JSON.stringify({ kind: "unavailable" });
+    try {
+      this.assertStudioArity(keys, args, 8, 9);
+      const preparationKey = this.studioKey(keys, 0);
+      const referenceKey = this.studioKey(keys, 1);
+      const leaseKey = this.studioKey(keys, 2);
+      const releaseFenceKey = this.studioKey(keys, 3);
+      const jobKey = this.studioKey(keys, 4);
+      const payloadKey = this.studioKey(keys, 5);
+      const readyJobKey = this.studioKey(keys, 6);
+      const cursorKey = this.studioKey(keys, 7);
+      const token = this.studioArgument(args, 0);
+      const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
+      const generation = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+      const phase = this.studioArgument(args, 3);
+      const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
+      const jobId = this.studioArgument(args, 5);
+      const expectedJobVersion = this.studioPositiveInteger(this.studioArgument(args, 6));
+      const minimumPayloadRemainingMs = this.studioPositiveInteger(this.studioArgument(args, 7));
+      const outputIndex = this.studioPositiveInteger(this.studioArgument(args, 8));
+      if (!this.studioSafeText(jobId, 160) || outputIndex > 4) return unavailable();
+      const preparation = this.studioJobResultPreparation(preparationKey);
+      if (
+        preparation === null
+        || preparation === "invalid"
+        || preparation.jobId !== jobId
+        || preparation.outputIndex !== outputIndex
+      ) return unavailable();
+      const response = (kind: string): string => JSON.stringify({ kind, preparation });
+      if (this.studioString(leaseKey) !== token) return JSON.stringify({ kind: "lease_lost" });
+
+      const reconcileUnknown = (): string => {
+        preparation.state = "upload_unknown";
+        preparation.stateVersion = this.studioStateVersion(preparation) + 1;
+        preparation.updatedAtMs = now;
+        this.studioSetPersistentRecord(preparationKey, preparation);
+        this.values.delete(referenceKey);
+        this.values.delete(leaseKey);
+        const job = this.studioRecordFailClosed(jobKey);
+        if (
+          job
+          && job.jobId === jobId
+          && (job.state === "executing" || job.state === "ready" || job.state === "delivering")
+        ) {
+          job.state = "reconciliation_required";
+          job.stateVersion = this.studioStateVersion(job) + 1;
+          job.updatedAtMs = now;
+          this.studioSetPersistentRecord(jobKey, job);
+          this.studioRemoveMember(readyJobKey, jobId);
+        }
+        return response("upload_unknown");
+      };
+
+      if (preparation.state === "uploading") return reconcileUnknown();
+      if (preparation.state === "prepared") {
+        if (this.studioRemainingTtl(referenceKey) < 1) {
+          const cursor = this.studioResultCursor(cursorKey);
+          const published = cursor !== null
+            && cursor !== "invalid"
+            && cursor.jobId === jobId
+            && cursor.outputs[outputIndex - 1]?.outputIndex === outputIndex;
+          if (!published) return reconcileUnknown();
+        }
+        return response("prepared");
+      }
+      if (
+        preparation.state === "upload_unknown"
+        || preparation.state === "failed"
+        || preparation.state === "canceled"
+      ) return response(preparation.state);
+      if (preparation.state !== "reserved") return unavailable();
+
+      const job = this.studioRecordFailClosed(jobKey);
+      if (!job || job.jobId !== jobId) {
+        preparation.state = "canceled";
+        preparation.stateVersion = this.studioStateVersion(preparation) + 1;
+        preparation.updatedAtMs = now;
+        this.studioSetRecord(preparationKey, preparation, terminalTtl);
+        this.values.delete(referenceKey);
+        this.values.delete(leaseKey);
+        return response("canceled");
+      }
+      if (job.state !== "executing" || this.studioStateVersion(job) !== expectedJobVersion) return unavailable();
+      if (this.studioRemainingTtl(payloadKey) <= minimumPayloadRemainingMs) return response("payload_expiring");
+      const fence = this.studioReleaseFence(releaseFenceKey);
+      if (
+        (phase !== "canary" && phase !== "production")
+        || generation < 1
+        || fence === null
+        || fence === "invalid"
+        || fence.generation !== generation
+        || fence.phase !== phase
+      ) return response("release_blocked");
+
+      preparation.state = "uploading";
+      preparation.stateVersion = this.studioStateVersion(preparation) + 1;
+      preparation.updatedAtMs = now;
+      this.studioSetPersistentRecord(preparationKey, preparation);
+      return response("ready");
+    } catch {
+      return unavailable();
+    }
+  }
+
+  /** Mirrors the write-after-upload boundary without extending reference TTLs. */
+  private evalStudioFinishJobResultPreparation(keys: readonly string[], args: readonly string[]): string {
+    const unavailable = (): string => JSON.stringify({ kind: "unavailable" });
+    try {
+      this.assertStudioArity(keys, args, 6, 7);
+      const preparationKey = this.studioKey(keys, 0);
+      const referenceKey = this.studioKey(keys, 1);
+      const leaseKey = this.studioKey(keys, 2);
+      const jobKey = this.studioKey(keys, 3);
+      const payloadKey = this.studioKey(keys, 4);
+      const readyJobKey = this.studioKey(keys, 5);
+      const token = this.studioArgument(args, 0);
+      const outcome = this.studioArgument(args, 1);
+      const encryptedReference = this.studioArgument(args, 2);
+      const now = this.studioNonnegativeInteger(this.studioArgument(args, 3));
+      const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 4));
+      const jobId = this.studioArgument(args, 5);
+      const outputIndex = this.studioPositiveInteger(this.studioArgument(args, 6));
+      if (!this.studioSafeText(jobId, 160) || outputIndex > 4) return unavailable();
+      const preparation = this.studioJobResultPreparation(preparationKey);
+      if (
+        preparation === null
+        || preparation === "invalid"
+        || preparation.jobId !== jobId
+        || preparation.outputIndex !== outputIndex
+      ) return unavailable();
+      const response = (kind: string): string => JSON.stringify({ kind, preparation });
+      if (this.studioString(leaseKey) !== token) return JSON.stringify({ kind: "lease_lost" });
+      if (preparation.state !== "uploading") return unavailable();
+
+      const reconcileUnknown = (): string => {
+        preparation.state = "upload_unknown";
+        preparation.stateVersion = this.studioStateVersion(preparation) + 1;
+        preparation.updatedAtMs = now;
+        this.studioSetPersistentRecord(preparationKey, preparation);
+        this.values.delete(referenceKey);
+        this.values.delete(leaseKey);
+        const job = this.studioRecordFailClosed(jobKey);
+        if (
+          job
+          && job.jobId === jobId
+          && (job.state === "executing" || job.state === "ready" || job.state === "delivering")
+        ) {
+          job.state = "reconciliation_required";
+          job.stateVersion = this.studioStateVersion(job) + 1;
+          job.updatedAtMs = now;
+          this.studioSetPersistentRecord(jobKey, job);
+          this.studioRemoveMember(readyJobKey, jobId);
+        }
+        return response("upload_unknown");
+      };
+
+      if (outcome === "prepared") {
+        if (!this.studioEncryptedPayloadFromJson(encryptedReference)) return reconcileUnknown();
+        const payloadTtl = this.studioRemainingTtl(payloadKey);
+        if (payloadTtl < 1) return reconcileUnknown();
+        preparation.state = "prepared";
+        preparation.stateVersion = this.studioStateVersion(preparation) + 1;
+        preparation.updatedAtMs = now;
+        this.studioSetPersistentRecord(preparationKey, preparation);
+        this.studioSet(referenceKey, encryptedReference, payloadTtl);
+        this.values.delete(leaseKey);
+        return response("prepared");
+      }
+      if (outcome === "retryable_failure") {
+        preparation.state = "reserved";
+        preparation.stateVersion = this.studioStateVersion(preparation) + 1;
+        preparation.updatedAtMs = now;
+        this.studioSetPersistentRecord(preparationKey, preparation);
+        this.values.delete(referenceKey);
+        this.values.delete(leaseKey);
+        return response("retryable_failure");
+      }
+      if (outcome === "failed") {
+        preparation.state = "failed";
+        preparation.stateVersion = this.studioStateVersion(preparation) + 1;
+        preparation.updatedAtMs = now;
+        this.studioSetRecord(preparationKey, preparation, terminalTtl);
+        this.values.delete(referenceKey);
+        this.values.delete(leaseKey);
+        return response("failed");
+      }
+      if (outcome === "upload_unknown") return reconcileUnknown();
+      return unavailable();
     } catch {
       return unavailable();
     }
@@ -3281,6 +3482,45 @@ export class MemoryRedis implements RedisLike {
       createdAtMs: record.createdAtMs as number,
       updatedAtMs: record.updatedAtMs as number,
     };
+  }
+
+  private studioJobResultPreparation(key: string): Record<string, unknown> | "invalid" | null {
+    const record = this.studioRecordFailClosed(key);
+    if (record === null) return null;
+    const outputIndex = record.outputIndex;
+    const state = record.state;
+    if (
+      record.schemaVersion !== 1
+      || !isMemoryOpaqueStudioIdentifier(record.preparationId)
+      || !this.studioSafeText(record.jobId, 160)
+      || typeof outputIndex !== "number"
+      || !Number.isSafeInteger(outputIndex)
+      || outputIndex < 1
+      || outputIndex > 4
+      || (state !== "reserved"
+        && state !== "uploading"
+        && state !== "prepared"
+        && state !== "upload_unknown"
+        && state !== "failed"
+        && state !== "canceled")
+      || typeof record.stateVersion !== "number"
+      || !Number.isSafeInteger(record.stateVersion)
+      || record.stateVersion < 1
+      || typeof record.createdAtMs !== "number"
+      || !Number.isSafeInteger(record.createdAtMs)
+      || record.createdAtMs < 0
+      || typeof record.updatedAtMs !== "number"
+      || !Number.isSafeInteger(record.updatedAtMs)
+      || record.updatedAtMs < 0
+    ) return "invalid";
+    return record;
+  }
+
+  /** Redis PTTL shape: -2 missing, -1 persistent, otherwise milliseconds. */
+  private studioRemainingTtl(key: string): number {
+    const entry = this.getEntry(key);
+    if (!entry) return -2;
+    return entry.expiresAt === null ? -1 : Math.max(0, entry.expiresAt - this.now());
   }
 
   private studioValidReleaseStamp(value: unknown): value is Record<string, unknown> {
