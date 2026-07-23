@@ -13,6 +13,7 @@ import {
   createStudioJob,
   type StudioInboundEnvelope,
   type StudioInboxRecord,
+  type StudioExecutionSnapshot,
   type StudioJobRecord,
   type StudioJobRecordWithPayload,
   type StudioReleaseStamp,
@@ -96,6 +97,7 @@ function job(
   releaseStamp: StudioReleaseStamp = darkReleaseStamp,
   outputCount = 1,
   provider: "gmi" | "fal" = "gmi",
+  pollingOverrides: Partial<StudioExecutionSnapshot["polling"]> = {},
 ): StudioJobRecordWithPayload {
   return createStudioJob({
     jobId,
@@ -136,6 +138,7 @@ function job(
           pollIntervalMs: 1_000,
           maxPollAttempts: 3,
           deadlineMs: 15_000,
+          ...pollingOverrides,
         },
         releaseStamp,
       },
@@ -231,6 +234,29 @@ async function activeCanaryFixture() {
   });
   expect(await store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
   return Object.freeze({ ...base, store, releaseStamp });
+}
+
+async function submittedProviderSubrun(
+  setup: Awaited<ReturnType<typeof activeCanaryFixture>>,
+  jobId: string,
+  pollingOverrides: Partial<StudioExecutionSnapshot["polling"]> = {},
+) {
+  const { store, cipher, now, releaseStamp } = setup;
+  const { senderHash, threadHash } = identities();
+  const created = job(cipher, senderHash, threadHash, jobId, now(), releaseStamp, 1, "gmi", pollingOverrides);
+  const executing = await admitAndExecute(store, created);
+  const payload = store.decryptJobPayload(executing);
+  if (!payload.execution) throw new Error("expected execution snapshot");
+  const reserved = await store.ensureProviderSubrun(executing, payload.execution);
+  const lease = await store.acquireProviderSubrunLease(reserved.subrunId);
+  if (!lease) throw new Error("expected provider submit lease");
+  await expect(store.beginProviderSubmission(reserved.subrunId, lease.token, executing)).resolves.toMatchObject({ kind: "ready" });
+  const submitted = await store.finishProviderSubmission(reserved.subrunId, lease.token, executing, {
+    kind: "accepted",
+    providerRequestId: `private-provider-request-${jobId}`,
+  });
+  if (!submitted || submitted.state !== "submitted") throw new Error("expected submitted provider subrun");
+  return Object.freeze({ created, executing, snapshot: payload.execution, subrun: submitted });
 }
 
 function resultAttachmentPayload(outputIndex: number) {
@@ -1998,6 +2024,107 @@ describe("Air v2 studio durable store", () => {
     if (!retryLease) throw new Error("expected retry upload lease");
     await expect(store.beginJobResultPreparation(executing, 1, retryLease.token))
       .resolves.toMatchObject({ kind: "ready", preparation: { state: "uploading" } });
+  });
+
+  it("creates a deterministic content-free observation only after a known provider submission", async () => {
+    const setup = await activeCanaryFixture();
+    const { store, redis, prefix } = setup;
+    const { snapshot, subrun } = await submittedProviderSubrun(setup, "observation-known-submission");
+
+    const first = await store.ensureProviderObservation(subrun, snapshot);
+    if (!first) throw new Error("expected provider observation");
+    const second = await store.ensureProviderObservation(subrun, snapshot);
+    expect(second).toEqual(first);
+    expect(first).toMatchObject({
+      subrunId: subrun.subrunId,
+      jobId: subrun.jobId,
+      state: "scheduled",
+      pollAttempts: 0,
+      maxPollAttempts: snapshot.polling.maxPollAttempts,
+      requestTimeoutMs: snapshot.polling.requestTimeoutMs,
+      pollIntervalMs: snapshot.polling.pollIntervalMs,
+      deadlineAtMs: subrun.updatedAtMs + snapshot.polling.deadlineMs,
+      nextDueAtMs: subrun.updatedAtMs,
+    });
+    const raw = await redis.get(`${prefix}:provider-observation:${first.observationId}`);
+    expect(raw ?? "").not.toContain("private-provider-request-observation-known-submission");
+    expect(raw ?? "").not.toContain("a private prompt");
+    expect(raw ?? "").not.toContain("providerRequestId");
+    await expect(store.getProviderObservation(subrun.subrunId)).resolves.toEqual(first);
+  });
+
+  it("retries only bounded safe provider polls after a crashed observation lease", async () => {
+    const setup = await activeCanaryFixture();
+    const { store, advance, now } = setup;
+    const { snapshot, subrun } = await submittedProviderSubrun(setup, "observation-safe-retry", {
+      deadlineMs: 300_000,
+      maxPollAttempts: 3,
+      pollIntervalMs: 1_000,
+    });
+    const observation = await store.ensureProviderObservation(subrun, snapshot);
+    if (!observation) throw new Error("expected provider observation");
+
+    const firstLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!firstLease) throw new Error("expected first observation lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, firstLease.token))
+      .resolves.toMatchObject({ kind: "ready", observation: { state: "observing", pollAttempts: 1 } });
+
+    // A provider GET is read-only, so the recovery is allowed to make one
+    // bounded new poll. Unlike submission recovery, it never changes the
+    // subrun back to `reserved` or calls a submit primitive.
+    advance(90_001);
+    const recoveryLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!recoveryLease) throw new Error("expected recovered observation lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, recoveryLease.token))
+      .resolves.toMatchObject({ kind: "ready", observation: { state: "observing", pollAttempts: 2 } });
+    await expect(store.finishProviderObservation(subrun.subrunId, firstLease.token, { kind: "succeeded" }))
+      .resolves.toEqual({ kind: "lease_lost" });
+    await expect(store.finishProviderObservation(subrun.subrunId, recoveryLease.token, { kind: "pending" }))
+      .resolves.toMatchObject({
+        kind: "pending",
+        observation: { state: "scheduled", pollAttempts: 2, nextDueAtMs: now() + 1_000 },
+      });
+
+    const earlyLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!earlyLease) throw new Error("expected early observation lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, earlyLease.token))
+      .resolves.toMatchObject({ kind: "not_due", observation: { state: "scheduled", pollAttempts: 2 } });
+    advance(1_000);
+    const finalLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!finalLease) throw new Error("expected final observation lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, finalLease.token))
+      .resolves.toMatchObject({ kind: "ready", observation: { state: "observing", pollAttempts: 3 } });
+    await expect(store.finishProviderObservation(subrun.subrunId, finalLease.token, { kind: "pending" }))
+      .resolves.toMatchObject({ kind: "attempts_exhausted", observation: { state: "attempts_exhausted", pollAttempts: 3 } });
+    await expect(store.getProviderSubrun(subrun.subrunId)).resolves.toMatchObject({ state: "submitted" });
+  });
+
+  it("fences a completed poll when its submitted subrun or executing job is no longer current", async () => {
+    const setup = await activeCanaryFixture();
+    const { store } = setup;
+    const { executing, snapshot, subrun } = await submittedProviderSubrun(setup, "observation-fenced-finish");
+    const observation = await store.ensureProviderObservation(subrun, snapshot);
+    if (!observation) throw new Error("expected provider observation");
+    const lease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!lease) throw new Error("expected observation lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, lease.token)).resolves.toMatchObject({ kind: "ready" });
+    await expect(store.transitionJob(executing.jobId, "executing", "failed")).resolves.toMatchObject({ state: "failed" });
+    await expect(store.finishProviderObservation(subrun.subrunId, lease.token, { kind: "succeeded" }))
+      .resolves.toMatchObject({ kind: "canceled", observation: { state: "canceled" } });
+    await expect(store.getProviderSubrun(subrun.subrunId)).resolves.toMatchObject({ state: "submitted" });
+  });
+
+  it("expires a due observation at its immutable deadline without starting a provider GET", async () => {
+    const setup = await activeCanaryFixture();
+    const { store, advance } = setup;
+    const { snapshot, subrun } = await submittedProviderSubrun(setup, "observation-deadline", { deadlineMs: 6_000 });
+    const observation = await store.ensureProviderObservation(subrun, snapshot);
+    if (!observation) throw new Error("expected provider observation");
+    advance(6_000);
+    const lease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!lease) throw new Error("expected deadline observation lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, lease.token))
+      .resolves.toMatchObject({ kind: "deadline_exceeded", observation: { state: "deadline_exceeded", pollAttempts: 0 } });
   });
 
   it("keeps unresolved job metadata durable while bounding its encrypted snapshot to 24 hours", async () => {

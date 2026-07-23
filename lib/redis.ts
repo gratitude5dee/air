@@ -1244,6 +1244,12 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_FINISH_PROVIDER_SUBMISSION_V2")) {
       return this.evalStudioFinishProviderSubmission(options.keys, options.arguments);
     }
+    if (script.includes("AIR_STUDIO_BEGIN_PROVIDER_OBSERVATION_V1")) {
+      return this.evalStudioBeginProviderObservation(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_FINISH_PROVIDER_OBSERVATION_V1")) {
+      return this.evalStudioFinishProviderObservation(options.keys, options.arguments);
+    }
     if (script.includes("AIR_STUDIO_ATTACH_PROVIDER_REQUEST_RECONCILIATION_V2")) {
       return this.evalStudioAttachProviderRequestReconciliation(options.keys, options.arguments);
     }
@@ -3002,6 +3008,161 @@ export class MemoryRedis implements RedisLike {
     return JSON.stringify(record);
   }
 
+  /** Mirrors Air's safe GET/poll fence; it never opens a submission path. */
+  private evalStudioBeginProviderObservation(keys: readonly string[], args: readonly string[]): string {
+    const unavailable = (): string => JSON.stringify({ kind: "unavailable" });
+    try {
+      this.assertStudioArity(keys, args, 5, 6);
+      const observationKey = this.studioKey(keys, 0);
+      const leaseKey = this.studioKey(keys, 1);
+      const subrunKey = this.studioKey(keys, 2);
+      const referenceKey = this.studioKey(keys, 3);
+      const jobKey = this.studioKey(keys, 4);
+      const token = this.studioArgument(args, 0);
+      const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
+      const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 2));
+      const observationId = this.studioArgument(args, 3);
+      const subrunId = this.studioArgument(args, 4);
+      const jobId = this.studioArgument(args, 5);
+      if (this.studioString(leaseKey) !== token) return JSON.stringify({ kind: "lease_lost" });
+      const observation = this.studioProviderObservation(observationKey);
+      if (
+        observation === null
+        || observation === "invalid"
+        || observation.observationId !== observationId
+        || observation.subrunId !== subrunId
+        || observation.jobId !== jobId
+      ) return unavailable();
+      const response = (kind: string): string => JSON.stringify({ kind, observation });
+      const terminal = (kind: string, state: string): string => {
+        observation.state = state;
+        observation.stateVersion = this.studioStateVersion(observation) + 1;
+        observation.updatedAtMs = now;
+        this.studioSetRecord(observationKey, observation, terminalTtl);
+        this.values.delete(leaseKey);
+        return response(kind);
+      };
+      if (this.studioProviderObservationTerminalState(observation.state)) {
+        this.values.delete(leaseKey);
+        return response(observation.state as string);
+      }
+
+      const subrun = this.studioRecordFailClosed(subrunKey);
+      const job = this.studioRecordFailClosed(jobKey);
+      const subrunValid = Boolean(
+        subrun
+        && subrun.subrunId === observation.subrunId
+        && subrun.jobId === observation.jobId
+        && subrun.state === "submitted"
+        && this.studioStateVersion(subrun) === observation.subrunStateVersion,
+      );
+      const jobValid = Boolean(
+        job
+        && job.jobId === observation.jobId
+        && job.state === "executing"
+        && this.studioStateVersion(job) === observation.jobStateVersion,
+      );
+      if (!subrunValid || !jobValid) return terminal("canceled", "canceled");
+      if (observation.state === "scheduled" && now < (observation.nextDueAtMs as number)) {
+        this.values.delete(leaseKey);
+        return response("not_due");
+      }
+      if (observation.state !== "scheduled" && observation.state !== "observing") return unavailable();
+      if (now >= (observation.deadlineAtMs as number)) return terminal("deadline_exceeded", "deadline_exceeded");
+      if ((observation.pollAttempts as number) >= (observation.maxPollAttempts as number)) {
+        return terminal("attempts_exhausted", "attempts_exhausted");
+      }
+      if (this.studioRemainingTtl(referenceKey) <= (observation.requestTimeoutMs as number)) {
+        return terminal("reference_expired", "reference_expired");
+      }
+      observation.state = "observing";
+      observation.pollAttempts = (observation.pollAttempts as number) + 1;
+      observation.nextDueAtMs = now;
+      observation.stateVersion = this.studioStateVersion(observation) + 1;
+      observation.updatedAtMs = now;
+      this.studioSetPersistentRecord(observationKey, observation);
+      return response("ready");
+    } catch {
+      return unavailable();
+    }
+  }
+
+  /** Mirrors the state-version fence after one already-authorized provider GET. */
+  private evalStudioFinishProviderObservation(keys: readonly string[], args: readonly string[]): string {
+    const unavailable = (): string => JSON.stringify({ kind: "unavailable" });
+    try {
+      this.assertStudioArity(keys, args, 4, 7);
+      const observationKey = this.studioKey(keys, 0);
+      const leaseKey = this.studioKey(keys, 1);
+      const subrunKey = this.studioKey(keys, 2);
+      const jobKey = this.studioKey(keys, 3);
+      const token = this.studioArgument(args, 0);
+      const outcome = this.studioArgument(args, 1);
+      const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
+      const terminalTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
+      const observationId = this.studioArgument(args, 4);
+      const subrunId = this.studioArgument(args, 5);
+      const jobId = this.studioArgument(args, 6);
+      if (this.studioString(leaseKey) !== token) return JSON.stringify({ kind: "lease_lost" });
+      const observation = this.studioProviderObservation(observationKey);
+      if (
+        observation === null
+        || observation === "invalid"
+        || observation.observationId !== observationId
+        || observation.subrunId !== subrunId
+        || observation.jobId !== jobId
+        || observation.state !== "observing"
+      ) return unavailable();
+      const response = (kind: string): string => JSON.stringify({ kind, observation });
+      const terminal = (kind: string, state: string): string => {
+        observation.state = state;
+        observation.stateVersion = this.studioStateVersion(observation) + 1;
+        observation.updatedAtMs = now;
+        this.studioSetRecord(observationKey, observation, terminalTtl);
+        this.values.delete(leaseKey);
+        return response(kind);
+      };
+
+      const subrun = this.studioRecordFailClosed(subrunKey);
+      const job = this.studioRecordFailClosed(jobKey);
+      const subrunValid = Boolean(
+        subrun
+        && subrun.subrunId === observation.subrunId
+        && subrun.jobId === observation.jobId
+        && subrun.state === "submitted"
+        && this.studioStateVersion(subrun) === observation.subrunStateVersion,
+      );
+      const jobValid = Boolean(
+        job
+        && job.jobId === observation.jobId
+        && job.state === "executing"
+        && this.studioStateVersion(job) === observation.jobStateVersion,
+      );
+      if (!subrunValid || !jobValid) return terminal("canceled", "canceled");
+      if (outcome === "succeeded") return terminal("succeeded", "succeeded");
+      if (outcome === "failed") return terminal("failed", "failed");
+      if (outcome !== "pending") return unavailable();
+      if (now >= (observation.deadlineAtMs as number)) return terminal("deadline_exceeded", "deadline_exceeded");
+      if ((observation.pollAttempts as number) >= (observation.maxPollAttempts as number)) {
+        return terminal("attempts_exhausted", "attempts_exhausted");
+      }
+      const deadlineAtMs = observation.deadlineAtMs as number;
+      const interval = observation.pollIntervalMs as number;
+      const nextDueAtMs = now > Number.MAX_SAFE_INTEGER - interval
+        ? deadlineAtMs
+        : Math.min(deadlineAtMs, now + interval);
+      observation.state = "scheduled";
+      observation.nextDueAtMs = nextDueAtMs;
+      observation.stateVersion = this.studioStateVersion(observation) + 1;
+      observation.updatedAtMs = now;
+      this.studioSetPersistentRecord(observationKey, observation);
+      this.values.delete(leaseKey);
+      return response("pending");
+    } catch {
+      return unavailable();
+    }
+  }
+
   private evalStudioAttachProviderRequestReconciliation(keys: readonly string[], args: readonly string[]): number {
     this.assertStudioArity(keys, args, 7, 7);
     const subrunKey = this.studioKey(keys, 0);
@@ -3514,6 +3675,80 @@ export class MemoryRedis implements RedisLike {
       || record.updatedAtMs < 0
     ) return "invalid";
     return record;
+  }
+
+  private studioProviderObservation(key: string): Record<string, unknown> | "invalid" | null {
+    const record = this.studioRecordFailClosed(key);
+    if (record === null) return null;
+    const state = record.state;
+    const pollAttempts = record.pollAttempts;
+    const maxPollAttempts = record.maxPollAttempts;
+    const requestTimeoutMs = record.requestTimeoutMs;
+    const pollIntervalMs = record.pollIntervalMs;
+    const deadlineAtMs = record.deadlineAtMs;
+    const nextDueAtMs = record.nextDueAtMs;
+    if (
+      record.schemaVersion !== 1
+      || !isMemoryOpaqueStudioIdentifier(record.observationId)
+      || !isMemoryOpaqueStudioIdentifier(record.subrunId)
+      || !this.studioSafeText(record.jobId, 160)
+      || typeof record.subrunStateVersion !== "number"
+      || !Number.isSafeInteger(record.subrunStateVersion)
+      || record.subrunStateVersion < 1
+      || typeof record.jobStateVersion !== "number"
+      || !Number.isSafeInteger(record.jobStateVersion)
+      || record.jobStateVersion < 1
+      || (state !== "scheduled"
+        && state !== "observing"
+        && state !== "succeeded"
+        && state !== "failed"
+        && state !== "deadline_exceeded"
+        && state !== "attempts_exhausted"
+        && state !== "reference_expired"
+        && state !== "canceled")
+      || typeof pollAttempts !== "number"
+      || !Number.isSafeInteger(pollAttempts)
+      || pollAttempts < 0
+      || typeof maxPollAttempts !== "number"
+      || !Number.isSafeInteger(maxPollAttempts)
+      || maxPollAttempts < 1
+      || maxPollAttempts > 10_000
+      || pollAttempts > maxPollAttempts
+      || typeof requestTimeoutMs !== "number"
+      || !Number.isSafeInteger(requestTimeoutMs)
+      || requestTimeoutMs < 1_000
+      || requestTimeoutMs > 900_000
+      || typeof pollIntervalMs !== "number"
+      || !Number.isSafeInteger(pollIntervalMs)
+      || pollIntervalMs < 250
+      || pollIntervalMs > 300_000
+      || typeof deadlineAtMs !== "number"
+      || !Number.isSafeInteger(deadlineAtMs)
+      || deadlineAtMs < 0
+      || typeof nextDueAtMs !== "number"
+      || !Number.isSafeInteger(nextDueAtMs)
+      || nextDueAtMs < 0
+      || nextDueAtMs > deadlineAtMs
+      || typeof record.stateVersion !== "number"
+      || !Number.isSafeInteger(record.stateVersion)
+      || record.stateVersion < 1
+      || typeof record.createdAtMs !== "number"
+      || !Number.isSafeInteger(record.createdAtMs)
+      || record.createdAtMs < 0
+      || typeof record.updatedAtMs !== "number"
+      || !Number.isSafeInteger(record.updatedAtMs)
+      || record.updatedAtMs < 0
+    ) return "invalid";
+    return record;
+  }
+
+  private studioProviderObservationTerminalState(value: unknown): boolean {
+    return value === "succeeded"
+      || value === "failed"
+      || value === "deadline_exceeded"
+      || value === "attempts_exhausted"
+      || value === "reference_expired"
+      || value === "canceled";
   }
 
   /** Redis PTTL shape: -2 missing, -1 persistent, otherwise milliseconds. */

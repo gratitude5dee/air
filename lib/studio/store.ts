@@ -323,6 +323,92 @@ export interface StudioProviderSubrunReference {
   readonly providerRequestId: string;
 }
 
+/**
+ * A read-only provider-request observation. Unlike submission, observing is
+ * safe to retry after a crashed worker because it performs only a bounded
+ * provider GET/poll. The record deliberately contains no provider request
+ * ID, URL, output reference, prompt, or media data.
+ */
+export const STUDIO_PROVIDER_OBSERVATION_STATES = Object.freeze([
+  "scheduled",
+  "observing",
+  "succeeded",
+  "failed",
+  "deadline_exceeded",
+  "attempts_exhausted",
+  "reference_expired",
+  "canceled",
+] as const);
+export type StudioProviderObservationState = (typeof STUDIO_PROVIDER_OBSERVATION_STATES)[number];
+
+/**
+ * Content-free durable polling control plane for one known provider request.
+ * The immutable state-version fences bind this record to the exact submitted
+ * subrun and executing job it was created for. The provider request ID stays
+ * only in the existing encrypted, short-lived subrun reference.
+ */
+export interface StudioProviderObservationRecord {
+  readonly schemaVersion: 1;
+  readonly observationId: string;
+  readonly subrunId: string;
+  readonly jobId: string;
+  /** The exact known-submitted subrun state this poller may observe. */
+  readonly subrunStateVersion: number;
+  /** The exact executing job state this poller may observe. */
+  readonly jobStateVersion: number;
+  readonly state: StudioProviderObservationState;
+  /** Counted before each physical provider GET, including a crashed attempt. */
+  readonly pollAttempts: number;
+  readonly maxPollAttempts: number;
+  readonly requestTimeoutMs: number;
+  readonly pollIntervalMs: number;
+  /** Absolute, immutable deadline derived from the reviewed job snapshot. */
+  readonly deadlineAtMs: number;
+  /** Earliest time a scheduled safe GET may begin. */
+  readonly nextDueAtMs: number;
+  readonly stateVersion: number;
+  readonly createdAtMs: number;
+  readonly updatedAtMs: number;
+}
+
+export type StudioProviderObservationBeginResult =
+  | { readonly kind: "ready"; readonly observation: StudioProviderObservationRecord }
+  | {
+      readonly kind:
+        | "not_due"
+        | "succeeded"
+        | "failed"
+        | "deadline_exceeded"
+        | "attempts_exhausted"
+        | "reference_expired"
+        | "canceled";
+      readonly observation: StudioProviderObservationRecord;
+    }
+  | { readonly kind: "lease_lost" | "unavailable" };
+
+/**
+ * `pending` represents an authoritative non-terminal provider GET response
+ * or a known safe GET failure. It may be retried under the persisted policy;
+ * it never authorizes another provider submission.
+ */
+export type StudioProviderObservationFinishOutcome =
+  | { readonly kind: "pending" }
+  | { readonly kind: "succeeded" }
+  | { readonly kind: "failed" };
+
+export type StudioProviderObservationFinishResult =
+  | {
+      readonly kind:
+        | "pending"
+        | "succeeded"
+        | "failed"
+        | "deadline_exceeded"
+        | "attempts_exhausted"
+        | "canceled";
+      readonly observation: StudioProviderObservationRecord;
+    }
+  | { readonly kind: "lease_lost" | "unavailable" };
+
 export type StudioProviderSubmissionBeginResult =
   | { readonly kind: "ready"; readonly subrun: StudioProviderSubrunRecord }
   | { readonly kind: "already_submitted"; readonly subrun: StudioProviderSubrunRecord }
@@ -1776,6 +1862,164 @@ export class StudioStore {
   }
 
   /**
+   * Creates the deterministic, content-free observation record only after a
+   * provider submission is durably known. The reviewed polling policy is
+   * copied once and can never be loosened by a later worker or deployment.
+   */
+  public async ensureProviderObservation(
+    subrun: StudioProviderSubrunRecord,
+    snapshot: StudioExecutionSnapshot,
+  ): Promise<StudioProviderObservationRecord | null> {
+    if (!isProviderSubrunRecord(subrun) || subrun.state !== "submitted") return null;
+    const currentSubrun = await this.getProviderSubrun(subrun.subrunId);
+    if (
+      !currentSubrun
+      || currentSubrun.state !== "submitted"
+      || currentSubrun.stateVersion !== subrun.stateVersion
+      || !sameProviderSubrunIdentity(currentSubrun, subrun)
+    ) return null;
+
+    const job = await this.getJob(currentSubrun.jobId);
+    if (
+      !job
+      || job.jobId !== currentSubrun.jobId
+      || job.state !== "executing"
+      || !job.encryptedPayload
+      || !isExecutionSnapshotForJob(snapshot, job)
+      || currentSubrun.provider !== snapshot.model.provider
+      || currentSubrun.modelSlug !== snapshot.model.slug
+      || currentSubrun.workflowId !== snapshot.workflow.workflowId
+      || currentSubrun.stepId !== snapshot.workflow.stepId
+      || !sameReleaseStamp(currentSubrun.releaseStamp, snapshot.releaseStamp)
+    ) return null;
+
+    // A known submission is observable only while its encrypted provider
+    // request reference remains available. This never decrypts or copies the
+    // provider ID into observation metadata.
+    if (await this.redis.pttl(this.providerSubrunReferenceKey(currentSubrun.subrunId)) < 1) return null;
+    const deadlineAtMs = addSafeMilliseconds(currentSubrun.updatedAtMs, snapshot.polling.deadlineMs);
+    if (deadlineAtMs === null) return null;
+
+    const observationId = this.providerObservationId(currentSubrun.subrunId);
+    const now = this.now();
+    const template: StudioProviderObservationRecord = Object.freeze({
+      schemaVersion: 1,
+      observationId,
+      subrunId: currentSubrun.subrunId,
+      jobId: job.jobId,
+      subrunStateVersion: currentSubrun.stateVersion,
+      jobStateVersion: job.stateVersion,
+      state: "scheduled",
+      pollAttempts: 0,
+      maxPollAttempts: snapshot.polling.maxPollAttempts,
+      requestTimeoutMs: snapshot.polling.requestTimeoutMs,
+      pollIntervalMs: snapshot.polling.pollIntervalMs,
+      deadlineAtMs,
+      nextDueAtMs: currentSubrun.updatedAtMs,
+      stateVersion: 1,
+      createdAtMs: now,
+      updatedAtMs: now,
+    });
+    const created = await this.redis.set(this.providerObservationKey(observationId), JSON.stringify(template), { nx: true });
+    if (created === "OK") return template;
+    const existing = await this.getProviderObservation(currentSubrun.subrunId);
+    if (!existing || !sameProviderObservationIdentity(existing, template)) return null;
+    return existing;
+  }
+
+  /** Reads the durable, content-free polling state for one provider subrun. */
+  public async getProviderObservation(subrunId: string): Promise<StudioProviderObservationRecord | null> {
+    if (!isOpaqueStudioIdentifier(subrunId)) return null;
+    const observationId = this.providerObservationId(subrunId);
+    const record = parseStored<StudioProviderObservationRecord>(await this.redis.get(this.providerObservationKey(observationId)));
+    if (!record || !isProviderObservationRecord(record)) return null;
+    if (record.observationId !== observationId || record.subrunId !== subrunId) return null;
+    return Object.freeze(record);
+  }
+
+  /** One lease spans at most one safe provider GET/poll. */
+  public async acquireProviderObservationLease(subrunId: string): Promise<RedisLease | null> {
+    if (!isOpaqueStudioIdentifier(subrunId)) return null;
+    return acquireRedisLease(this.redis, this.providerObservationLeaseKey(this.providerObservationId(subrunId)), {
+      now: this.now,
+      ttlMs: LEASE_TTL_MS,
+    });
+  }
+
+  /**
+   * Fences and records a physical provider GET before it begins. A stale
+   * `observing` state is intentionally safe to re-enter after lease expiry:
+   * it counts a new bounded read attempt, never a provider submission.
+   */
+  public async beginProviderObservation(
+    subrunId: string,
+    leaseToken: string,
+  ): Promise<StudioProviderObservationBeginResult> {
+    if (!isOpaqueStudioIdentifier(subrunId) || !isSafeRecordString(leaseToken, 256)) {
+      return Object.freeze({ kind: "unavailable" });
+    }
+    const observationId = this.providerObservationId(subrunId);
+    const observation = await this.getProviderObservation(subrunId);
+    if (!observation) return Object.freeze({ kind: "unavailable" });
+    const result = await this.redis.eval(BEGIN_PROVIDER_OBSERVATION_LUA, {
+      keys: [
+        this.providerObservationKey(observationId),
+        this.providerObservationLeaseKey(observationId),
+        this.providerSubrunKey(subrunId),
+        this.providerSubrunReferenceKey(subrunId),
+        this.jobKey(observation.jobId),
+      ],
+      arguments: [
+        leaseToken,
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        observationId,
+        subrunId,
+        observation.jobId,
+      ],
+    });
+    return parseProviderObservationBeginResult(typeof result === "string" ? result : null);
+  }
+
+  /**
+   * Persists the outcome of one already-authorized provider GET. `pending`
+   * schedules another safe read under the original bounds; this method never
+   * transitions a subrun back toward submission or accepts provider content.
+   */
+  public async finishProviderObservation(
+    subrunId: string,
+    leaseToken: string,
+    outcome: StudioProviderObservationFinishOutcome,
+  ): Promise<StudioProviderObservationFinishResult> {
+    if (
+      !isOpaqueStudioIdentifier(subrunId)
+      || !isSafeRecordString(leaseToken, 256)
+      || !isProviderObservationFinishOutcome(outcome)
+    ) return Object.freeze({ kind: "unavailable" });
+    const observationId = this.providerObservationId(subrunId);
+    const observation = await this.getProviderObservation(subrunId);
+    if (!observation) return Object.freeze({ kind: "unavailable" });
+    const result = await this.redis.eval(FINISH_PROVIDER_OBSERVATION_LUA, {
+      keys: [
+        this.providerObservationKey(observationId),
+        this.providerObservationLeaseKey(observationId),
+        this.providerSubrunKey(subrunId),
+        this.jobKey(observation.jobId),
+      ],
+      arguments: [
+        leaseToken,
+        outcome.kind,
+        String(this.now()),
+        String(TERMINAL_METADATA_TTL_SECONDS),
+        observationId,
+        subrunId,
+        observation.jobId,
+      ],
+    });
+    return parseProviderObservationFinishResult(typeof result === "string" ? result : null);
+  }
+
+  /**
    * Creates the opaque upload record before a Photon upload is allowed to
    * start. The ID is deterministic for one `{job, output}` pair, so a retry
    * can only observe the same preparation state; it can never allocate a
@@ -2839,6 +3083,15 @@ export class StudioStore {
   private providerSubrunKey(subrunId: string): string { return `${this.prefix}:provider-subrun:${subrunId}`; }
   private providerSubrunReferenceKey(subrunId: string): string { return `${this.prefix}:provider-subrun:reference:${subrunId}`; }
   private providerSubrunLeaseKey(subrunId: string): string { return `${this.prefix}:provider-subrun:lease:${subrunId}`; }
+  private providerObservationId(subrunId: string): string {
+    return deriveOpaqueId(this.secret, "studio-provider-observation", subrunId);
+  }
+  private providerObservationKey(observationId: string): string {
+    return `${this.prefix}:provider-observation:${observationId}`;
+  }
+  private providerObservationLeaseKey(observationId: string): string {
+    return `${this.prefix}:provider-observation:lease:${observationId}`;
+  }
   private reconciliationAuditKey(auditId: string): string { return `${this.prefix}:reconciliation:audit:${auditId}`; }
   private outboxKey(outboxId: string): string { return `${this.prefix}:outbox:${outboxId}`; }
   private outboxPayloadKey(outboxId: string): string { return `${this.prefix}:outbox:payload:${outboxId}`; }
@@ -4633,6 +4886,246 @@ redis.call('DEL', KEYS[3])
 return cjson.encode(record)
 `;
 
+const BEGIN_PROVIDER_OBSERVATION_LUA = `
+-- AIR_STUDIO_BEGIN_PROVIDER_OBSERVATION_V1
+-- KEYS: opaque observation metadata, short observation lease, provider subrun
+--       metadata, encrypted provider request reference, job metadata
+-- ARGV: lease token, now, terminal metadata ttl, expected observation id,
+--       expected subrun id, expected job id
+local function nonnegativeInteger(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+local function positiveInteger(value)
+  return nonnegativeInteger(value) and value >= 1
+end
+local function opaque(value)
+  return type(value) == 'string' and string.match(value, '^[a-f0-9]+$') and string.len(value) == 64
+end
+local function safeText(value, maximum)
+  return type(value) == 'string' and string.len(value) >= 1 and string.len(value) <= maximum
+    and string.match(value, '^%s') == nil and string.match(value, '%s$') == nil
+    and string.find(value, '[%z\r\n]') == nil
+end
+local function terminalState(state)
+  return state == 'succeeded' or state == 'failed' or state == 'deadline_exceeded'
+    or state == 'attempts_exhausted' or state == 'reference_expired' or state == 'canceled'
+end
+local function validObservation(record)
+  return type(record) == 'table'
+    and record.schemaVersion == 1
+    and opaque(record.observationId)
+    and opaque(record.subrunId)
+    and safeText(record.jobId, 160)
+    and positiveInteger(record.subrunStateVersion)
+    and positiveInteger(record.jobStateVersion)
+    and (record.state == 'scheduled' or record.state == 'observing' or terminalState(record.state))
+    and nonnegativeInteger(record.pollAttempts)
+    and positiveInteger(record.maxPollAttempts) and record.maxPollAttempts <= 10000
+    and record.pollAttempts <= record.maxPollAttempts
+    and positiveInteger(record.requestTimeoutMs) and record.requestTimeoutMs >= 1000 and record.requestTimeoutMs <= 900000
+    and positiveInteger(record.pollIntervalMs) and record.pollIntervalMs >= 250 and record.pollIntervalMs <= 300000
+    and nonnegativeInteger(record.deadlineAtMs)
+    and nonnegativeInteger(record.nextDueAtMs) and record.nextDueAtMs <= record.deadlineAtMs
+    and positiveInteger(record.stateVersion)
+    and nonnegativeInteger(record.createdAtMs)
+    and nonnegativeInteger(record.updatedAtMs)
+end
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return cjson.encode({ kind = 'lease_lost' }) end
+local raw = redis.call('GET', KEYS[1])
+if not raw then return cjson.encode({ kind = 'unavailable' }) end
+local ok, observation = pcall(cjson.decode, raw)
+if not ok or not validObservation(observation)
+  or observation.observationId ~= ARGV[4]
+  or observation.subrunId ~= ARGV[5]
+  or observation.jobId ~= ARGV[6] then return cjson.encode({ kind = 'unavailable' }) end
+local function response(kind)
+  return cjson.encode({ kind = kind, observation = observation })
+end
+local function persistPersistent()
+  redis.call('SET', KEYS[1], cjson.encode(observation))
+end
+local function terminal(kind, state)
+  observation.state = state
+  observation.stateVersion = observation.stateVersion + 1
+  observation.updatedAtMs = tonumber(ARGV[2])
+  redis.call('SET', KEYS[1], cjson.encode(observation), 'EX', ARGV[3])
+  redis.call('DEL', KEYS[2])
+  return response(kind)
+end
+if terminalState(observation.state) then
+  redis.call('DEL', KEYS[2])
+  return response(observation.state)
+end
+
+-- The observation never transitions a subrun toward submission. It is valid
+-- only for the exact durable submitted state and executing job that created
+-- it, so a stale worker cannot write a later provider-read outcome.
+local subrunRaw = redis.call('GET', KEYS[3])
+local subrun = nil
+if subrunRaw then
+  local decoded, parsed = pcall(cjson.decode, subrunRaw)
+  if decoded and type(parsed) == 'table' then subrun = parsed end
+end
+local jobRaw = redis.call('GET', KEYS[5])
+local job = nil
+if jobRaw then
+  local decoded, parsed = pcall(cjson.decode, jobRaw)
+  if decoded and type(parsed) == 'table' then job = parsed end
+end
+local subrunValid = subrun ~= nil
+  and subrun.subrunId == observation.subrunId
+  and subrun.jobId == observation.jobId
+  and subrun.state == 'submitted'
+  and type(subrun.stateVersion) == 'number'
+  and subrun.stateVersion == math.floor(subrun.stateVersion)
+  and subrun.stateVersion == observation.subrunStateVersion
+local jobValid = job ~= nil
+  and job.jobId == observation.jobId
+  and job.state == 'executing'
+  and type(job.stateVersion) == 'number'
+  and job.stateVersion == math.floor(job.stateVersion)
+  and job.stateVersion == observation.jobStateVersion
+if not subrunValid or not jobValid then return terminal('canceled', 'canceled') end
+
+local now = tonumber(ARGV[2])
+if observation.state == 'scheduled' and now < observation.nextDueAtMs then
+  redis.call('DEL', KEYS[2])
+  return response('not_due')
+end
+if observation.state ~= 'scheduled' and observation.state ~= 'observing' then
+  return cjson.encode({ kind = 'unavailable' })
+end
+if now >= observation.deadlineAtMs then return terminal('deadline_exceeded', 'deadline_exceeded') end
+if observation.pollAttempts >= observation.maxPollAttempts then return terminal('attempts_exhausted', 'attempts_exhausted') end
+
+-- A GET must not start when the encrypted request ID cannot survive its
+-- reviewed request timeout. We never renew this privacy-bound reference.
+local referenceTtl = redis.call('PTTL', KEYS[4])
+if not referenceTtl or referenceTtl <= observation.requestTimeoutMs then
+  return terminal('reference_expired', 'reference_expired')
+end
+observation.state = 'observing'
+observation.pollAttempts = observation.pollAttempts + 1
+observation.nextDueAtMs = now
+observation.stateVersion = observation.stateVersion + 1
+observation.updatedAtMs = now
+persistPersistent()
+return response('ready')
+`;
+
+const FINISH_PROVIDER_OBSERVATION_LUA = `
+-- AIR_STUDIO_FINISH_PROVIDER_OBSERVATION_V1
+-- KEYS: opaque observation metadata, short observation lease, provider subrun
+--       metadata, job metadata
+-- ARGV: lease token, pending|succeeded|failed, now, terminal metadata ttl,
+--       expected observation id, expected subrun id, expected job id
+local function nonnegativeInteger(value)
+  return type(value) == 'number' and value >= 0 and value == math.floor(value)
+end
+local function positiveInteger(value)
+  return nonnegativeInteger(value) and value >= 1
+end
+local function opaque(value)
+  return type(value) == 'string' and string.match(value, '^[a-f0-9]+$') and string.len(value) == 64
+end
+local function safeText(value, maximum)
+  return type(value) == 'string' and string.len(value) >= 1 and string.len(value) <= maximum
+    and string.match(value, '^%s') == nil and string.match(value, '%s$') == nil
+    and string.find(value, '[%z\r\n]') == nil
+end
+local function terminalState(state)
+  return state == 'succeeded' or state == 'failed' or state == 'deadline_exceeded'
+    or state == 'attempts_exhausted' or state == 'reference_expired' or state == 'canceled'
+end
+local function validObservation(record)
+  return type(record) == 'table'
+    and record.schemaVersion == 1
+    and opaque(record.observationId)
+    and opaque(record.subrunId)
+    and safeText(record.jobId, 160)
+    and positiveInteger(record.subrunStateVersion)
+    and positiveInteger(record.jobStateVersion)
+    and (record.state == 'scheduled' or record.state == 'observing' or terminalState(record.state))
+    and nonnegativeInteger(record.pollAttempts)
+    and positiveInteger(record.maxPollAttempts) and record.maxPollAttempts <= 10000
+    and record.pollAttempts <= record.maxPollAttempts
+    and positiveInteger(record.requestTimeoutMs) and record.requestTimeoutMs >= 1000 and record.requestTimeoutMs <= 900000
+    and positiveInteger(record.pollIntervalMs) and record.pollIntervalMs >= 250 and record.pollIntervalMs <= 300000
+    and nonnegativeInteger(record.deadlineAtMs)
+    and nonnegativeInteger(record.nextDueAtMs) and record.nextDueAtMs <= record.deadlineAtMs
+    and positiveInteger(record.stateVersion)
+    and nonnegativeInteger(record.createdAtMs)
+    and nonnegativeInteger(record.updatedAtMs)
+end
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return cjson.encode({ kind = 'lease_lost' }) end
+local raw = redis.call('GET', KEYS[1])
+if not raw then return cjson.encode({ kind = 'unavailable' }) end
+local ok, observation = pcall(cjson.decode, raw)
+if not ok or not validObservation(observation)
+  or observation.observationId ~= ARGV[5]
+  or observation.subrunId ~= ARGV[6]
+  or observation.jobId ~= ARGV[7]
+  or observation.state ~= 'observing' then return cjson.encode({ kind = 'unavailable' }) end
+local function response(kind)
+  return cjson.encode({ kind = kind, observation = observation })
+end
+local function persistPersistent()
+  redis.call('SET', KEYS[1], cjson.encode(observation))
+end
+local function terminal(kind, state)
+  observation.state = state
+  observation.stateVersion = observation.stateVersion + 1
+  observation.updatedAtMs = tonumber(ARGV[3])
+  redis.call('SET', KEYS[1], cjson.encode(observation), 'EX', ARGV[4])
+  redis.call('DEL', KEYS[2])
+  return response(kind)
+end
+
+local subrunRaw = redis.call('GET', KEYS[3])
+local subrun = nil
+if subrunRaw then
+  local decoded, parsed = pcall(cjson.decode, subrunRaw)
+  if decoded and type(parsed) == 'table' then subrun = parsed end
+end
+local jobRaw = redis.call('GET', KEYS[4])
+local job = nil
+if jobRaw then
+  local decoded, parsed = pcall(cjson.decode, jobRaw)
+  if decoded and type(parsed) == 'table' then job = parsed end
+end
+local subrunValid = subrun ~= nil
+  and subrun.subrunId == observation.subrunId
+  and subrun.jobId == observation.jobId
+  and subrun.state == 'submitted'
+  and type(subrun.stateVersion) == 'number'
+  and subrun.stateVersion == math.floor(subrun.stateVersion)
+  and subrun.stateVersion == observation.subrunStateVersion
+local jobValid = job ~= nil
+  and job.jobId == observation.jobId
+  and job.state == 'executing'
+  and type(job.stateVersion) == 'number'
+  and job.stateVersion == math.floor(job.stateVersion)
+  and job.stateVersion == observation.jobStateVersion
+if not subrunValid or not jobValid then return terminal('canceled', 'canceled') end
+
+if ARGV[2] == 'succeeded' then return terminal('succeeded', 'succeeded') end
+if ARGV[2] == 'failed' then return terminal('failed', 'failed') end
+if ARGV[2] ~= 'pending' then return cjson.encode({ kind = 'unavailable' }) end
+
+local now = tonumber(ARGV[3])
+if now >= observation.deadlineAtMs then return terminal('deadline_exceeded', 'deadline_exceeded') end
+if observation.pollAttempts >= observation.maxPollAttempts then return terminal('attempts_exhausted', 'attempts_exhausted') end
+local nextDue = now + observation.pollIntervalMs
+if nextDue > observation.deadlineAtMs then nextDue = observation.deadlineAtMs end
+observation.state = 'scheduled'
+observation.nextDueAtMs = nextDue
+observation.stateVersion = observation.stateVersion + 1
+observation.updatedAtMs = now
+persistPersistent()
+redis.call('DEL', KEYS[2])
+return response('pending')
+`;
+
 const BEGIN_JOB_RESULT_PREPARATION_LUA = `
 -- AIR_STUDIO_BEGIN_JOB_RESULT_PREPARATION_V1
 -- KEYS: opaque preparation metadata, encrypted prepared Photon GUID, upload
@@ -5168,6 +5661,46 @@ function parseProviderSubmissionBeginResult(raw: string | null): StudioProviderS
   }
 }
 
+function parseProviderObservationBeginResult(raw: string | null): StudioProviderObservationBeginResult {
+  const parsed = parseStored<{ readonly kind?: unknown; readonly observation?: unknown }>(raw);
+  if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
+  if (parsed.kind === "lease_lost" || parsed.kind === "unavailable") return Object.freeze({ kind: parsed.kind });
+  if (!isProviderObservationRecord(parsed.observation)) return Object.freeze({ kind: "unavailable" });
+  const observation = Object.freeze(parsed.observation);
+  switch (parsed.kind) {
+    case "ready":
+    case "not_due":
+    case "succeeded":
+    case "failed":
+    case "deadline_exceeded":
+    case "attempts_exhausted":
+    case "reference_expired":
+    case "canceled":
+      return Object.freeze({ kind: parsed.kind, observation });
+    default:
+      return Object.freeze({ kind: "unavailable" });
+  }
+}
+
+function parseProviderObservationFinishResult(raw: string | null): StudioProviderObservationFinishResult {
+  const parsed = parseStored<{ readonly kind?: unknown; readonly observation?: unknown }>(raw);
+  if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
+  if (parsed.kind === "lease_lost" || parsed.kind === "unavailable") return Object.freeze({ kind: parsed.kind });
+  if (!isProviderObservationRecord(parsed.observation)) return Object.freeze({ kind: "unavailable" });
+  const observation = Object.freeze(parsed.observation);
+  switch (parsed.kind) {
+    case "pending":
+    case "succeeded":
+    case "failed":
+    case "deadline_exceeded":
+    case "attempts_exhausted":
+    case "canceled":
+      return Object.freeze({ kind: parsed.kind, observation });
+    default:
+      return Object.freeze({ kind: "unavailable" });
+  }
+}
+
 function parseJobResultPreparationBeginResult(raw: string | null): StudioJobResultPreparationBeginResult {
   const parsed = parseStored<{ readonly kind?: unknown; readonly preparation?: unknown }>(raw);
   if (!parsed || typeof parsed.kind !== "string") return Object.freeze({ kind: "unavailable" });
@@ -5428,6 +5961,49 @@ function isProviderSubrunRecord(value: unknown): value is StudioProviderSubrunRe
     && typeof candidate.updatedAtMs === "number" && isNonnegativeSafeInteger(candidate.updatedAtMs);
 }
 
+function isProviderObservationRecord(value: unknown): value is StudioProviderObservationRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Partial<StudioProviderObservationRecord>;
+  return record.schemaVersion === 1
+    && isOpaqueStudioIdentifier(record.observationId)
+    && isOpaqueStudioIdentifier(record.subrunId)
+    && isSafeRecordString(record.jobId, 160)
+    && typeof record.subrunStateVersion === "number" && isPositiveSafeInteger(record.subrunStateVersion)
+    && typeof record.jobStateVersion === "number" && isPositiveSafeInteger(record.jobStateVersion)
+    && STUDIO_PROVIDER_OBSERVATION_STATES.includes(record.state as StudioProviderObservationState)
+    && typeof record.pollAttempts === "number"
+    && isNonnegativeSafeInteger(record.pollAttempts)
+    && typeof record.maxPollAttempts === "number"
+    && isPositiveSafeInteger(record.maxPollAttempts)
+    && record.maxPollAttempts <= 10_000
+    && record.pollAttempts <= record.maxPollAttempts
+    && typeof record.requestTimeoutMs === "number"
+    && isPositiveSafeInteger(record.requestTimeoutMs)
+    && record.requestTimeoutMs >= 1_000
+    && record.requestTimeoutMs <= 900_000
+    && typeof record.pollIntervalMs === "number"
+    && isPositiveSafeInteger(record.pollIntervalMs)
+    && record.pollIntervalMs >= 250
+    && record.pollIntervalMs <= 300_000
+    && typeof record.deadlineAtMs === "number"
+    && isNonnegativeSafeInteger(record.deadlineAtMs)
+    && typeof record.nextDueAtMs === "number"
+    && isNonnegativeSafeInteger(record.nextDueAtMs)
+    && record.nextDueAtMs <= record.deadlineAtMs
+    && typeof record.stateVersion === "number"
+    && isPositiveSafeInteger(record.stateVersion)
+    && typeof record.createdAtMs === "number"
+    && isNonnegativeSafeInteger(record.createdAtMs)
+    && typeof record.updatedAtMs === "number"
+    && isNonnegativeSafeInteger(record.updatedAtMs);
+}
+
+function isProviderObservationFinishOutcome(value: unknown): value is StudioProviderObservationFinishOutcome {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const outcome = value as { readonly kind?: unknown };
+  return outcome.kind === "pending" || outcome.kind === "succeeded" || outcome.kind === "failed";
+}
+
 function isReconciliationAuditRecord(value: unknown): value is StudioReconciliationAuditRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Partial<StudioReconciliationAuditRecord>;
@@ -5457,6 +6033,21 @@ function sameProviderSubrunIdentity(
     && left.releaseStamp.phase === right.releaseStamp.phase;
 }
 
+function sameProviderObservationIdentity(
+  left: StudioProviderObservationRecord,
+  right: StudioProviderObservationRecord,
+): boolean {
+  return left.observationId === right.observationId
+    && left.subrunId === right.subrunId
+    && left.jobId === right.jobId
+    && left.subrunStateVersion === right.subrunStateVersion
+    && left.jobStateVersion === right.jobStateVersion
+    && left.maxPollAttempts === right.maxPollAttempts
+    && left.requestTimeoutMs === right.requestTimeoutMs
+    && left.pollIntervalMs === right.pollIntervalMs
+    && left.deadlineAtMs === right.deadlineAtMs;
+}
+
 function sameJobResultPreparationIdentity(
   left: StudioJobResultPreparationRecord,
   right: StudioJobResultPreparationRecord,
@@ -5472,6 +6063,12 @@ function isOpaqueStudioIdentifier(value: unknown): value is string {
 
 function isSafeProviderRequestId(value: string): boolean {
   return isSafeRecordString(value, 512);
+}
+
+function addSafeMilliseconds(start: number, duration: number): number | null {
+  if (!isNonnegativeSafeInteger(start) || !isPositiveSafeInteger(duration)) return null;
+  const result = start + duration;
+  return isNonnegativeSafeInteger(result) ? result : null;
 }
 
 function isProviderTerminalizationReason(value: unknown): value is StudioProviderTerminalizationReason {
