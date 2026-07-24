@@ -136,7 +136,10 @@ function createDarkFixture(options: {
   return { runtime, store, transport, senderHash, threadHash, redis, cipher };
 }
 
-async function armFixtureReleaseFence(fixture: ReturnType<typeof createDarkFixture>): Promise<void> {
+async function armFixtureReleaseFence(
+  fixture: ReturnType<typeof createDarkFixture>,
+  options: { readonly activateInboxFifo?: boolean } = {},
+): Promise<void> {
   if (fixture.runtime.environment.releasePhase === "dark") return;
   const baseline = new StudioStore({
     redis: fixture.redis,
@@ -146,6 +149,15 @@ async function armFixtureReleaseFence(fixture: ReturnType<typeof createDarkFixtu
   });
   expect(await baseline.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
   expect(await fixture.store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+  if (options.activateInboxFifo ?? true) {
+    await expect(fixture.store.beginInboxFifoMigration()).resolves.toEqual({ kind: "holding" });
+    await expect(fixture.store.prepareInboxFifoHoldingScopes()).resolves.toEqual({
+      kind: "prepared",
+      preparedScopes: 0,
+      remainingScopes: 0,
+    });
+    await expect(fixture.store.activateInboxFifoMigration()).resolves.toEqual({ kind: "activated" });
+  }
 }
 
 function reviewedImagineRegistry(options: {
@@ -864,6 +876,98 @@ describe("Air studio dark engine", () => {
     expect(admitJob).not.toHaveBeenCalled();
     expect(fixture.transport.sendText).not.toHaveBeenCalled();
     expect(fixture.transport.sendAttachment).not.toHaveBeenCalled();
+  });
+
+  it("requires durable FIFO before active media or creation handling while /help remains available", async () => {
+    const provider = {
+      verified: true,
+      submit: vi.fn(async () => Object.freeze({ kind: "accepted" as const, providerRequestId: "must-not-submit" })),
+    } satisfies StudioProviderPort;
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      allowProviderSubmit: true,
+      provider,
+      registry: reviewedImagineRegistry(),
+      perJobCents: 100,
+      dailyCents: 100,
+    });
+    await armFixtureReleaseFence(fixture, { activateInboxFifo: false });
+    await fixture.store.putSettings(fixture.senderHash, {
+      schemaVersion: 1,
+      onboardingVersion: 1,
+      modes: {
+        imagine: { outputCount: 1 },
+        animate: { outputCount: 1, durationSeconds: 5 },
+        "edit-image": { outputCount: 1 },
+        "edit-video": { outputCount: 1, durationSeconds: 5 },
+      },
+    });
+    const admit = vi.spyOn(fixture.store, "admitJobWithInitialNotifications");
+    const putPending = vi.spyOn(fixture.store, "putPendingWithGuard");
+    const fifoStatus = vi.spyOn(fixture.store, "getInboxFifoMigrationStatus");
+    const createOutbox = vi.spyOn(fixture.store, "createOutbox");
+
+    const creationReceipt = await persistInbound(fixture, "fifo-required-create-001", "/imagine a paper lantern");
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    await expect(fixture.store.readInbox(creationReceipt)).resolves.toMatchObject({ state: "maintenance_rejected" });
+    expect(admit).not.toHaveBeenCalled();
+
+    const mediaReceipt = await persistInbound(
+      fixture,
+      "fifo-required-media-001",
+      null,
+      [{ id: "fifo-required-media", mimeType: "image/png", sizeBytes: 42 }],
+    );
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    await expect(fixture.store.readInbox(mediaReceipt)).resolves.toMatchObject({ state: "maintenance_rejected" });
+    await expect(fixture.store.getPending(fixture.senderHash, fixture.threadHash)).resolves.toBeNull();
+    expect(putPending).not.toHaveBeenCalled();
+
+    const fifoReadsBeforeHelp = fifoStatus.mock.calls.length;
+    const helpReceipt = await persistInbound(fixture, "fifo-required-help-001", "/help");
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    await expect(fixture.store.readInbox(helpReceipt)).resolves.toMatchObject({ state: "processed" });
+    // Claiming and finishing every receipt inspect the durable migration
+    // marker in the store. `/help` itself must not add the engine's paid
+    // admission check, so only those two scheduler reads are expected.
+    expect(fifoStatus).toHaveBeenCalledTimes(fifoReadsBeforeHelp + 2);
+    expect(createOutbox.mock.calls.map(([input]) => input.payload))
+      .toContainEqual(expect.objectContaining({ text: expect.stringContaining("Air commands:") }));
+    expect(createOutbox.mock.calls.map(([input]) => input.payload))
+      .toContainEqual(expect.objectContaining({ text: expect.stringContaining("ordering-safety migration") }));
+    expect(provider.submit).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for an invalid FIFO migration status even after a FIFO cutover", async () => {
+    const provider = {
+      verified: true,
+      submit: vi.fn(async () => Object.freeze({ kind: "accepted" as const, providerRequestId: "must-not-submit" })),
+    } satisfies StudioProviderPort;
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      acceptNewJobs: true,
+      allowProviderSubmit: true,
+      provider,
+      registry: reviewedImagineRegistry(),
+      perJobCents: 100,
+      dailyCents: 100,
+    });
+    await armFixtureReleaseFence(fixture);
+    // Let the store's scheduler claim the already-persisted FIFO head, then
+    // make the engine's new-admission read fail closed. The real marker stays
+    // FIFO so the Lua finish primitive can terminalize the claimed receipt.
+    vi.spyOn(fixture.store, "getInboxFifoMigrationStatus")
+      .mockResolvedValueOnce({ kind: "current", phase: "fifo", holdingScopes: 0 })
+      .mockResolvedValueOnce({ kind: "invalid" })
+      .mockResolvedValue({ kind: "current", phase: "fifo", holdingScopes: 0 });
+    const admit = vi.spyOn(fixture.store, "admitJobWithInitialNotifications");
+    const receiptId = await persistInbound(fixture, "fifo-invalid-create-001", "/imagine a paper lantern");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    await expect(fixture.store.readInbox(receiptId)).resolves.toMatchObject({ state: "maintenance_rejected" });
+    expect(admit).not.toHaveBeenCalled();
+    expect(provider.submit).not.toHaveBeenCalled();
   });
 
   it("treats zero spend caps as a no-paid-generation kill switch even if provider switches are true", async () => {

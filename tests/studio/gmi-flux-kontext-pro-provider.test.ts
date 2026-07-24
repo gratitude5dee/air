@@ -7,6 +7,7 @@ import {
   GmiFluxKontextProStudioProvider,
   type GmiFluxKontextProRequestQueueClient,
 } from "../../lib/studio/gmi-flux-kontext-pro-provider.js";
+import { isStudioProviderResultReference } from "../../lib/studio/provider-result-reference.js";
 import type {
   StudioProviderObservationInput,
   StudioProviderSubmitInput,
@@ -264,6 +265,124 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
     await expect(provider.observe(observationInput())).resolves.toEqual({ kind: "pending" });
     expect(getRequestStatus).toHaveBeenCalledWith("gmi-flux-observation-001");
     expect(submitRequest).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("splits a successful status poll from later artifact materialization without exposing its URL", async () => {
+    const getRequestStatus = vi.fn(async () => ({
+      requestId: "gmi-flux-observation-001",
+      status: "success" as const,
+      response: {
+        request_id: "gmi-flux-observation-001",
+        model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+        status: "success",
+        is_public: false,
+        outcome: {
+          media_urls: [{ id: "0", url: signedFluxOutputUrl() }],
+        },
+      },
+    }));
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
+      status: 200,
+      headers: { "content-type": "image/jpeg", "content-length": "3" },
+    }));
+    const provider = new GmiFluxKontextProStudioProvider(
+      {
+        submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }),
+        getRequestStatus,
+      },
+      { outputPolicy, fetch },
+    );
+    const input = observationInput();
+
+    const polled = await provider.pollResult(input);
+
+    expect(polled.kind).toBe("ready");
+    if (polled.kind !== "ready") throw new Error("expected sealed result reference");
+    expect(isStudioProviderResultReference(polled.reference)).toBe(true);
+    expect(JSON.stringify(polled)).not.toContain("X-Goog-Signature");
+    expect(JSON.stringify(polled)).not.toContain("opaque-output.jpg");
+    expect(getRequestStatus).toHaveBeenCalledTimes(1);
+    expect(fetch).not.toHaveBeenCalled();
+
+    const materialized = await provider.materializeResult({
+      job: input.job,
+      snapshot: input.snapshot,
+      reference: polled.reference,
+    });
+
+    expect(materialized.kind).toBe("ready");
+    expect(getRequestStatus).toHaveBeenCalledTimes(1);
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a copied result reference before any artifact fetch", async () => {
+    const getRequestStatus = vi.fn(async () => ({
+      requestId: "gmi-flux-observation-001",
+      status: "success" as const,
+      response: {
+        request_id: "gmi-flux-observation-001",
+        model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+        status: "success",
+        is_public: false,
+        outcome: {
+          media_urls: [{ id: "0", url: signedFluxOutputUrl() }],
+        },
+      },
+    }));
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("must not fetch"));
+    const provider = new GmiFluxKontextProStudioProvider(
+      {
+        submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }),
+        getRequestStatus,
+      },
+      { outputPolicy, fetch },
+    );
+    const input = observationInput();
+    const polled = await provider.pollResult(input);
+    if (polled.kind !== "ready") throw new Error("expected sealed result reference");
+
+    await expect(provider.materializeResult({
+      job: input.job,
+      snapshot: input.snapshot,
+      reference: { ...polled.reference },
+    })).resolves.toEqual({ kind: "reconciliation_required" });
+
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects a sealed result reference when it is presented for a different Air job", async () => {
+    const getRequestStatus = vi.fn(async () => ({
+      requestId: "gmi-flux-observation-001",
+      status: "success" as const,
+      response: {
+        request_id: "gmi-flux-observation-001",
+        model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+        status: "success",
+        is_public: false,
+        outcome: {
+          media_urls: [{ id: "0", url: signedFluxOutputUrl() }],
+        },
+      },
+    }));
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("must not fetch"));
+    const provider = new GmiFluxKontextProStudioProvider(
+      {
+        submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }),
+        getRequestStatus,
+      },
+      { outputPolicy, fetch },
+    );
+    const input = observationInput();
+    const polled = await provider.pollResult(input);
+    if (polled.kind !== "ready") throw new Error("expected sealed result reference");
+
+    await expect(provider.materializeResult({
+      job: { ...input.job, jobId: "different-opaque-air-job" },
+      snapshot: input.snapshot,
+      reference: polled.reference,
+    })).resolves.toEqual({ kind: "reconciliation_required" });
+
     expect(fetch).not.toHaveBeenCalled();
   });
 

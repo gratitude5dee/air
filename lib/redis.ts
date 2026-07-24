@@ -1196,7 +1196,16 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_ADMIT_JOB_V5")) {
       return this.evalStudioAdmitJob(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_PERSIST_INBOX_V4")) {
+    if (script.includes("AIR_STUDIO_BEGIN_INBOX_FIFO_HOLDING_V1")) {
+      return this.evalStudioBeginInboxFifoHolding(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_PREPARE_INBOX_FIFO_HOLDING_SCOPE_V1")) {
+      return this.evalStudioPrepareInboxFifoHoldingScope(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_ACTIVATE_INBOX_FIFO_V1")) {
+      return this.evalStudioActivateInboxFifo(options.keys, options.arguments);
+    }
+    if (script.includes("AIR_STUDIO_PERSIST_INBOX_V5")) {
       return this.evalStudioPersistInbox(options.keys, options.arguments);
     }
     if (script.includes("AIR_STUDIO_ENSURE_ONBOARDING_BUNDLE_V1")) {
@@ -1205,13 +1214,13 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_PERSIST_OUTBOX_V4")) {
       return this.evalStudioPersistOutbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_CLAIM_INBOX_V3")) {
+    if (script.includes("AIR_STUDIO_CLAIM_INBOX_V4")) {
       return this.evalStudioClaimInbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_FINISH_INBOX_V3")) {
+    if (script.includes("AIR_STUDIO_FINISH_INBOX_V4")) {
       return this.evalStudioFinishInbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_RETRY_INBOX_V3")) {
+    if (script.includes("AIR_STUDIO_RETRY_INBOX_V4")) {
       return this.evalStudioRetryInbox(options.keys, options.arguments);
     }
     if (script.includes("AIR_STUDIO_CLAIM_OUTBOX_V5")) {
@@ -1878,31 +1887,151 @@ export class MemoryRedis implements RedisLike {
   }
 
   private evalStudioPersistInbox(keys: readonly string[], args: readonly string[]): string | number {
-    this.assertStudioArity(keys, args, 4, 5);
+    this.assertStudioArity(keys, args, 8, 6);
     const recordKey = this.studioKey(keys, 0);
     const envelopeKey = this.studioKey(keys, 1);
     const readyKey = this.studioKey(keys, 2);
     const scopeCounterKey = this.studioKey(keys, 3);
+    const migrationKey = this.studioKey(keys, 4);
+    const scopeQueueKey = this.studioKey(keys, 5);
+    const scopeCursorKey = this.studioKey(keys, 6);
+    const holdingScopesKey = this.studioKey(keys, 7);
     const serializedRecord = this.studioArgument(args, 0);
     const serializedEnvelope = this.studioArgument(args, 1);
     const envelopeTtl = this.studioPositiveInteger(this.studioArgument(args, 2));
     const score = this.studioNonnegativeInteger(this.studioArgument(args, 3));
     const member = this.studioArgument(args, 4);
+    const scopeId = this.studioArgument(args, 5);
+    if (!/^[a-f0-9]{64}$/.test(scopeId)) return -2;
     this.assertStringOrMissing(recordKey);
     this.assertStringOrMissing(envelopeKey);
     this.assertStringOrMissing(scopeCounterKey);
+    this.assertStringOrMissing(migrationKey);
     this.assertZSetOrMissing(readyKey);
     if (this.getEntry(recordKey)) return 0;
+    const phase = this.studioInboxFifoPhase(migrationKey);
+    if (phase === "invalid") return -2;
     const record = this.studioRecordFromJson(serializedRecord);
     const nextSequence = this.studioCounter(scopeCounterKey) + 1;
+    if (!Number.isSafeInteger(nextSequence) || nextSequence < 1) return -2;
+
+    let cursor: number | undefined;
+    if (phase !== "legacy") {
+      this.assertZSetOrMissing(scopeQueueKey);
+      this.assertStringOrMissing(scopeCursorKey);
+      this.assertZSetOrMissing(holdingScopesKey);
+      const rawCursor = this.studioString(scopeCursorKey);
+      if (rawCursor === null) {
+        cursor = nextSequence;
+      } else {
+        try {
+          cursor = this.studioPositiveInteger(rawCursor);
+        } catch {
+          return -2;
+        }
+        if (cursor > nextSequence) return -2;
+      }
+      // Match the production Lua's counter-rollback/corruption guard: a
+      // second member at one sequence must never be resolved by member sort.
+      if ([...(this.getZSet(scopeQueueKey, false)?.value.values() ?? [])]
+        .some((scopeSequence) => scopeSequence === nextSequence)) return -2;
+    }
+
     this.values.set(scopeCounterKey, { kind: "string", value: String(nextSequence), expiresAt: null });
     record.scopeSequence = nextSequence;
     delete record.encryptedEnvelope;
     const stored = JSON.stringify(record);
     this.values.set(recordKey, { kind: "string", value: stored, expiresAt: null });
     this.values.set(envelopeKey, { kind: "string", value: serializedEnvelope, expiresAt: this.now() + envelopeTtl * 1_000 });
-    this.getZSet(readyKey, true).value.set(member, score);
+    if (phase === "legacy") {
+      this.getZSet(readyKey, true).value.set(member, score);
+      return stored;
+    }
+
+    if (this.studioString(scopeCursorKey) === null) {
+      this.studioSetPersistent(scopeCursorKey, String(cursor));
+    }
+    this.getZSet(scopeQueueKey, true).value.set(member, nextSequence);
+    if (phase === "holding") {
+      this.getZSet(holdingScopesKey, true).value.set(scopeId, 0);
+    } else if (cursor === nextSequence) {
+      this.getZSet(readyKey, true).value.set(member, score);
+    }
     return stored;
+  }
+
+  private evalStudioBeginInboxFifoHolding(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 3, 0);
+    const migrationKey = this.studioKey(keys, 0);
+    const readyKey = this.studioKey(keys, 1);
+    const holdingScopesKey = this.studioKey(keys, 2);
+    this.assertStringOrMissing(migrationKey);
+    this.assertZSetOrMissing(readyKey);
+    this.assertZSetOrMissing(holdingScopesKey);
+    const phase = this.studioInboxFifoPhase(migrationKey);
+    if (phase === "invalid") return -3;
+    if (phase === "holding") return 2;
+    if (phase === "fifo") return -2;
+    if (this.getZSet(readyKey, false)?.value.size ?? 0) return -1;
+    if (this.getZSet(holdingScopesKey, false)?.value.size ?? 0) return -3;
+    this.studioSetPersistent(migrationKey, JSON.stringify({ schemaVersion: 1, phase: "holding" }));
+    return 1;
+  }
+
+  private evalStudioPrepareInboxFifoHoldingScope(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 5, 2);
+    const migrationKey = this.studioKey(keys, 0);
+    const holdingScopesKey = this.studioKey(keys, 1);
+    const scopeQueueKey = this.studioKey(keys, 2);
+    const scopeCursorKey = this.studioKey(keys, 3);
+    const readyKey = this.studioKey(keys, 4);
+    const scopeId = this.studioArgument(args, 0);
+    const recordKeyPrefix = this.studioArgument(args, 1);
+    if (!/^[a-f0-9]{64}$/.test(scopeId) || !recordKeyPrefix) return -1;
+    this.assertStringOrMissing(migrationKey);
+    this.assertZSetOrMissing(holdingScopesKey);
+    this.assertZSetOrMissing(scopeQueueKey);
+    this.assertStringOrMissing(scopeCursorKey);
+    this.assertZSetOrMissing(readyKey);
+    if (this.studioInboxFifoPhase(migrationKey) !== "holding") return -2;
+    let cursor: number;
+    try {
+      const raw = this.studioString(scopeCursorKey);
+      if (raw === null) return -1;
+      cursor = this.studioPositiveInteger(raw);
+    } catch {
+      return -1;
+    }
+    const head = this.studioInboxFifoHead(scopeQueueKey);
+    if (head === "invalid" || head === null || head.scopeSequence !== cursor) return -1;
+    const record = this.studioRecordFailClosed(`${recordKeyPrefix}${head.receiptId}`);
+    if (!this.studioInboxFifoReadyRecord(record, head.receiptId, cursor)) return -1;
+    const held = this.getZSet(holdingScopesKey, false)?.value.has(scopeId) === true;
+    const published = this.getZSet(readyKey, false)?.value.get(head.receiptId);
+    if (!held) return published === record.receivedAtMs ? 2 : -1;
+    if (published !== undefined) {
+      if (published !== record.receivedAtMs) return -1;
+      this.studioRemoveMember(holdingScopesKey, scopeId);
+      return 2;
+    }
+    this.getZSet(readyKey, true).value.set(head.receiptId, record.receivedAtMs);
+    this.studioRemoveMember(holdingScopesKey, scopeId);
+    return 1;
+  }
+
+  private evalStudioActivateInboxFifo(keys: readonly string[], args: readonly string[]): number {
+    this.assertStudioArity(keys, args, 2, 0);
+    const migrationKey = this.studioKey(keys, 0);
+    const holdingScopesKey = this.studioKey(keys, 1);
+    this.assertStringOrMissing(migrationKey);
+    this.assertZSetOrMissing(holdingScopesKey);
+    const phase = this.studioInboxFifoPhase(migrationKey);
+    if (phase === "invalid") return -3;
+    if (phase === "legacy") return -2;
+    if (phase === "fifo") return 2;
+    if (this.getZSet(holdingScopesKey, false)?.value.size ?? 0) return -1;
+    this.studioSetPersistent(migrationKey, JSON.stringify({ schemaVersion: 1, phase: "fifo" }));
+    return 1;
   }
 
   private evalStudioPersistOutbox(keys: readonly string[], args: readonly string[]): number {
@@ -2213,7 +2342,7 @@ export class MemoryRedis implements RedisLike {
     args: readonly string[],
   ): readonly [string, string?] {
     try {
-      this.assertStudioArity(keys, args, 16, 27);
+      this.assertStudioArity(keys, args, 17, 27);
       const activeKey = this.studioKey(keys, 0);
       const userCountKey = this.studioKey(keys, 1);
       const spendKey = this.studioKey(keys, 2);
@@ -2230,6 +2359,7 @@ export class MemoryRedis implements RedisLike {
       const tapbackLaneKey = this.studioKey(keys, 13);
       const canaryBudgetKey = this.studioKey(keys, 14);
       const recentJobKey = this.studioKey(keys, 15);
+      const inboxFifoMigrationKey = this.studioKey(keys, 16);
       const jobId = this.studioArgument(args, 0);
       const serializedMetadata = this.studioArgument(args, 1);
       const serializedPayload = this.studioArgument(args, 2);
@@ -2345,6 +2475,7 @@ export class MemoryRedis implements RedisLike {
       this.assertStringOrMissing(acknowledgementPayloadKey);
       this.assertZSetOrMissing(acknowledgementLaneKey);
       this.assertStringOrMissing(recentJobKey);
+      this.assertStringOrMissing(inboxFifoMigrationKey);
       if (releasePhase === "canary") this.assertStringOrMissing(canaryBudgetKey);
       if (hasTapback) {
         this.assertStringOrMissing(tapbackKey);
@@ -2353,6 +2484,12 @@ export class MemoryRedis implements RedisLike {
       }
       if (this.studioReleasePersistenceStatus(candidate, releaseFenceKey, releaseGeneration, releasePhase) !== 1) {
         return ["release_blocked"];
+      }
+      // New iMessage job creation is impossible until the one-way inbox
+      // migration reaches FIFO. This check lives in the same transaction as
+      // reservation so an active config flag cannot race a cutover state.
+      if (releasePhase !== "dark" && this.studioInboxFifoPhase(inboxFifoMigrationKey) !== "fifo") {
+        return ["inbox_fifo_required"];
       }
       if (reservedCents > perJobCap) return ["per_job_cap"];
 
@@ -2483,17 +2620,31 @@ export class MemoryRedis implements RedisLike {
   }
 
   private evalStudioClaimInbox(keys: readonly string[], args: readonly string[]): string | false {
-    this.assertStudioArity(keys, args, 4, 4);
+    this.assertStudioArity(keys, args, 7, 4);
     const recordKey = this.studioKey(keys, 0);
     const envelopeKey = this.studioKey(keys, 1);
     const leaseKey = this.studioKey(keys, 2);
     const readyKey = this.studioKey(keys, 3);
+    const migrationKey = this.studioKey(keys, 4);
+    const scopeQueueKey = this.studioKey(keys, 5);
+    const scopeCursorKey = this.studioKey(keys, 6);
     const token = this.studioArgument(args, 0);
     const leaseTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
     const member = this.studioArgument(args, 3);
-    const record = this.studioRecord(recordKey);
+    this.assertStringOrMissing(migrationKey);
+    this.assertZSetOrMissing(readyKey);
+    const phase = this.studioInboxFifoPhase(migrationKey);
+    if (phase === "invalid" || phase === "holding") return false;
+    const record = this.studioRecordFailClosed(recordKey);
     if (!record || (record.state !== "received" && record.state !== "claimed")) return false;
+    if (phase === "fifo") {
+      this.assertZSetOrMissing(scopeQueueKey);
+      this.assertStringOrMissing(scopeCursorKey);
+      if (!this.studioInboxFifoCurrentHead(record, member, scopeQueueKey, scopeCursorKey)) return false;
+      const dueAt = this.getZSet(readyKey, false)?.value.get(member);
+      if (dueAt === undefined || dueAt > now) return false;
+    }
     if (this.studioString(leaseKey) !== null) return false;
     this.studioSet(leaseKey, token, leaseTtl);
     record.state = "claimed";
@@ -2501,24 +2652,44 @@ export class MemoryRedis implements RedisLike {
     this.studioSetPersistentRecord(recordKey, record);
     this.getZSet(readyKey, true).value.set(member, now + leaseTtl);
     const envelope = this.studioString(envelopeKey);
-    if (envelope !== null) record.encryptedEnvelope = this.studioRecordFromJson(envelope);
+    if (envelope !== null) {
+      try {
+        record.encryptedEnvelope = this.studioRecordFromJson(envelope);
+      } catch {
+        // Match the deployed Lua's privacy-safe outcome: a bad payload is
+        // returned without an envelope and terminalized by the worker.
+      }
+    }
     return JSON.stringify(record);
   }
 
   private evalStudioFinishInbox(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 4, 5);
+    this.assertStudioArity(keys, args, 7, 6);
     const recordKey = this.studioKey(keys, 0);
     const envelopeKey = this.studioKey(keys, 1);
     const leaseKey = this.studioKey(keys, 2);
     const readyKey = this.studioKey(keys, 3);
+    const migrationKey = this.studioKey(keys, 4);
+    const scopeQueueKey = this.studioKey(keys, 5);
+    const scopeCursorKey = this.studioKey(keys, 6);
     const token = this.studioArgument(args, 0);
     const nextState = this.studioArgument(args, 1);
     const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
     const member = this.studioArgument(args, 4);
+    const recordKeyPrefix = this.studioArgument(args, 5);
     if (nextState !== "processed" && nextState !== "maintenance_rejected" && nextState !== "failed") return 0;
+    this.assertStringOrMissing(migrationKey);
+    this.assertZSetOrMissing(readyKey);
+    const phase = this.studioInboxFifoPhase(migrationKey);
+    if (phase === "invalid" || phase === "holding") return 0;
     if (this.studioString(leaseKey) !== token) return 0;
-    const record = this.studioRecord(recordKey);
+    const record = this.studioRecordFailClosed(recordKey);
     if (!record || record.state !== "claimed") return 0;
+    if (phase === "fifo") {
+      this.assertZSetOrMissing(scopeQueueKey);
+      this.assertStringOrMissing(scopeCursorKey);
+      if (!this.studioInboxFifoCurrentHead(record, member, scopeQueueKey, scopeCursorKey)) return 0;
+    }
     record.state = nextState;
     record.stateVersion = this.studioStateVersion(record) + 1;
     // Mirror the production Lua terminal scrub: receipt metadata remains for
@@ -2528,29 +2699,53 @@ export class MemoryRedis implements RedisLike {
     this.values.delete(envelopeKey);
     this.studioRemoveMember(readyKey, member);
     this.values.delete(leaseKey);
-    return 1;
+    if (phase === "legacy") return 1;
+    this.studioRemoveMember(scopeQueueKey, member);
+    const nextSequence = (record.scopeSequence as number) + 1;
+    this.studioSetPersistent(scopeCursorKey, String(nextSequence));
+    return this.studioPromoteInboxFifoNext(scopeQueueKey, readyKey, nextSequence, recordKeyPrefix);
   }
 
   private evalStudioRetryInbox(keys: readonly string[], args: readonly string[]): number {
-    this.assertStudioArity(keys, args, 4, 5);
+    this.assertStudioArity(keys, args, 7, 6);
     const recordKey = this.studioKey(keys, 0);
     const envelopeKey = this.studioKey(keys, 1);
     const leaseKey = this.studioKey(keys, 2);
     const readyKey = this.studioKey(keys, 3);
+    const migrationKey = this.studioKey(keys, 4);
+    const scopeQueueKey = this.studioKey(keys, 5);
+    const scopeCursorKey = this.studioKey(keys, 6);
     const token = this.studioArgument(args, 0);
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 1));
     const retryAfter = this.studioNonnegativeInteger(this.studioArgument(args, 2));
     const recordTtl = this.studioPositiveInteger(this.studioArgument(args, 3));
     const member = this.studioArgument(args, 4);
+    const recordKeyPrefix = this.studioArgument(args, 5);
+    this.assertStringOrMissing(migrationKey);
+    this.assertZSetOrMissing(readyKey);
+    const phase = this.studioInboxFifoPhase(migrationKey);
+    if (phase === "invalid" || phase === "holding") return 0;
     if (this.studioString(leaseKey) !== token) return 0;
-    const record = this.studioRecord(recordKey);
+    const record = this.studioRecordFailClosed(recordKey);
     if (!record || record.state !== "claimed") return 0;
+    if (phase === "fifo") {
+      this.assertZSetOrMissing(scopeQueueKey);
+      this.assertStringOrMissing(scopeCursorKey);
+      if (!this.studioInboxFifoCurrentHead(record, member, scopeQueueKey, scopeCursorKey)) return 0;
+    }
     if (this.studioString(envelopeKey) === null) {
       record.state = "failed";
       record.stateVersion = this.studioStateVersion(record) + 1;
+      delete record.encryptedEnvelope;
       this.studioSetRecord(recordKey, record, recordTtl);
       this.studioRemoveMember(readyKey, member);
       this.values.delete(leaseKey);
+      if (phase === "fifo") {
+        this.studioRemoveMember(scopeQueueKey, member);
+        const nextSequence = (record.scopeSequence as number) + 1;
+        this.studioSetPersistent(scopeCursorKey, String(nextSequence));
+        this.studioPromoteInboxFifoNext(scopeQueueKey, readyKey, nextSequence, recordKeyPrefix);
+      }
       return 2;
     }
     record.state = "received";
@@ -3932,6 +4127,102 @@ export class MemoryRedis implements RedisLike {
     if (!entry) return null;
     if (entry.kind !== "string") throw new Error("Redis key has the wrong type");
     return entry.value;
+  }
+
+  private studioInboxFifoPhase(key: string): "legacy" | "holding" | "fifo" | "invalid" {
+    const raw = this.studioString(key);
+    if (raw === null) return "legacy";
+    let record: Record<string, unknown>;
+    try {
+      record = this.studioRecordFromJson(raw);
+    } catch {
+      return "invalid";
+    }
+    if (record.schemaVersion !== 1) return "invalid";
+    if (record.phase === "holding" || record.phase === "fifo") return record.phase;
+    return "invalid";
+  }
+
+  private studioInboxFifoHead(
+    queueKey: string,
+  ): { readonly receiptId: string; readonly scopeSequence: number } | "invalid" | null {
+    const queue = this.getZSet(queueKey, false);
+    if (!queue || queue.value.size === 0) return null;
+    const ordered = [...queue.value.entries()].sort(([firstMember, firstSequence], [secondMember, secondSequence]) =>
+      firstSequence === secondSequence ? firstMember.localeCompare(secondMember) : firstSequence - secondSequence,
+    );
+    const [receiptId, scopeSequence] = ordered[0] ?? [];
+    if (
+      typeof receiptId !== "string"
+      || !/^[a-f0-9]{64}$/.test(receiptId)
+      || typeof scopeSequence !== "number"
+      || !Number.isSafeInteger(scopeSequence)
+      || scopeSequence < 1
+      || ordered.filter(([, sequence]) => sequence === scopeSequence).length !== 1
+    ) return "invalid";
+    return { receiptId, scopeSequence };
+  }
+
+  private studioInboxFifoCurrentHead(
+    record: Record<string, unknown>,
+    member: string,
+    queueKey: string,
+    cursorKey: string,
+  ): boolean {
+    const scopeSequence = record.scopeSequence;
+    if (
+      record.receiptId !== member
+      || typeof scopeSequence !== "number"
+      || !Number.isSafeInteger(scopeSequence)
+      || scopeSequence < 1
+    ) return false;
+    let cursor: number;
+    try {
+      const raw = this.studioString(cursorKey);
+      if (raw === null) return false;
+      cursor = this.studioPositiveInteger(raw);
+    } catch {
+      return false;
+    }
+    const head = this.studioInboxFifoHead(queueKey);
+    return head !== null
+      && head !== "invalid"
+      && cursor === scopeSequence
+      && head.receiptId === member
+      && head.scopeSequence === scopeSequence;
+  }
+
+  private studioInboxFifoReadyRecord(
+    record: Record<string, unknown> | null,
+    receiptId: string,
+    scopeSequence: number,
+  ): record is Record<string, unknown> & { readonly receivedAtMs: number } {
+    return record !== null
+      && record.receiptId === receiptId
+      && record.scopeSequence === scopeSequence
+      && record.state === "received"
+      && typeof record.receivedAtMs === "number"
+      && Number.isSafeInteger(record.receivedAtMs)
+      && record.receivedAtMs >= 0;
+  }
+
+  /**
+   * A missing/corrupt/gapped successor stays unpromoted. Returning `2` is a
+   * deliberate integrity hold, not permission to skip it.
+   */
+  private studioPromoteInboxFifoNext(
+    queueKey: string,
+    readyKey: string,
+    nextSequence: number,
+    recordKeyPrefix: string,
+  ): 1 | 2 {
+    const head = this.studioInboxFifoHead(queueKey);
+    if (head === null) return 1;
+    if (head === "invalid" || head.scopeSequence !== nextSequence || !recordKeyPrefix) return 2;
+    const record = this.studioRecordFailClosed(`${recordKeyPrefix}${head.receiptId}`);
+    if (!this.studioInboxFifoReadyRecord(record, head.receiptId, nextSequence)) return 2;
+    this.getZSet(readyKey, true).value.set(head.receiptId, record.receivedAtMs);
+    return 1;
   }
 
   private studioCounter(key: string): number {

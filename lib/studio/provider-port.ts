@@ -8,6 +8,7 @@ import type {
   StudioProviderArtifactByteStream,
   StudioProviderArtifactMediaType,
 } from "./artifact-validation.js";
+import type { StudioProviderResultReference } from "./provider-result-reference.js";
 
 /**
  * The only provider boundary Air's durable executor may use. It has no
@@ -34,6 +35,32 @@ export interface StudioProviderObservationPort extends StudioProviderPort {
 }
 
 /**
+ * A status-only result poll. It is separate from materialization so a bounded
+ * worker can persist a private retrieval capability before it spends time on
+ * bytes or a downstream transport boundary.
+ */
+export interface StudioProviderResultPollingPort extends StudioProviderPort {
+  readonly resultPollingSupported: true;
+  pollResult(input: StudioProviderObservationInput): Promise<StudioProviderResultPollResult>;
+}
+
+/**
+ * The second half of a split provider result path. It accepts only a sealed
+ * reference produced by a verified status poll and never performs a provider
+ * status read or submission itself.
+ */
+export interface StudioProviderResultMaterializationPort extends StudioProviderPort {
+  readonly resultMaterializationSupported: true;
+  materializeResult(
+    input: StudioProviderResultMaterializationInput,
+  ): Promise<StudioProviderResultMaterializationResult>;
+}
+
+export type StudioProviderResultReferencePort =
+  & StudioProviderResultPollingPort
+  & StudioProviderResultMaterializationPort;
+
+/**
  * One result stream is consumed immediately by Air's bounded artifact
  * validator. It carries no URL, file name, provider identifier, or user
  * routing data, so none of those values can escape into a result outbox.
@@ -55,6 +82,16 @@ export interface StudioProviderObservationInput {
   readonly providerRequestId: string;
 }
 
+/** The durable store owns the reference's encrypted persistence, if any. */
+export interface StudioProviderResultMaterializationInput {
+  readonly job: Pick<
+    StudioJobRecord,
+    "jobId" | "mode" | "modelSlug" | "provider" | "outputCount" | "durationSeconds" | "reservedCents"
+  >;
+  readonly snapshot: StudioExecutionSnapshot;
+  readonly reference: StudioProviderResultReference;
+}
+
 /**
  * A result poll never authorizes another submission. Temporary recovery
  * failures remain retryable reads; malformed terminal results are fenced for
@@ -67,11 +104,42 @@ export type StudioProviderObservationResult =
   | { readonly kind: "retryable_failure" }
   | { readonly kind: "reconciliation_required" };
 
+/** A successful poll carries no bytes and exposes no provider URL. */
+export type StudioProviderResultPollResult =
+  | { readonly kind: "pending" }
+  | { readonly kind: "ready"; readonly reference: StudioProviderResultReference }
+  | { readonly kind: "definitive_failure" }
+  | { readonly kind: "retryable_failure" }
+  | { readonly kind: "reconciliation_required" };
+
+/** Materialization preserves the existing stream-only observation contract. */
+export type StudioProviderResultMaterializationResult = StudioProviderObservationResult;
+
 export function isStudioProviderObservationPort(
   provider: StudioProviderPort,
 ): provider is StudioProviderObservationPort {
   const candidate = provider as Partial<StudioProviderObservationPort>;
   return candidate.observationSupported === true && typeof candidate.observe === "function";
+}
+
+export function isStudioProviderResultPollingPort(
+  provider: StudioProviderPort,
+): provider is StudioProviderResultPollingPort {
+  const candidate = provider as Partial<StudioProviderResultPollingPort>;
+  return candidate.resultPollingSupported === true && typeof candidate.pollResult === "function";
+}
+
+export function isStudioProviderResultMaterializationPort(
+  provider: StudioProviderPort,
+): provider is StudioProviderResultMaterializationPort {
+  const candidate = provider as Partial<StudioProviderResultMaterializationPort>;
+  return candidate.resultMaterializationSupported === true && typeof candidate.materializeResult === "function";
+}
+
+export function isStudioProviderResultReferencePort(
+  provider: StudioProviderPort,
+): provider is StudioProviderResultReferencePort {
+  return isStudioProviderResultPollingPort(provider) && isStudioProviderResultMaterializationPort(provider);
 }
 
 /** User content is available only to the injected provider adapter at call time. */

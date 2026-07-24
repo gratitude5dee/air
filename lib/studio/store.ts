@@ -174,6 +174,39 @@ export interface StudioInboxRecord {
   readonly encryptedEnvelope?: EncryptedPayload | undefined;
 }
 
+/**
+ * The inbox queue moves forward exactly once.  `legacy` deliberately keeps
+ * the pre-FIFO global-ready behavior while a compatibility deployment is
+ * drained; `holding` durably accepts new receipts without claiming them; and
+ * `fifo` permits only the exact per-scope head to be claimed.
+ */
+export type StudioInboxFifoPhase = "legacy" | "holding" | "fifo";
+
+/** Secret-free migration view for the protected operator control plane. */
+export type StudioInboxFifoStatus =
+  | { readonly kind: "current"; readonly phase: StudioInboxFifoPhase; readonly holdingScopes: number }
+  | { readonly kind: "invalid" };
+
+export type StudioInboxFifoBeginResult =
+  | { readonly kind: "holding" }
+  | { readonly kind: "already_holding" }
+  | { readonly kind: "legacy_not_drained" }
+  | { readonly kind: "already_fifo" }
+  | { readonly kind: "invalid" };
+
+export type StudioInboxFifoPrepareResult =
+  | { readonly kind: "prepared"; readonly preparedScopes: number; readonly remainingScopes: number }
+  | { readonly kind: "blocked"; readonly preparedScopes: number }
+  | { readonly kind: "not_holding" }
+  | { readonly kind: "invalid" };
+
+export type StudioInboxFifoActivateResult =
+  | { readonly kind: "activated" }
+  | { readonly kind: "already_fifo" }
+  | { readonly kind: "holding_not_prepared" }
+  | { readonly kind: "not_holding" }
+  | { readonly kind: "invalid" };
+
 export interface StudioJobPayload {
   readonly prompt: string | null;
   readonly input?: StudioAttachmentReference | undefined;
@@ -755,6 +788,12 @@ interface PendingControl {
   readonly expiresAtMs?: number | undefined;
 }
 
+/** Non-secret global migration record; its absence is the legacy baseline. */
+interface InboxFifoMigrationRecord {
+  readonly schemaVersion: 1;
+  readonly phase: Exclude<StudioInboxFifoPhase, "legacy">;
+}
+
 /** Internal, secret-free arguments for the atomic canary admission scripts. */
 interface CanaryBudgetAdmission {
   readonly key: string;
@@ -787,6 +826,7 @@ export type AdmissionResult =
         | "canary_budget_required"
         | "canary_total_cap"
         | "canary_fal_cap"
+        | "inbox_fifo_required"
         | "release_blocked"
         | "storage_error";
     };
@@ -990,6 +1030,100 @@ export class StudioStore {
     });
   }
 
+  /**
+   * Returns only the durable inbox migration phase. It never reads an inbox
+   * record, scope identifier, prompt, media reference, or queue payload.
+   */
+  public async getInboxFifoMigrationStatus(): Promise<StudioInboxFifoStatus> {
+    const phase = parseInboxFifoPhase(await this.redis.get(this.inboxFifoMigrationKey()));
+    if (phase === "invalid") return Object.freeze({ kind: "invalid" });
+    const holdingScopes = phase === "holding"
+      ? await this.redis.zCard(this.inboxFifoHoldingScopesKey())
+      : 0;
+    return Object.freeze({ kind: "current", phase, holdingScopes });
+  }
+
+  /**
+   * Begins the one-way legacy -> holding -> fifo cutover. A nonempty legacy
+   * ready index is an explicit safety stop: old receipts are never guessed
+   * into the new queue or allowed to overtake a missing predecessor.
+   */
+  public async beginInboxFifoMigration(): Promise<StudioInboxFifoBeginResult> {
+    const result = await this.redis.eval(BEGIN_INBOX_FIFO_HOLDING_LUA, {
+      keys: [this.inboxFifoMigrationKey(), this.readyInboxKey(), this.inboxFifoHoldingScopesKey()],
+      arguments: [],
+    });
+    if (result === 1 || result === "1") return Object.freeze({ kind: "holding" });
+    if (result === 2 || result === "2") return Object.freeze({ kind: "already_holding" });
+    if (result === -1 || result === "-1") return Object.freeze({ kind: "legacy_not_drained" });
+    if (result === -2 || result === "-2") return Object.freeze({ kind: "already_fifo" });
+    return Object.freeze({ kind: "invalid" });
+  }
+
+  /**
+   * Publishes validated holding heads into the global scheduler in bounded
+   * batches. It intentionally never advances over a missing sequence; a
+   * malformed/missing head leaves the migration in holding for reconciliation.
+   */
+  public async prepareInboxFifoHoldingScopes(limit = 32): Promise<StudioInboxFifoPrepareResult> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error("inbox FIFO preparation limit is invalid");
+    }
+    const status = await this.getInboxFifoMigrationStatus();
+    if (status.kind === "invalid") return Object.freeze({ kind: "invalid" });
+    if (status.phase !== "holding") return Object.freeze({ kind: "not_holding" });
+
+    const scopeIds = await this.redis.zRangeByScore(
+      this.inboxFifoHoldingScopesKey(),
+      Number.NEGATIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+      { limit },
+    );
+    let preparedScopes = 0;
+    for (const scopeId of scopeIds) {
+      if (!isOpaqueStudioIdentifier(scopeId)) return Object.freeze({ kind: "blocked", preparedScopes });
+      const result = await this.redis.eval(PREPARE_INBOX_FIFO_HOLDING_SCOPE_LUA, {
+        keys: [
+          this.inboxFifoMigrationKey(),
+          this.inboxFifoHoldingScopesKey(),
+          this.inboxFifoScopeQueueKey(scopeId),
+          this.inboxFifoScopeCursorKey(scopeId),
+          this.readyInboxKey(),
+        ],
+        arguments: [scopeId, this.inboxKeyPrefix()],
+      });
+      if (result === 1 || result === "1") {
+        preparedScopes += 1;
+        continue;
+      }
+      // Another bounded operator invocation may have prepared this exact
+      // scope after this call selected it. The Lua primitive returns `2` only
+      // after proving that its validated head is already globally published.
+      if (result === 2 || result === "2") continue;
+      if (result === -1 || result === "-1") return Object.freeze({ kind: "blocked", preparedScopes });
+      if (result === -2 || result === "-2") return Object.freeze({ kind: "not_holding" });
+      return Object.freeze({ kind: "invalid" });
+    }
+    return Object.freeze({
+      kind: "prepared",
+      preparedScopes,
+      remainingScopes: await this.redis.zCard(this.inboxFifoHoldingScopesKey()),
+    });
+  }
+
+  /** Promotes a fully prepared holding set to FIFO; this transition is one-way. */
+  public async activateInboxFifoMigration(): Promise<StudioInboxFifoActivateResult> {
+    const result = await this.redis.eval(ACTIVATE_INBOX_FIFO_LUA, {
+      keys: [this.inboxFifoMigrationKey(), this.inboxFifoHoldingScopesKey()],
+      arguments: [],
+    });
+    if (result === 1 || result === "1") return Object.freeze({ kind: "activated" });
+    if (result === 2 || result === "2") return Object.freeze({ kind: "already_fifo" });
+    if (result === -1 || result === "-1") return Object.freeze({ kind: "holding_not_prepared" });
+    if (result === -2 || result === "-2") return Object.freeze({ kind: "not_holding" });
+    return Object.freeze({ kind: "invalid" });
+  }
+
   public async persistInbox(input: {
     readonly receiptId: string;
     readonly senderHash: SenderHash;
@@ -1015,11 +1149,30 @@ export class StudioStore {
     });
     const record = Object.freeze({ ...metadata, encryptedEnvelope });
     const key = this.inboxKey(input.receiptId);
+    const fifoScopeId = this.inboxFifoScopeId(input.senderHash, input.threadHash);
     // Receipt + ready index must commit together. A separate SET followed by
     // ZADD could acknowledge a webhook and strand work after a crash.
     const result = await this.redis.eval(PERSIST_INBOX_LUA, {
-      keys: [key, this.inboxEnvelopeKey(input.receiptId), this.readyInboxKey(), this.inboxScopeSequenceKey(input.senderHash, input.threadHash)],
-      arguments: [JSON.stringify(metadata), JSON.stringify(encryptedEnvelope), String(INBOX_ENVELOPE_TTL_SECONDS), String(now), input.receiptId],
+      keys: [
+        key,
+        this.inboxEnvelopeKey(input.receiptId),
+        this.readyInboxKey(),
+        // This is the existing latest-ingress fence used by pending-media
+        // guards. FIFO progress deliberately uses the separate cursor below.
+        this.inboxScopeSequenceKey(input.senderHash, input.threadHash),
+        this.inboxFifoMigrationKey(),
+        this.inboxFifoScopeQueueKey(fifoScopeId),
+        this.inboxFifoScopeCursorKey(fifoScopeId),
+        this.inboxFifoHoldingScopesKey(),
+      ],
+      arguments: [
+        JSON.stringify(metadata),
+        JSON.stringify(encryptedEnvelope),
+        String(INBOX_ENVELOPE_TTL_SECONDS),
+        String(now),
+        input.receiptId,
+        fifoScopeId,
+      ],
     });
     const persisted = parseStored<StudioInboxRecord>(typeof result === "string" ? result : null);
     if (persisted && persisted.receiptId === input.receiptId && isPositiveSafeInteger(persisted.scopeSequence)) {
@@ -1045,11 +1198,50 @@ export class StudioStore {
 
   /** Claiming a receipt is fenced by a short Redis lease and never replays an already processed receipt. */
   public async claimNextInbox(): Promise<{ readonly record: StudioInboxRecord; readonly leaseToken: string } | null> {
+    const migration = await this.getInboxFifoMigrationStatus();
+    if (migration.kind === "invalid") throw new Error("inbox FIFO migration state is invalid");
+    // New receipts continue to commit in holding, but no worker may run them
+    // until every scope head has been audited and prepared atomically.
+    if (migration.phase === "holding") return null;
     const due = await this.redis.zRangeByScore(this.readyInboxKey(), Number.NEGATIVE_INFINITY, this.now(), { limit: 50 });
     for (const receiptId of due) {
       const token = randomBytes(16).toString("base64url");
-      const claimed = await this.claimInbox(receiptId, token);
+      const beforeClaim = await this.readInbox(receiptId);
+      if (!beforeClaim) {
+        // Legacy behavior may clean an orphaned global member. Once FIFO is
+        // active an orphan could be an unknown predecessor, so halt rather
+        // than letting another same-scope receipt pass it.
+        if (migration.phase === "fifo") return null;
+        await this.redis.zRem(this.readyInboxKey(), receiptId);
+        continue;
+      }
+      const validFifoIdentity = isOpaqueStudioIdentifier(beforeClaim.senderHash)
+        && isOpaqueStudioIdentifier(beforeClaim.threadHash);
+      if (!validFifoIdentity) {
+        // A nonterminal receipt without a trustworthy scope cannot be safely
+        // assigned order or terminalized. Leaving it indexed is an explicit
+        // legacy cutover stop; removing it would make `begin` mistake a
+        // stranded encrypted receipt for a drained scheduler.
+        if (migration.phase === "fifo") return null;
+        if (beforeClaim.state !== "received" && beforeClaim.state !== "claimed") {
+          await this.redis.zRem(this.readyInboxKey(), receiptId);
+          continue;
+        }
+        return null;
+      }
+      // Older deployed receipts can have a valid opaque scope but no durable
+      // sequence. Legacy mode must still lease them so the engine can
+      // terminalize them as maintenance-rejected; FIFO mode never guesses an
+      // order for such a record.
+      if (!isPositiveSafeInteger(beforeClaim.scopeSequence) && migration.phase === "fifo") return null;
+      const claimed = await this.claimInbox(receiptId, token, beforeClaim);
       if (claimed) return Object.freeze({ record: claimed, leaseToken: token });
+
+      // The FIFO claim script has already checked the head/cursor/migration
+      // relationship. A failed claim can be a live head lease, a migration
+      // race, or integrity trouble; none is safe to bypass by inspecting a
+      // later global member.
+      if (migration.phase === "fifo") return null;
 
       // Keep an in-flight claimed receipt indexed until its lease expires so a
       // crashed worker can be recovered. Only terminal/corrupt records are
@@ -1063,11 +1255,24 @@ export class StudioStore {
   }
 
   public async finishInbox(receiptId: string, leaseToken: string, state: "processed" | "maintenance_rejected" | "failed"): Promise<boolean> {
+    const record = await this.readInbox(receiptId);
+    if (!record || !isOpaqueStudioIdentifier(record.senderHash) || !isOpaqueStudioIdentifier(record.threadHash)) return false;
+    const fifoScopeId = this.inboxFifoScopeId(record.senderHash, record.threadHash);
     const result = await this.redis.eval(FINISH_INBOX_LUA, {
-      keys: [this.inboxKey(receiptId), this.inboxEnvelopeKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
-      arguments: [leaseToken, state, String(this.now()), String(INBOX_TTL_SECONDS), receiptId],
+      keys: [
+        this.inboxKey(receiptId),
+        this.inboxEnvelopeKey(receiptId),
+        this.inboxLeaseKey(receiptId),
+        this.readyInboxKey(),
+        this.inboxFifoMigrationKey(),
+        this.inboxFifoScopeQueueKey(fifoScopeId),
+        this.inboxFifoScopeCursorKey(fifoScopeId),
+      ],
+      arguments: [leaseToken, state, String(this.now()), String(INBOX_TTL_SECONDS), receiptId, this.inboxKeyPrefix()],
     });
-    return result === 1 || result === "1";
+    // `2` means the just-finished record was safely terminalized but a later
+    // same-scope receipt was deliberately held behind an integrity gap.
+    return result === 1 || result === "1" || result === 2 || result === "2";
   }
 
   /**
@@ -1079,9 +1284,20 @@ export class StudioStore {
     if (!Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0 || retryAfterMs > MAX_INBOX_RETRY_DELAY_MS) {
       throw new Error("inbox retry delay is invalid");
     }
+    const record = await this.readInbox(receiptId);
+    if (!record || !isOpaqueStudioIdentifier(record.senderHash) || !isOpaqueStudioIdentifier(record.threadHash)) return false;
+    const fifoScopeId = this.inboxFifoScopeId(record.senderHash, record.threadHash);
     const result = await this.redis.eval(RETRY_INBOX_LUA, {
-      keys: [this.inboxKey(receiptId), this.inboxEnvelopeKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
-      arguments: [leaseToken, String(this.now()), String(retryAfterMs), String(INBOX_TTL_SECONDS), receiptId],
+      keys: [
+        this.inboxKey(receiptId),
+        this.inboxEnvelopeKey(receiptId),
+        this.inboxLeaseKey(receiptId),
+        this.readyInboxKey(),
+        this.inboxFifoMigrationKey(),
+        this.inboxFifoScopeQueueKey(fifoScopeId),
+        this.inboxFifoScopeCursorKey(fifoScopeId),
+      ],
+      arguments: [leaseToken, String(this.now()), String(retryAfterMs), String(INBOX_TTL_SECONDS), receiptId, this.inboxKeyPrefix()],
     });
     return result === 1 || result === "1";
   }
@@ -1519,6 +1735,7 @@ export class StudioStore {
         tapback === undefined ? this.unusedInitialAdmissionOutboxLaneKey() : this.outboxLaneKey(tapback),
         canaryBudget.key,
         this.recentJobKey(job.senderHash),
+        this.inboxFifoMigrationKey(),
       ],
       arguments: [
         job.jobId,
@@ -1572,6 +1789,7 @@ export class StudioStore {
       || code === "canary_budget_required"
       || code === "canary_total_cap"
       || code === "canary_fal_cap"
+      || code === "inbox_fifo_required"
       || code === "release_blocked"
     ) {
       return Object.freeze({ admitted: false, reason: code });
@@ -3336,10 +3554,23 @@ export class StudioStore {
     return result === 1 || result === "1";
   }
 
-  private async claimInbox(receiptId: string, leaseToken: string): Promise<StudioInboxRecord | null> {
+  private async claimInbox(
+    receiptId: string,
+    leaseToken: string,
+    record: Pick<StudioInboxRecord, "senderHash" | "threadHash">,
+  ): Promise<StudioInboxRecord | null> {
     const now = this.now();
+    const fifoScopeId = this.inboxFifoScopeId(record.senderHash, record.threadHash);
     const result = await this.redis.eval(CLAIM_INBOX_LUA, {
-      keys: [this.inboxKey(receiptId), this.inboxEnvelopeKey(receiptId), this.inboxLeaseKey(receiptId), this.readyInboxKey()],
+      keys: [
+        this.inboxKey(receiptId),
+        this.inboxEnvelopeKey(receiptId),
+        this.inboxLeaseKey(receiptId),
+        this.readyInboxKey(),
+        this.inboxFifoMigrationKey(),
+        this.inboxFifoScopeQueueKey(fifoScopeId),
+        this.inboxFifoScopeCursorKey(fifoScopeId),
+      ],
       arguments: [leaseToken, String(LEASE_TTL_MS), String(now), receiptId],
     });
     return parseStored<StudioInboxRecord>(typeof result === "string" ? result : null);
@@ -3393,12 +3624,25 @@ export class StudioStore {
   }
 
   private inboxKey(receiptId: string): string { return `${this.prefix}:inbox:${receiptId}`; }
+  private inboxKeyPrefix(): string { return `${this.prefix}:inbox:`; }
   private inboxEnvelopeKey(receiptId: string): string { return `${this.prefix}:inbox:envelope:${receiptId}`; }
   private readyInboxKey(): string { return `${this.prefix}:inbox:ready`; }
   private inboxLeaseKey(receiptId: string): string { return `${this.prefix}:inbox:lease:${receiptId}`; }
   private inboxScopeSequenceKey(senderHash: SenderHash, threadHash: ThreadHash): string {
     return `${this.prefix}:inbox:scope-sequence:${senderHash}:${threadHash}`;
   }
+  /**
+   * A separate opaque scope namespace avoids turning the existing ingress
+   * sequence fence into processing progress. The original counter remains the
+   * authority for pending-media/guard revocation.
+   */
+  private inboxFifoScopeId(senderHash: SenderHash, threadHash: ThreadHash): string {
+    return deriveOpaqueId(this.secret, "studio-inbox-fifo-scope", `${senderHash}\u0000${threadHash}`);
+  }
+  private inboxFifoMigrationKey(): string { return `${this.prefix}:inbox:fifo:migration`; }
+  private inboxFifoHoldingScopesKey(): string { return `${this.prefix}:inbox:fifo:holding-scopes`; }
+  private inboxFifoScopeQueueKey(scopeId: string): string { return `${this.prefix}:inbox:fifo:queue:${scopeId}`; }
+  private inboxFifoScopeCursorKey(scopeId: string): string { return `${this.prefix}:inbox:fifo:cursor:${scopeId}`; }
   private cronHeartbeatKey(scope: StudioCronHeartbeatScope): string {
     return `${this.prefix}:operations:cron-heartbeat:${scope}`;
   }
@@ -3841,7 +4085,7 @@ const ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_LUA = `
 --       encrypted job payload, durable job-ready index, release fence,
 --       outbox-ready index, acknowledgement metadata/payload/lane,
 --       optional tapback metadata/payload/lane, opaque canary budget,
---       sender recent-job pointer
+--       sender recent-job pointer, inbox FIFO migration marker
 -- ARGV: job id, metadata, payload, daily ttl, job payload ttl, user limit,
 --       daily spend cap, reserved cents, now, release generation/phase,
 --       per-job cap, acknowledgement metadata/payload/id/sequence/due,
@@ -3913,6 +4157,17 @@ end
 
 local function positiveInteger(value)
   return nonnegativeInteger(value) and value >= 1
+end
+
+-- An active release may create a billable job only after the one-way inbox
+-- ordering migration has reached FIFO. Missing, malformed, legacy, and
+-- holding markers are all a no-spend stop rather than a best-effort state.
+local function inboxFifoActive()
+  local raw = redis.call('GET', KEYS[17])
+  if not raw then return false end
+  local ok, marker = pcall(cjson.decode, raw)
+  return ok and type(marker) == 'table'
+    and marker.schemaVersion == 1 and marker.phase == 'fifo'
 end
 
 local jobId = ARGV[1]
@@ -4011,6 +4266,7 @@ if not isStringOrMissing(KEYS[1]) or not isStringOrMissing(KEYS[2])
   or not isStringOrMissing(KEYS[10]) or not isZsetOrMissing(KEYS[11])
   or (ARGV[11] == 'canary' and not isStringOrMissing(KEYS[15]))
   or not isStringOrMissing(KEYS[16])
+  or not isStringOrMissing(KEYS[17])
   or (hasTapback and (
     not isStringOrMissing(KEYS[12]) or not isStringOrMissing(KEYS[13]) or not isZsetOrMissing(KEYS[14])
   )) then return {'storage_error'} end
@@ -4023,6 +4279,9 @@ if fenceRaw then
     or fence.generation ~= releaseGeneration or fence.phase ~= ARGV[11] then return {'release_blocked'} end
 elseif ARGV[11] ~= 'dark' then
   return {'release_blocked'}
+end
+if ARGV[11] ~= 'dark' and not inboxFifoActive() then
+  return {'inbox_fifo_required'}
 end
 -- A known release revocation wins over a cost response: this stale worker
 -- must not publish any user-visible effect while a rollback is in force.
@@ -4138,81 +4397,403 @@ if canaryBudget then redis.call('SET', KEYS[15], cjson.encode(canaryBudget)) end
 return {'admitted'}
 `;
 
+// Kept as source text and injected into every inbox FIFO Lua primitive so the
+// production scripts fail closed exactly like MemoryRedis. In particular, a
+// tied ZSET score, unsafe integer, or malformed receipt member can never be
+// selected by Redis's lexical tie-break and treated as a valid predecessor.
+const INBOX_FIFO_LUA_VALIDATED_HEAD_HELPER = `
+local function fifoSafePositiveInteger(value)
+  if type(value) ~= 'string' or not string.match(value, '^[1-9][0-9]*$') then return false end
+  local length = string.len(value)
+  return length < 16 or (length == 16 and value <= '9007199254740991')
+end
+
+local function fifoSafeSequence(value)
+  return type(value) == 'number'
+    and value >= 1 and value <= 9007199254740991
+    and value == math.floor(value)
+end
+
+-- Returns the sole valid head at one exact durable sequence, or false. A
+-- duplicate score is never resolved by Redis member ordering.
+local function fifoValidatedQueueHead(queueKey, expectedSequence, expectedReceipt)
+  if not fifoSafeSequence(expectedSequence) then return false end
+  local head = redis.call('ZRANGE', queueKey, 0, 0, 'WITHSCORES')
+  if #head ~= 2
+    or not string.match(head[1], '^[a-f0-9]+$') or string.len(head[1]) ~= 64 then return false end
+  local score = tonumber(head[2])
+  if not fifoSafeSequence(score) or score ~= expectedSequence then return false end
+  local exact = redis.call('ZRANGEBYSCORE', queueKey, expectedSequence, expectedSequence, 'LIMIT', 0, 2)
+  if #exact ~= 1 or exact[1] ~= head[1] then return false end
+  if expectedReceipt and head[1] ~= expectedReceipt then return false end
+  return head[1]
+end
+`;
+
 const PERSIST_INBOX_LUA = `
--- AIR_STUDIO_PERSIST_INBOX_V4
--- The scope counter deliberately has no expiry: it is a compact opaque
--- fencing record and must outlive any recoverable inbox receipt.
+-- AIR_STUDIO_PERSIST_INBOX_V5
+-- KEYS: metadata, encrypted envelope, global ready, latest-ingress sequence,
+--       FIFO migration, per-scope FIFO queue, per-scope FIFO cursor,
+--       holding-scope index.
+-- ARGV: metadata, envelope, envelope ttl, received-at, receipt id, scope id.
+-- The existing latest-ingress counter remains the pending-media fence. FIFO
+-- progress has a distinct cursor so a later received bubble may revoke an
+-- older correction without permitting that later bubble to process first.
+local function fifoPhase()
+  local raw = redis.call('GET', KEYS[5])
+  if not raw then return 'legacy' end
+  local ok, value = pcall(cjson.decode, raw)
+  if not ok or type(value) ~= 'table' or value.schemaVersion ~= 1
+    or (value.phase ~= 'holding' and value.phase ~= 'fifo') then return nil end
+  return value.phase
+end
+${INBOX_FIFO_LUA_VALIDATED_HEAD_HELPER}
+local function nonnegativeInteger(value)
+  return value == '0' or fifoSafePositiveInteger(value)
+end
+local function typeOrMissing(key, expected)
+  local actual = redis.call('TYPE', key).ok
+  return actual == 'none' or actual == expected
+end
+
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
-local record = cjson.decode(ARGV[1])
+local phase = fifoPhase()
+if not phase
+  or not fifoSafePositiveInteger(ARGV[3])
+  or not nonnegativeInteger(ARGV[4])
+  or not ARGV[5] or ARGV[5] == ''
+  or not ARGV[6] or not string.match(ARGV[6], '^[a-f0-9]+$') or string.len(ARGV[6]) ~= 64
+  or not typeOrMissing(KEYS[1], 'string')
+  or not typeOrMissing(KEYS[2], 'string')
+  or not typeOrMissing(KEYS[3], 'zset')
+  or not typeOrMissing(KEYS[4], 'string')
+  or not typeOrMissing(KEYS[5], 'string') then return -2 end
+local decoded, record = pcall(cjson.decode, ARGV[1])
+if not decoded or type(record) ~= 'table' then return -2 end
+local counter = redis.call('GET', KEYS[4])
+if counter and not nonnegativeInteger(counter) then return -2 end
+local nextSequence = (counter and tonumber(counter) or 0) + 1
+if not fifoSafeSequence(nextSequence) then return -2 end
+
+local cursor = nil
+if phase ~= 'legacy' then
+  if not typeOrMissing(KEYS[6], 'zset')
+    or not typeOrMissing(KEYS[7], 'string')
+    or not typeOrMissing(KEYS[8], 'zset') then return -2 end
+  local cursorRaw = redis.call('GET', KEYS[7])
+  if cursorRaw then
+    if not fifoSafePositiveInteger(cursorRaw) then return -2 end
+    cursor = tonumber(cursorRaw)
+    if cursor > nextSequence then return -2 end
+  else
+    cursor = nextSequence
+  end
+  -- A counter rollback or corrupted queue must not create a second record at
+  -- one receipt sequence and rely on Redis's lexical member tie-break.
+  if #redis.call('ZRANGEBYSCORE', KEYS[6], nextSequence, nextSequence, 'LIMIT', 0, 1) ~= 0 then return -2 end
+end
+
+local allocated = redis.call('INCR', KEYS[4])
+if allocated ~= nextSequence then return -2 end
 record.encryptedEnvelope = nil
-record.scopeSequence = redis.call('INCR', KEYS[4])
--- A nonterminal receipt must remain recoverable until it is explicitly
--- terminalized. Its encrypted envelope is kept separately with a hard,
--- immutable 24-hour lifetime because it can contain media references.
+record.scopeSequence = allocated
 redis.call('SET', KEYS[1], cjson.encode(record))
 redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
-redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+if phase == 'legacy' then
+  redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+  return cjson.encode(record)
+end
+
+if not redis.call('GET', KEYS[7]) then redis.call('SET', KEYS[7], tostring(cursor)) end
+redis.call('ZADD', KEYS[6], allocated, ARGV[5])
+if phase == 'holding' then
+  redis.call('ZADD', KEYS[8], 0, ARGV[6])
+elseif cursor == allocated then
+  -- Only the durable per-scope head is globally schedulable.
+  redis.call('ZADD', KEYS[3], ARGV[4], ARGV[5])
+end
 return cjson.encode(record)
 `;
 
 const CLAIM_INBOX_LUA = `
--- AIR_STUDIO_CLAIM_INBOX_V3
+-- AIR_STUDIO_CLAIM_INBOX_V4
+-- KEYS: metadata, envelope, lease, global ready, FIFO migration, scope queue,
+--       scope cursor. ARGV: lease token, lease ttl, now, receipt id.
+local function fifoPhase()
+  local raw = redis.call('GET', KEYS[5])
+  if not raw then return 'legacy' end
+  local ok, value = pcall(cjson.decode, raw)
+  if not ok or type(value) ~= 'table' or value.schemaVersion ~= 1
+    or (value.phase ~= 'holding' and value.phase ~= 'fifo') then return nil end
+  return value.phase
+end
+${INBOX_FIFO_LUA_VALIDATED_HEAD_HELPER}
+local function validRecord(record)
+  return type(record) == 'table'
+    and record.receiptId == ARGV[4]
+    and type(record.scopeSequence) == 'number'
+    and record.scopeSequence >= 1
+    and record.scopeSequence <= 9007199254740991
+    and record.scopeSequence == math.floor(record.scopeSequence)
+end
+
+local phase = fifoPhase()
+if not phase or phase == 'holding' then return false end
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
-local record = cjson.decode(raw)
+local decoded, record = pcall(cjson.decode, raw)
+if not decoded or type(record) ~= 'table' then return false end
 if record.state ~= 'received' and record.state ~= 'claimed' then return false end
+
+if phase == 'fifo' then
+  if not validRecord(record) then return false end
+  local cursorRaw = redis.call('GET', KEYS[7])
+  if not fifoSafePositiveInteger(cursorRaw) or tonumber(cursorRaw) ~= record.scopeSequence then return false end
+  if not fifoValidatedQueueHead(KEYS[6], record.scopeSequence, ARGV[4]) then return false end
+  local dueAt = redis.call('ZSCORE', KEYS[4], ARGV[4])
+  if not dueAt or tonumber(dueAt) > tonumber(ARGV[3]) then return false end
+end
+
 if redis.call('SET', KEYS[3], ARGV[1], 'NX', 'PX', ARGV[2]) ~= 'OK' then return false end
 record.state = 'claimed'
 record.stateVersion = record.stateVersion + 1
 redis.call('SET', KEYS[1], cjson.encode(record))
 redis.call('ZADD', KEYS[4], tonumber(ARGV[3]) + tonumber(ARGV[2]), ARGV[4])
 local envelope = redis.call('GET', KEYS[2])
-if envelope then record.encryptedEnvelope = cjson.decode(envelope) end
+if envelope then
+  local envelopeDecoded, value = pcall(cjson.decode, envelope)
+  if envelopeDecoded then record.encryptedEnvelope = value end
+end
 return cjson.encode(record)
 `;
 
 const FINISH_INBOX_LUA = `
--- AIR_STUDIO_FINISH_INBOX_V3
+-- AIR_STUDIO_FINISH_INBOX_V4
+-- KEYS: metadata, envelope, lease, global ready, FIFO migration, scope queue,
+--       scope cursor. ARGV: lease, terminal state, now, metadata ttl, receipt,
+--       inbox metadata-key prefix.
+local function fifoPhase()
+  local raw = redis.call('GET', KEYS[5])
+  if not raw then return 'legacy' end
+  local ok, value = pcall(cjson.decode, raw)
+  if not ok or type(value) ~= 'table' or value.schemaVersion ~= 1
+    or (value.phase ~= 'holding' and value.phase ~= 'fifo') then return nil end
+  return value.phase
+end
+${INBOX_FIFO_LUA_VALIDATED_HEAD_HELPER}
+local function validCurrent(record)
+  return type(record) == 'table'
+    and record.receiptId == ARGV[5]
+    and type(record.scopeSequence) == 'number'
+    and record.scopeSequence >= 1
+    and record.scopeSequence <= 9007199254740991
+    and record.scopeSequence == math.floor(record.scopeSequence)
+end
+local function promoteExactNext(nextSequence)
+  local first = redis.call('ZRANGE', KEYS[6], 0, 0)
+  if #first == 0 then return 1 end
+  local nextReceipt = fifoValidatedQueueHead(KEYS[6], nextSequence, nil)
+  if not nextReceipt then return 2 end
+  local nextRaw = redis.call('GET', ARGV[6] .. nextReceipt)
+  if not nextRaw then return 2 end
+  local decoded, nextRecord = pcall(cjson.decode, nextRaw)
+  if not decoded or type(nextRecord) ~= 'table'
+    or nextRecord.receiptId ~= nextReceipt
+    or nextRecord.scopeSequence ~= nextSequence
+    or nextRecord.state ~= 'received'
+    or type(nextRecord.receivedAtMs) ~= 'number'
+    or nextRecord.receivedAtMs < 0 or nextRecord.receivedAtMs > 9007199254740991
+    or nextRecord.receivedAtMs ~= math.floor(nextRecord.receivedAtMs) then return 2 end
+  redis.call('ZADD', KEYS[4], nextRecord.receivedAtMs, nextReceipt)
+  return 1
+end
+
+if ARGV[2] ~= 'processed' and ARGV[2] ~= 'maintenance_rejected' and ARGV[2] ~= 'failed' then return 0 end
+local phase = fifoPhase()
+if not phase or phase == 'holding' then return 0 end
 if redis.call('GET', KEYS[3]) ~= ARGV[1] then return 0 end
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
-local record = cjson.decode(raw)
-if record.state ~= 'claimed' then return 0 end
-if ARGV[2] ~= 'processed' and ARGV[2] ~= 'maintenance_rejected' and ARGV[2] ~= 'failed' then return 0 end
+local decoded, record = pcall(cjson.decode, raw)
+if not decoded or record.state ~= 'claimed' then return 0 end
+
+if phase == 'fifo' then
+  if not validCurrent(record) then return 0 end
+  local cursorRaw = redis.call('GET', KEYS[7])
+  if not fifoSafePositiveInteger(cursorRaw) or tonumber(cursorRaw) ~= record.scopeSequence then return 0 end
+  if not fifoValidatedQueueHead(KEYS[6], record.scopeSequence, ARGV[5]) then return 0 end
+end
+
 record.state = ARGV[2]
 record.stateVersion = record.stateVersion + 1
--- Terminal receipt metadata is enough for idempotency and audit. Do not keep
--- prompts, attachment GUIDs, or raw thread identifiers after processing.
 record.encryptedEnvelope = nil
 redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
 redis.call('DEL', KEYS[2])
 redis.call('ZREM', KEYS[4], ARGV[5])
 redis.call('DEL', KEYS[3])
-return 1
+if phase == 'legacy' then return 1 end
+
+redis.call('ZREM', KEYS[6], ARGV[5])
+local nextSequence = record.scopeSequence + 1
+redis.call('SET', KEYS[7], tostring(nextSequence))
+return promoteExactNext(nextSequence)
 `;
 
 const RETRY_INBOX_LUA = `
--- AIR_STUDIO_RETRY_INBOX_V3
+-- AIR_STUDIO_RETRY_INBOX_V4
+-- KEYS and ARGV match FINISH except ARGV[2] is now and ARGV[3] retry delay.
+local function fifoPhase()
+  local raw = redis.call('GET', KEYS[5])
+  if not raw then return 'legacy' end
+  local ok, value = pcall(cjson.decode, raw)
+  if not ok or type(value) ~= 'table' or value.schemaVersion ~= 1
+    or (value.phase ~= 'holding' and value.phase ~= 'fifo') then return nil end
+  return value.phase
+end
+${INBOX_FIFO_LUA_VALIDATED_HEAD_HELPER}
+local function validCurrent(record)
+  return type(record) == 'table'
+    and record.receiptId == ARGV[5]
+    and type(record.scopeSequence) == 'number'
+    and record.scopeSequence >= 1
+    and record.scopeSequence <= 9007199254740991
+    and record.scopeSequence == math.floor(record.scopeSequence)
+end
+local function promoteExactNext(nextSequence)
+  local first = redis.call('ZRANGE', KEYS[6], 0, 0)
+  if #first == 0 then return 2 end
+  local nextReceipt = fifoValidatedQueueHead(KEYS[6], nextSequence, nil)
+  if not nextReceipt then return 3 end
+  local nextRaw = redis.call('GET', ARGV[6] .. nextReceipt)
+  if not nextRaw then return 3 end
+  local decoded, nextRecord = pcall(cjson.decode, nextRaw)
+  if not decoded or type(nextRecord) ~= 'table'
+    or nextRecord.receiptId ~= nextReceipt
+    or nextRecord.scopeSequence ~= nextSequence
+    or nextRecord.state ~= 'received'
+    or type(nextRecord.receivedAtMs) ~= 'number'
+    or nextRecord.receivedAtMs < 0 or nextRecord.receivedAtMs > 9007199254740991
+    or nextRecord.receivedAtMs ~= math.floor(nextRecord.receivedAtMs) then return 3 end
+  redis.call('ZADD', KEYS[4], nextRecord.receivedAtMs, nextReceipt)
+  return 2
+end
+
+local phase = fifoPhase()
+if not phase or phase == 'holding' then return 0 end
 if redis.call('GET', KEYS[3]) ~= ARGV[1] then return 0 end
 local raw = redis.call('GET', KEYS[1])
 if not raw then return 0 end
-local record = cjson.decode(raw)
-if record.state ~= 'claimed' then return 0 end
--- Privacy wins once the immutable encrypted envelope lifetime is over. The
--- opaque receipt remains terminal for seven days rather than looping forever.
+local decoded, record = pcall(cjson.decode, raw)
+if not decoded or record.state ~= 'claimed' then return 0 end
+if phase == 'fifo' then
+  if not validCurrent(record) then return 0 end
+  local cursorRaw = redis.call('GET', KEYS[7])
+  if not fifoSafePositiveInteger(cursorRaw) or tonumber(cursorRaw) ~= record.scopeSequence then return 0 end
+  if not fifoValidatedQueueHead(KEYS[6], record.scopeSequence, ARGV[5]) then return 0 end
+end
+
+-- Privacy wins once the immutable encrypted envelope lifetime is over.
 if redis.call('EXISTS', KEYS[2]) ~= 1 then
   record.state = 'failed'
   record.stateVersion = record.stateVersion + 1
+  record.encryptedEnvelope = nil
   redis.call('SET', KEYS[1], cjson.encode(record), 'EX', ARGV[4])
   redis.call('ZREM', KEYS[4], ARGV[5])
   redis.call('DEL', KEYS[3])
-  return 2
+  if phase == 'legacy' then return 2 end
+  redis.call('ZREM', KEYS[6], ARGV[5])
+  local nextSequence = record.scopeSequence + 1
+  redis.call('SET', KEYS[7], tostring(nextSequence))
+  return promoteExactNext(nextSequence)
 end
 record.state = 'received'
 record.stateVersion = record.stateVersion + 1
 redis.call('SET', KEYS[1], cjson.encode(record))
 redis.call('ZADD', KEYS[4], tonumber(ARGV[2]) + tonumber(ARGV[3]), ARGV[5])
 redis.call('DEL', KEYS[3])
+return 1
+`;
+
+const BEGIN_INBOX_FIFO_HOLDING_LUA = `
+-- AIR_STUDIO_BEGIN_INBOX_FIFO_HOLDING_V1
+-- KEYS: migration record, legacy/global ready index, holding-scope index.
+local raw = redis.call('GET', KEYS[1])
+if raw then
+  local decoded, value = pcall(cjson.decode, raw)
+  if not decoded or type(value) ~= 'table' or value.schemaVersion ~= 1
+    or (value.phase ~= 'holding' and value.phase ~= 'fifo') then return -3 end
+  if value.phase == 'holding' then return 2 end
+  return -2
+end
+-- Do not infer an old scope queue from metadata that may have expired. A
+-- claimed V4 receipt remains in global ready, so this proves no legacy owner
+-- can cross the cutover boundary.
+if redis.call('ZCARD', KEYS[2]) ~= 0 then return -1 end
+if redis.call('ZCARD', KEYS[3]) ~= 0 then return -3 end
+redis.call('SET', KEYS[1], cjson.encode({ schemaVersion = 1, phase = 'holding' }))
+return 1
+`;
+
+const PREPARE_INBOX_FIFO_HOLDING_SCOPE_LUA = `
+-- AIR_STUDIO_PREPARE_INBOX_FIFO_HOLDING_SCOPE_V1
+-- KEYS: migration, holding scopes, scope queue, scope cursor, global ready.
+-- ARGV: scope id, inbox metadata-key prefix.
+${INBOX_FIFO_LUA_VALIDATED_HEAD_HELPER}
+local raw = redis.call('GET', KEYS[1])
+if not raw then return -2 end
+local decoded, migration = pcall(cjson.decode, raw)
+if not decoded or type(migration) ~= 'table' or migration.schemaVersion ~= 1
+  or migration.phase ~= 'holding' then return -2 end
+if not ARGV[1] or not string.match(ARGV[1], '^[a-f0-9]+$') or string.len(ARGV[1]) ~= 64
+  or not ARGV[2] or ARGV[2] == '' then return -1 end
+local cursorRaw = redis.call('GET', KEYS[4])
+if not fifoSafePositiveInteger(cursorRaw) then return -1 end
+local cursor = tonumber(cursorRaw)
+-- An empty scope while holding means a record vanished after acceptance. It
+-- is intentionally not cleaned up or skipped.
+local headReceipt = fifoValidatedQueueHead(KEYS[3], cursor, nil)
+if not headReceipt then return -1 end
+local nextRaw = redis.call('GET', ARGV[2] .. headReceipt)
+if not nextRaw then return -1 end
+local ok, record = pcall(cjson.decode, nextRaw)
+if not ok or type(record) ~= 'table'
+  or record.receiptId ~= headReceipt
+  or record.scopeSequence ~= cursor
+  or record.state ~= 'received'
+  or type(record.receivedAtMs) ~= 'number'
+  or record.receivedAtMs < 0 or record.receivedAtMs > 9007199254740991
+  or record.receivedAtMs ~= math.floor(record.receivedAtMs) then return -1 end
+local held = redis.call('ZSCORE', KEYS[2], ARGV[1])
+local published = redis.call('ZSCORE', KEYS[5], headReceipt)
+-- A second operator can observe the scope after the first one atomically
+-- published it. Treat that as idempotent only after proving the exact valid
+-- head is already present at its immutable receipt-time score. Anything else
+-- is an integrity failure, not a reason to infer or overwrite queue state.
+if not held then
+  if published and tonumber(published) == record.receivedAtMs then return 2 end
+  return -1
+end
+if published then
+  if tonumber(published) ~= record.receivedAtMs then return -1 end
+  redis.call('ZREM', KEYS[2], ARGV[1])
+  return 2
+end
+redis.call('ZADD', KEYS[5], record.receivedAtMs, headReceipt)
+redis.call('ZREM', KEYS[2], ARGV[1])
+return 1
+`;
+
+const ACTIVATE_INBOX_FIFO_LUA = `
+-- AIR_STUDIO_ACTIVATE_INBOX_FIFO_V1
+-- KEYS: migration record, holding-scope index.
+local raw = redis.call('GET', KEYS[1])
+if not raw then return -2 end
+local decoded, migration = pcall(cjson.decode, raw)
+if not decoded or type(migration) ~= 'table' or migration.schemaVersion ~= 1
+  or (migration.phase ~= 'holding' and migration.phase ~= 'fifo') then return -3 end
+if migration.phase == 'fifo' then return 2 end
+if redis.call('ZCARD', KEYS[2]) ~= 0 then return -1 end
+redis.call('SET', KEYS[1], cjson.encode({ schemaVersion = 1, phase = 'fifo' }))
 return 1
 `;
 
@@ -7044,6 +7625,19 @@ function isReleaseFenceRecord(value: unknown): value is { readonly schemaVersion
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as { readonly schemaVersion?: unknown };
   return record.schemaVersion === 1 && isValidReleaseStamp(value);
+}
+
+function parseInboxFifoPhase(raw: string | null): StudioInboxFifoPhase | "invalid" {
+  if (raw === null) return "legacy";
+  const parsed = parseStored<unknown>(raw);
+  if (!isInboxFifoMigrationRecord(parsed)) return "invalid";
+  return parsed.phase;
+}
+
+function isInboxFifoMigrationRecord(value: unknown): value is InboxFifoMigrationRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Partial<InboxFifoMigrationRecord>;
+  return candidate.schemaVersion === 1 && (candidate.phase === "holding" || candidate.phase === "fifo");
 }
 
 function sameReleaseStamp(left: unknown, right: unknown): boolean {

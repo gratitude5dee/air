@@ -156,6 +156,19 @@ export function loadStudioEnvironment(source: EnvironmentSource = process.env): 
   if (isReleasePhaseActive(releasePhase) && !releaseFenceSecret) {
     throw new Error("an active release phase requires AIR_RELEASE_FENCE_SECRET");
   }
+  const imessageProjectId = optional(source.IMESSAGE_PROJECT_ID);
+  const imessageProjectSecret = optional(source.IMESSAGE_PROJECT_SECRET);
+  const imessageWebhookSecret = optional(source.IMESSAGE_WEBHOOK_SECRET);
+  const cronSecret = optional(source.CRON_SECRET);
+  // These credentials protect distinct trust boundaries. Reusing any pair
+  // would let a compromised delivery, Cron, or inbound-signing capability
+  // authorize an unrelated control plane, including FIFO migration.
+  requireDistinctSecretValues([
+    ["IMESSAGE_PROJECT_SECRET", imessageProjectSecret],
+    ["IMESSAGE_WEBHOOK_SECRET", imessageWebhookSecret],
+    ["CRON_SECRET", cronSecret],
+    ["AIR_RELEASE_FENCE_SECRET", releaseFenceSecret],
+  ]);
 
   const environment = Object.freeze({
     deploymentMode,
@@ -163,9 +176,9 @@ export function loadStudioEnvironment(source: EnvironmentSource = process.env): 
     releaseGeneration,
     releaseFenceSecret,
     storageTransport,
-    imessageProjectId: optional(source.IMESSAGE_PROJECT_ID),
-    imessageProjectSecret: optional(source.IMESSAGE_PROJECT_SECRET),
-    imessageWebhookSecret: optional(source.IMESSAGE_WEBHOOK_SECRET),
+    imessageProjectId,
+    imessageProjectSecret,
+    imessageWebhookSecret,
     redisUrl,
     upstashRedisRestUrl: restUrl,
     upstashRedisRestToken: restToken,
@@ -174,7 +187,7 @@ export function loadStudioEnvironment(source: EnvironmentSource = process.env): 
     idHashSecret: optional(source.AIR_ID_HASH_SECRET),
     queueEncryptionKey,
     allowedSenderHashes,
-    cronSecret: optional(source.CRON_SECRET),
+    cronSecret,
     publicBaseUrl: optional(source.AIR_PUBLIC_BASE_URL) ?? "https://air.wzrd.tech",
     modelRegistryVersion: optional(source.AIR_MODEL_REGISTRY_VERSION),
     dailyUserJobLimit: positiveInteger(source.AIR_DAILY_USER_JOB_LIMIT, 3, 100),
@@ -360,6 +373,22 @@ function positiveInteger(value: string | undefined, fallback: number, maximum: n
 function optional(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized || undefined;
+}
+
+/** Never report a value; only reject a configuration that collapses trust boundaries. */
+function requireDistinctSecretValues(
+  entries: readonly (readonly [label: string, value: string | undefined])[],
+): void {
+  for (let left = 0; left < entries.length; left += 1) {
+    const first = entries[left];
+    if (!first?.[1]) continue;
+    for (let right = left + 1; right < entries.length; right += 1) {
+      const second = entries[right];
+      if (second?.[1] && first[1] === second[1]) {
+        throw new Error(`${first[0]} must be distinct from ${second[0]}`);
+      }
+    }
+  }
 }
 
 function validateSecretLikeValue(value: string, label: string): void {

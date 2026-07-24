@@ -7,13 +7,25 @@ import type {
 } from "./gmi-request-queue.js";
 import {
   fetchStudioProviderArtifact,
+  normalizeStudioProviderArtifactReference,
   StudioProviderArtifactFetchError,
   type StudioProviderArtifactFetchPolicy,
 } from "./provider-artifact-fetch.js";
+import {
+  createStudioProviderResultReference,
+  isStudioProviderResultReference,
+  openStudioProviderResultReference,
+  type StudioProviderResultReference,
+} from "./provider-result-reference.js";
 import type {
   StudioProviderObservationInput,
   StudioProviderObservationPort,
   StudioProviderObservationResult,
+  StudioProviderResultMaterializationInput,
+  StudioProviderResultMaterializationPort,
+  StudioProviderResultMaterializationResult,
+  StudioProviderResultPollResult,
+  StudioProviderResultPollingPort,
   StudioProviderSubmitInput,
   StudioProviderSubmitResult,
 } from "./provider-port.js";
@@ -63,9 +75,15 @@ export interface GmiFluxKontextProStudioProviderOptions {
  * still needs live catalog/schema/pricing evidence, an enabled registry entry,
  * an authenticated injected client, and the existing release/cap gates.
  */
-export class GmiFluxKontextProStudioProvider implements StudioProviderObservationPort {
+export class GmiFluxKontextProStudioProvider implements
+  StudioProviderObservationPort,
+  StudioProviderResultPollingPort,
+  StudioProviderResultMaterializationPort
+{
   public readonly verified = true;
   public readonly observationSupported = true;
+  public readonly resultPollingSupported = true;
+  public readonly resultMaterializationSupported = true;
 
   public constructor(
     private readonly client: GmiFluxKontextProRequestQueueClient,
@@ -99,11 +117,26 @@ export class GmiFluxKontextProStudioProvider implements StudioProviderObservatio
   }
 
   /**
-   * GMI status reads and result fetches are recovery operations only. The
-   * adapter never reconstructs a submission payload or calls `submit` here,
-   * so a poll retry cannot create another billable provider request.
+   * Compatibility bridge for the legacy unbounded observer. Production Cron
+   * code can instead persist the sealed result reference returned by
+   * `pollResult` and materialize it in a later bounded phase.
    */
   public async observe(input: StudioProviderObservationInput): Promise<StudioProviderObservationResult> {
+    const polled = await this.pollResult(input);
+    if (polled.kind !== "ready") return polled;
+    return await this.materializeResult(Object.freeze({
+      job: input.job,
+      snapshot: input.snapshot,
+      reference: polled.reference,
+    }));
+  }
+
+  /**
+   * Reads only the known provider request status. On success it seals the
+   * reviewed retrieval capability without fetching media bytes or touching a
+   * Photon transport boundary.
+   */
+  public async pollResult(input: StudioProviderObservationInput): Promise<StudioProviderResultPollResult> {
     if (!hasExactFluxKontextProObservationBinding(input)) return reconciliationRequired();
     if (!this.options.outputPolicy || typeof this.client.getRequestStatus !== "function") {
       return reconciliationRequired();
@@ -146,8 +179,53 @@ export class GmiFluxKontextProStudioProvider implements StudioProviderObservatio
     if (resultUrl === null) return reconciliationRequired();
 
     try {
-      const artifact = await fetchStudioProviderArtifact({
+      // Do the same strict host/path/signature validation that materialization
+      // will repeat later, but never issue a GET during this status phase.
+      const url = normalizeStudioProviderArtifactReference({
         url: resultUrl,
+        policy: this.options.outputPolicy,
+      });
+      const reference = createStudioProviderResultReference({
+        jobId: input.job.jobId,
+        provider: "gmi",
+        adapterKey: GMI_FLUX_KONTEXT_PRO_ADAPTER_KEY,
+        providerModelId: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+        resultSchemaFingerprint: input.snapshot.model.resultSchemaFingerprint,
+        outputs: Object.freeze([Object.freeze({
+          outputIndex: 1 as const,
+          mediaType: "image" as const,
+        })]),
+        material: Object.freeze({ kind: "signed-url" as const, url }),
+      });
+      return Object.freeze({
+        kind: "ready" as const,
+        reference,
+      });
+    } catch {
+      return reconciliationRequired();
+    }
+  }
+
+  /**
+   * Downloads one previously sealed private result. It deliberately has no
+   * access to a provider request ID and cannot issue a status poll or submit
+   * another billable request.
+   */
+  public async materializeResult(
+    input: StudioProviderResultMaterializationInput,
+  ): Promise<StudioProviderResultMaterializationResult> {
+    if (!hasExactFluxKontextProExecutionBinding(input) || !this.options.outputPolicy) {
+      return reconciliationRequired();
+    }
+    if (!hasExactFluxKontextProResultReference(input.reference, input)) {
+      return reconciliationRequired();
+    }
+    const material = openStudioProviderResultReference(input.reference);
+    if (material?.kind !== "signed-url") return reconciliationRequired();
+
+    try {
+      const artifact = await fetchStudioProviderArtifact({
+        url: material.url,
         policy: this.options.outputPolicy,
         ...(this.options.fetch === undefined ? {} : { fetch: this.options.fetch }),
         ...(this.options.artifactFetchTimeoutMs === undefined
@@ -208,7 +286,7 @@ function hasExactFluxKontextProObservationBinding(input: StudioProviderObservati
 }
 
 function hasExactFluxKontextProExecutionBinding(
-  input: Pick<StudioProviderSubmitInput, "job" | "snapshot"> | StudioProviderObservationInput,
+  input: Pick<StudioProviderSubmitInput, "job" | "snapshot"> | StudioProviderObservationInput | StudioProviderResultMaterializationInput,
 ): boolean {
   const { job, snapshot } = input;
   const { model, output, workflow } = snapshot;
@@ -236,6 +314,23 @@ function hasExactFluxKontextProExecutionBinding(
     && output.durationSeconds === undefined
     && snapshot.maximumQuotedCostCents === job.reservedCents
     && isPositiveSafeInteger(snapshot.maximumQuotedCostCents);
+}
+
+function hasExactFluxKontextProResultReference(
+  reference: StudioProviderResultReference,
+  input: StudioProviderResultMaterializationInput,
+): boolean {
+  if (!isStudioProviderResultReference(reference)) return false;
+  const output = reference.outputs[0];
+  return reference.jobId === input.job.jobId
+    && reference.provider === "gmi"
+    && reference.adapterKey === GMI_FLUX_KONTEXT_PRO_ADAPTER_KEY
+    && reference.providerModelId === GMI_FLUX_KONTEXT_PRO_MODEL_ID
+    && reference.resultSchemaFingerprint === input.snapshot.model.resultSchemaFingerprint
+    && reference.outputCount === 1
+    && reference.outputs.length === 1
+    && output?.outputIndex === 1
+    && output.mediaType === "image";
 }
 
 /**
@@ -310,19 +405,19 @@ function ambiguous(): StudioProviderSubmitResult {
   return Object.freeze({ kind: "ambiguous" });
 }
 
-function pending(): StudioProviderObservationResult {
+function pending(): Readonly<{ readonly kind: "pending" }> {
   return Object.freeze({ kind: "pending" });
 }
 
-function definitiveFailure(): StudioProviderObservationResult {
+function definitiveFailure(): Readonly<{ readonly kind: "definitive_failure" }> {
   return Object.freeze({ kind: "definitive_failure" });
 }
 
-function retryableFailure(): StudioProviderObservationResult {
+function retryableFailure(): Readonly<{ readonly kind: "retryable_failure" }> {
   return Object.freeze({ kind: "retryable_failure" });
 }
 
-function reconciliationRequired(): StudioProviderObservationResult {
+function reconciliationRequired(): Readonly<{ readonly kind: "reconciliation_required" }> {
   return Object.freeze({ kind: "reconciliation_required" });
 }
 

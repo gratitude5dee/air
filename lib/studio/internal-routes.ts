@@ -9,7 +9,13 @@ import {
 } from "./config.js";
 import { AIR_MODEL_REGISTRY, AIR_MODEL_REGISTRY_VERSION, listEnabledModels } from "./model-registry.js";
 import { getStudioDeliveryTransport, getStudioRuntime, type StudioRuntime } from "./runtime.js";
-import type { StudioReleaseFenceStatus } from "./store.js";
+import type {
+  StudioInboxFifoActivateResult,
+  StudioInboxFifoBeginResult,
+  StudioInboxFifoPrepareResult,
+  StudioInboxFifoStatus,
+  StudioReleaseFenceStatus,
+} from "./store.js";
 import { authorizeStudioDrain } from "./webhook-handler.js";
 
 export type StudioDrain = (runtime: StudioRuntime) => Promise<void>;
@@ -20,6 +26,7 @@ export interface StudioInternalRouteOptions {
 }
 
 type StudioReadinessReleaseFence = "not_required" | "current" | "missing" | "mismatched" | "invalid" | "unreachable" | "unknown";
+type StudioReadinessInboxFifo = "not_required" | "fifo" | "legacy" | "holding" | "invalid" | "unreachable" | "unknown";
 
 /**
  * Vercel cron and operator recovery endpoint. Authorization happens before a
@@ -84,18 +91,21 @@ export async function handleStudioReadiness(
   // A delivery-only release is intentionally healthy with no provider or
   // selectable model. Requiring either before its policy is enabled would
   // misreport the safe, zero-provider iMessage smoke path as broken.
-  const providerWorkEnabled = canAcceptStudioJobs(environment)
+  const admissionConfigured = canAcceptStudioJobs(environment);
+  const providerWorkEnabled = admissionConfigured
     || canSubmitPaidStudioProvider(environment)
     || canRecoverPaidStudioProvider(environment);
   const activeSideEffectsEnabled = providerWorkEnabled || canDeliverStudioMessages(environment);
-  if (canAcceptStudioJobs(environment) && enabledModels === 0) problems.push("no_enabled_models");
+  if (admissionConfigured && enabledModels === 0) problems.push("no_enabled_models");
 
   let redis: "reachable" | "unreachable" | "unknown" = "unknown";
   let cron: "fresh" | "stale" | "missing" | "invalid" | "not_scheduled" | "unreachable" | "unknown" = "unknown";
   let releaseFence: StudioReadinessReleaseFence = activeSideEffectsEnabled ? "unknown" : "not_required";
+  let inboxFifo: StudioReadinessInboxFifo = admissionConfigured ? "unknown" : "not_required";
   if (!canProbeRedis(environment)) {
     problems.push("redis_reachability_unknown", "cron_freshness_unknown");
     if (activeSideEffectsEnabled) problems.push("release_fence_unavailable");
+    if (admissionConfigured) problems.push("inbox_fifo_unavailable");
   } else {
     let runtime: StudioRuntime;
     try {
@@ -104,13 +114,30 @@ export async function handleStudioReadiness(
       redis = "unreachable";
       cron = "unreachable";
       releaseFence = activeSideEffectsEnabled ? "unreachable" : "not_required";
+      inboxFifo = admissionConfigured ? "unreachable" : "not_required";
       problems.push("redis_unavailable", "cron_freshness_unknown");
       if (activeSideEffectsEnabled) problems.push("release_fence_unavailable");
-      return readinessResponse(environment, enabledModels, redis, cron, releaseFence, problems);
+      if (admissionConfigured) problems.push("inbox_fifo_unavailable");
+      return readinessResponse(environment, enabledModels, redis, cron, releaseFence, inboxFifo, problems);
     }
     try {
       const freshness = await runtime.store.getCronFreshness(environment.deploymentMode);
       redis = "reachable";
+      if (admissionConfigured) {
+        try {
+          const migration = await runtime.store.getInboxFifoMigrationStatus();
+          if (migration.kind === "invalid") {
+            inboxFifo = "invalid";
+            problems.push("inbox_fifo_invalid");
+          } else {
+            inboxFifo = migration.phase;
+            if (migration.phase !== "fifo") problems.push(`inbox_fifo_${migration.phase}`);
+          }
+        } catch {
+          inboxFifo = "unreachable";
+          problems.push("inbox_fifo_unavailable");
+        }
+      }
       // Inbound receipt persistence deliberately never mints an outbound
       // Photon token. An authenticated readiness probe, however, is the right
       // place to verify that a currently active delivery release can obtain
@@ -157,12 +184,14 @@ export async function handleStudioReadiness(
       redis = "unreachable";
       cron = "unreachable";
       releaseFence = activeSideEffectsEnabled ? "unreachable" : "not_required";
+      inboxFifo = admissionConfigured ? "unreachable" : "not_required";
       problems.push("redis_unavailable", "cron_freshness_unknown");
       if (activeSideEffectsEnabled) problems.push("release_fence_unavailable");
+      if (admissionConfigured) problems.push("inbox_fifo_unavailable");
     }
   }
 
-  return readinessResponse(environment, enabledModels, redis, cron, releaseFence, problems);
+  return readinessResponse(environment, enabledModels, redis, cron, releaseFence, inboxFifo, problems);
 }
 
 /**
@@ -223,12 +252,73 @@ export async function handleStudioReleaseFence(
   }
 }
 
+/**
+ * Protected, one-way operator control plane for the inbox FIFO migration.
+ * The only mutation verbs are the reviewed legacy -> holding -> fifo steps;
+ * this endpoint deliberately has no force, skip, reset, or arbitrary phase
+ * setter. Its status and outcomes are bounded counters and enum values only.
+ */
+export async function handleStudioInboxFifoMigration(
+  request: Request,
+  options: StudioInternalRouteOptions = {},
+): Promise<Response> {
+  if (request.method !== "GET" && request.method !== "POST") return methodNotAllowedResponse("GET, POST");
+
+  let environment: StudioEnvironment;
+  try {
+    environment = (options.loadEnvironment ?? loadStudioEnvironment)();
+  } catch {
+    return privateEmptyResponse(503);
+  }
+  // This is intentionally independent from the inbound HMAC and Cron bearer:
+  // a delivery source or scheduled worker must not gain migration authority.
+  if (!authorizeStudioDrain(request, environment.releaseFenceSecret)) return privateEmptyResponse(401);
+
+  const action = request.method === "POST"
+    ? parseInboxFifoMigrationAction(request.headers.get("x-air-fifo-migration-action"))
+    : undefined;
+  // Parse the exact action before opening Redis. In particular, a future
+  // caller cannot smuggle a force/skip/reset operation through a broad JSON
+  // command surface or use malformed input to cause a queue side effect.
+  if (request.method === "POST" && action === undefined) return privateEmptyResponse(400);
+
+  let runtime: StudioRuntime;
+  try {
+    runtime = await (options.getRuntime ?? getStudioRuntime)();
+  } catch {
+    return privateEmptyResponse(503);
+  }
+
+  try {
+    if (request.method === "GET") {
+      const status = await runtime.store.getInboxFifoMigrationStatus();
+      return inboxFifoMigrationStatusResponse(status);
+    }
+
+    switch (action) {
+      case "begin":
+        return inboxFifoMigrationMutationResponse(await runtime.store.beginInboxFifoMigration());
+      case "prepare":
+        return inboxFifoMigrationMutationResponse(await runtime.store.prepareInboxFifoHoldingScopes());
+      case "activate":
+        return inboxFifoMigrationMutationResponse(await runtime.store.activateInboxFifoMigration());
+      default:
+        // `action` is checked above. Keep a fail-closed guard if this handler
+        // is ever widened without updating the exact parser.
+        return privateEmptyResponse(400);
+    }
+  } catch {
+    return privateEmptyResponse(503);
+  }
+}
+
 function readinessResponse(
   environment: StudioEnvironment,
   enabledModels: number,
   redis: "reachable" | "unreachable" | "unknown",
   cron: "fresh" | "stale" | "missing" | "invalid" | "not_scheduled" | "unreachable" | "unknown",
   releaseFence: StudioReadinessReleaseFence,
+  inboxFifo: StudioReadinessInboxFifo,
   problems: readonly string[],
 ): Response {
   return Response.json(
@@ -239,7 +329,7 @@ function readinessResponse(
       enabledModels,
       sideEffects: environment.policy,
       effectiveSideEffects: {
-        acceptNewJobs: canAcceptStudioJobs(environment),
+        acceptNewJobs: canAcceptStudioJobs(environment) && inboxFifo === "fifo",
         allowProviderSubmit: canSubmitPaidStudioProvider(environment),
         allowProviderRecovery: canRecoverPaidStudioProvider(environment),
         deliveryEnabled: canDeliverStudioMessages(environment),
@@ -247,6 +337,7 @@ function readinessResponse(
       redis,
       cron,
       releaseFence,
+      inboxFifo,
       problems,
     },
     { status: problems.length === 0 ? 200 : 503, headers: { "cache-control": "no-store" } },
@@ -290,6 +381,55 @@ function parseReleaseFenceIfMatch(value: string | null): number | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
+/** Header values are literal control-plane verbs after normal HTTP OWS normalization. */
+function parseInboxFifoMigrationAction(value: string | null): "begin" | "prepare" | "activate" | undefined {
+  switch (value) {
+    case "begin":
+    case "prepare":
+    case "activate":
+      return value;
+    default:
+      return undefined;
+  }
+}
+
+function inboxFifoMigrationStatusResponse(status: StudioInboxFifoStatus): Response {
+  return Response.json(status, {
+    status: status.kind === "current" ? 200 : 503,
+    headers: { "cache-control": "no-store" },
+  });
+}
+
+function inboxFifoMigrationMutationResponse(
+  outcome: StudioInboxFifoBeginResult | StudioInboxFifoPrepareResult | StudioInboxFifoActivateResult,
+): Response {
+  const status = isAcceptedInboxFifoMigrationOutcome(outcome)
+    ? 202
+    : outcome.kind === "invalid"
+      ? 503
+      : 409;
+  return Response.json(outcome, { status, headers: { "cache-control": "no-store" } });
+}
+
+function isAcceptedInboxFifoMigrationOutcome(
+  outcome: StudioInboxFifoBeginResult | StudioInboxFifoPrepareResult | StudioInboxFifoActivateResult,
+): boolean {
+  switch (outcome.kind) {
+    case "holding":
+    case "already_holding":
+    case "already_fifo":
+    case "prepared":
+    case "activated":
+      return true;
+    case "legacy_not_drained":
+    case "blocked":
+    case "not_holding":
+    case "holding_not_prepared":
+    case "invalid":
+      return false;
+  }
+}
+
 function methodNotAllowedResponse(allowed: string): Response {
   return new Response(null, {
     status: 405,
@@ -297,6 +437,6 @@ function methodNotAllowedResponse(allowed: string): Response {
   });
 }
 
-function privateEmptyResponse(status: 401 | 409 | 503): Response {
+function privateEmptyResponse(status: 400 | 401 | 409 | 503): Response {
   return new Response(null, { status, headers: { "cache-control": "no-store" } });
 }

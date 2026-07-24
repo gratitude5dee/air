@@ -60,6 +60,24 @@ export interface StudioFetchedProviderArtifact {
   readonly contentLength?: number | undefined;
 }
 
+/**
+ * Validates a provider retrieval capability without starting an HTTP request.
+ * A split status-poll path uses this before it seals a private URL for later
+ * encrypted persistence. The returned normalized URL remains caller-owned
+ * sensitive material and must not be logged or placed in plaintext metadata.
+ */
+export function normalizeStudioProviderArtifactReference(input: {
+  readonly url: string;
+  readonly policy: StudioProviderArtifactFetchPolicy;
+}): string {
+  try {
+    return normalizeArtifactUrl(input.url, normalizePolicy(input.policy));
+  } catch (error) {
+    if (error instanceof StudioProviderArtifactFetchError) throw error;
+    fail("invalid_configuration");
+  }
+}
+
 export type StudioProviderArtifactFetchErrorCode =
   | "invalid_configuration"
   | "invalid_policy"

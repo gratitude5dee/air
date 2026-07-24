@@ -114,6 +114,18 @@ describe("Air studio configuration", () => {
     expect(canDeliverStudioMessages(active)).toBe(true);
   });
 
+  it("rejects secret reuse across Photon ingress, Cron, and release control planes", () => {
+    expect(() => loadStudioEnvironment(configured({
+      AIR_RELEASE_FENCE_SECRET: "cron-secret",
+    }))).toThrow(/must be distinct/);
+    expect(() => loadStudioEnvironment(configured({
+      CRON_SECRET: "webhook",
+    }))).toThrow(/IMESSAGE_WEBHOOK_SECRET must be distinct from CRON_SECRET/);
+    expect(() => loadStudioEnvironment(configured({
+      IMESSAGE_PROJECT_SECRET: "webhook",
+    }))).toThrow(/IMESSAGE_PROJECT_SECRET must be distinct from IMESSAGE_WEBHOOK_SECRET/);
+  });
+
   it("keeps accepted provider work recoverable after rollback closes admission and submission", () => {
     const active = loadStudioEnvironment(configured({
       VERCEL_ENV: "production",

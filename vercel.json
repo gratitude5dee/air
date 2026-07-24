@@ -14,7 +14,8 @@
     { "source": "/internal/drain-inbox", "destination": "/api/internal/drain-inbox" },
     { "source": "/internal/provider-audit", "destination": "/api/internal/provider-audit" },
     { "source": "/internal/readiness", "destination": "/api/internal/readiness" },
-    { "source": "/internal/release-fence", "destination": "/api/internal/release-fence" }
+    { "source": "/internal/release-fence", "destination": "/api/internal/release-fence" },
+    { "source": "/internal/inbox-fifo-migration", "destination": "/api/internal/inbox-fifo-migration" }
   ],
   "crons": [
     { "path": "/internal/drain-inbox", "schedule": "* * * * *" }

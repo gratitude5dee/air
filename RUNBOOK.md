@@ -97,6 +97,112 @@ vercel env ls production --scope 5dee-studios
 Do not run `vercel env pull`, do not call a command that echoes a value, and do
 not include an environment value in a support transcript.
 
+## Protected inbox FIFO cutover
+
+This is a required ordering-safety migration before pending prompt handling can
+be considered. It is not a provider rollout: it cannot enable `/imagine` (or
+any other generation mode), alter a release fence, enable a registry entry,
+raise a cap, submit a provider request, or spend money. All current
+zero-spend and dark-release restrictions remain in force before, during, and
+after the cutover.
+
+The migration route is intentionally separate from both the inbound webhook
+HMAC and the minute Cron credential. Use it only from an operator-controlled
+terminal where `AIR_RELEASE_FENCE_SECRET` is already present; do not paste,
+print, retrieve, export to a transcript, or put the value in a URL. In
+particular, do not substitute `IMESSAGE_WEBHOOK_SECRET` or `CRON_SECRET`.
+
+Set only a non-secret route variable in that terminal:
+
+```sh
+AIR_FIFO_URL="https://air.wzrd.tech/internal/inbox-fifo-migration"
+```
+
+The route exposes a secret-free status view and exactly three literal,
+one-way actions. There is no force, skip, reset, rollback, or arbitrary phase
+setter.
+
+| Phase | Meaning | Operator rule |
+| --- | --- | --- |
+| `legacy` | Existing compatibility global-ready behavior. | Do not begin until its ready index is empty. Old receipts are never backfilled or guessed into FIFO order. |
+| `holding` | New signed receipts are persisted durably but are not claimable. | Prepare every holding scope; a held receipt cannot progress during this phase. |
+| `fifo` | Only the exact durable receipt-order head for a sender/thread scope can be claimed. | A delayed, failed, or missing head blocks its own later receipts; it cannot be bypassed. |
+
+Perform the cutover in order, preserving only the returned enum/counter
+evidence in a handoff (never headers, prompts, phone numbers, receipt IDs, or
+secrets).
+
+1. Read status with the release-fence bearer credential already held by the
+   operator:
+
+   ```sh
+   curl --fail-with-body -sS \
+     -H "Authorization: Bearer ${AIR_RELEASE_FENCE_SECRET}" \
+     "${AIR_FIFO_URL}"
+   ```
+
+   Expect a secret-free response such as
+   `{"kind":"current","phase":"legacy","holdingScopes":0}`. A `401`
+   or `503` is a stop condition. Do not diagnose it by exposing a credential.
+
+2. Only when status is `legacy`, request the first one-way transition:
+
+   ```sh
+   curl --fail-with-body -sS -X POST \
+     -H "Authorization: Bearer ${AIR_RELEASE_FENCE_SECRET}" \
+     -H "X-Air-Fifo-Migration-Action: begin" \
+     "${AIR_FIFO_URL}"
+   ```
+
+   A `202` response of `{"kind":"holding"}` starts the cutover.
+   `{"kind":"already_holding"}` is a safe resumed invocation. A `409`
+   `legacy_not_drained` means stop: preserve Redis state, allow the established
+   recovery/reconciliation path to drain the old ready work, then reread
+   status. Never delete, reorder, backfill, or force old receipts into FIFO.
+
+3. While status is `holding`, invoke the bounded preparation action, then
+   reread status. Repeat this exact action until it reports no remaining
+   holding scopes:
+
+   ```sh
+   curl --fail-with-body -sS -X POST \
+     -H "Authorization: Bearer ${AIR_RELEASE_FENCE_SECRET}" \
+     -H "X-Air-Fifo-Migration-Action: prepare" \
+     "${AIR_FIFO_URL}"
+   ```
+
+   A `202` `prepared` response includes only `preparedScopes` and
+   `remainingScopes`; it does not disclose a scope or message. A `409`
+   `blocked`, `not_holding`, or other non-`202` result is a stop condition.
+   Do not activate while `holdingScopes` is nonzero. If a new receipt arrives
+   between checks, prepare again; holding deliberately accepts it without
+   claiming it.
+
+4. Once a status read reports `{"kind":"current","phase":"holding",
+   "holdingScopes":0}`, request activation:
+
+   ```sh
+   curl --fail-with-body -sS -X POST \
+     -H "Authorization: Bearer ${AIR_RELEASE_FENCE_SECRET}" \
+     -H "X-Air-Fifo-Migration-Action: activate" \
+     "${AIR_FIFO_URL}"
+   ```
+
+   A `202` `activated` response completes the one-way transition. A `409`
+   `holding_not_prepared` means a scope appeared or remains: return to
+   `prepare`; do not bypass it. `already_fifo` is the safe resumed outcome.
+
+5. Read status once more and record only that it reports `phase: "fifo"`.
+   At this point each sender/thread scope advances only from its durable head
+   to its exact next sequence after a terminal result. The minute drain
+   remains the sole scheduler; this route creates no extra Cron or worker.
+
+If any result is `invalid`, `blocked`, `legacy_not_drained`, or otherwise
+unexpected, leave the migration in its current phase, preserve encrypted
+state, and escalate through the normal reconciliation path. A one-way safety
+gate is not an incident-recovery shortcut, and no endpoint can be used to
+skip a predecessor.
+
 ## Photon credential incident and coordinated rotation
 
 `IMESSAGE_WEBHOOK_SECRET` is the existing inbound signing secret for the

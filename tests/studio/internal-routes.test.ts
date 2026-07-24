@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { StudioEnvironment } from "../../lib/studio/config.js";
 import {
   handleStudioDrain,
+  handleStudioInboxFifoMigration,
   handleStudioReadiness,
   handleStudioReleaseFence,
 } from "../../lib/studio/internal-routes.js";
@@ -75,6 +76,16 @@ function releaseFenceRequest(ifMatch: string | undefined, method = "POST", token
   const headers = new Headers({ authorization: `Bearer ${token}` });
   if (ifMatch !== undefined) headers.set("if-match", ifMatch);
   return new Request("https://air.example.test/internal/release-fence", { method, headers });
+}
+
+function inboxFifoMigrationRequest(
+  method: "GET" | "POST" | "PUT",
+  action?: string,
+  token = "release-fence-secret",
+): Request {
+  const headers = new Headers({ authorization: `Bearer ${token}` });
+  if (action !== undefined) headers.set("x-air-fifo-migration-action", action);
+  return new Request("https://air.example.test/internal/inbox-fifo-migration", { method, headers });
 }
 
 function readinessRuntime(freshness: "fresh" | "stale" | "missing" | "invalid") {
@@ -312,6 +323,68 @@ describe("Studio Vercel internal routes", () => {
     expect(body).not.toHaveProperty("stamp");
     expect(body).not.toHaveProperty("releaseGeneration");
     expect(getReleaseFenceStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an active admission configuration until the durable inbox is FIFO-ready", async () => {
+    const environment: StudioEnvironment = {
+      ...productionDeliveryEnvironment(),
+      policy: {
+        acceptNewJobs: true,
+        allowProviderSubmit: true,
+        allowProviderRecovery: false,
+        deliveryEnabled: false,
+      },
+      spendCaps: {
+        perJobCents: 100,
+        dailyCents: 100,
+        canaryTotalCents: 0,
+        canaryFalCents: 0,
+      },
+    };
+    const cases = [
+      {
+        status: { kind: "current" as const, phase: "legacy" as const, holdingScopes: 0 },
+        expected: "legacy",
+        problem: "inbox_fifo_legacy",
+      },
+      {
+        status: { kind: "current" as const, phase: "holding" as const, holdingScopes: 2 },
+        expected: "holding",
+        problem: "inbox_fifo_holding",
+      },
+      {
+        status: { kind: "invalid" as const },
+        expected: "invalid",
+        problem: "inbox_fifo_invalid",
+      },
+    ] as const;
+
+    for (const testCase of cases) {
+      const getInboxFifoMigrationStatus = vi.fn(async () => testCase.status);
+      const response = await handleStudioReadiness(authorizedRequest("/internal/readiness", "GET"), {
+        loadEnvironment: () => environment,
+        getRuntime: async () => ({
+          store: {
+            getCronFreshness: vi.fn(async () => "fresh" as const),
+            getInboxFifoMigrationStatus,
+            getReleaseFenceStatus: vi.fn(async () => ({
+              kind: "current" as const,
+              stamp: { generation: environment.releaseGeneration, phase: environment.releasePhase },
+            })),
+          },
+          transport: { verified: true },
+          provider: { verified: true },
+        }) as unknown as StudioRuntime,
+      });
+
+      expect(response.status, testCase.expected).toBe(503);
+      await expect(response.json()).resolves.toEqual(expect.objectContaining({
+        inboxFifo: testCase.expected,
+        effectiveSideEffects: expect.objectContaining({ acceptNewJobs: false }),
+        problems: expect.arrayContaining([testCase.problem]),
+      }));
+      expect(getInboxFifoMigrationStatus).toHaveBeenCalledTimes(1);
+    }
   });
 
   it("probes a deferred Photon transport only for an active delivery release", async () => {
@@ -610,5 +683,150 @@ describe("Studio Vercel internal routes", () => {
     expect(unsupported.status).toBe(405);
     expect(unsupported.headers.get("allow")).toBe("GET, POST");
     expect(getRuntime).not.toHaveBeenCalled();
+  });
+
+  it("keeps FIFO migration authority independent from Cron and returns only secret-free status", async () => {
+    const getInboxFifoMigrationStatus = vi.fn(async () => ({
+      kind: "current" as const,
+      phase: "holding" as const,
+      holdingScopes: 2,
+    }));
+    const getRuntime = vi.fn(async () => ({
+      store: { getInboxFifoMigrationStatus },
+    }) as unknown as StudioRuntime);
+
+    const cronCredential = await handleStudioInboxFifoMigration(
+      inboxFifoMigrationRequest("GET", undefined, "cron-secret"),
+      { loadEnvironment: releaseFenceEnvironment, getRuntime },
+    );
+    expect(cronCredential.status).toBe(401);
+    expect(await cronCredential.text()).toBe("");
+    expect(getRuntime).not.toHaveBeenCalled();
+
+    const response = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("GET"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime,
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    await expect(response.json()).resolves.toEqual({
+      kind: "current",
+      phase: "holding",
+      holdingScopes: 2,
+    });
+    expect(getInboxFifoMigrationStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects all unsupported or nonliteral FIFO migration actions before creating a runtime", async () => {
+    const loadEnvironment = vi.fn(releaseFenceEnvironment);
+    const getRuntime = vi.fn(async () => ({}) as StudioRuntime);
+
+    const method = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("PUT", "begin"), {
+      loadEnvironment,
+      getRuntime,
+    });
+    expect(method.status).toBe(405);
+    expect(method.headers.get("allow")).toBe("GET, POST");
+    expect(loadEnvironment).not.toHaveBeenCalled();
+
+    // Fetch's Headers constructor correctly applies HTTP OWS normalization,
+    // so this checks exact post-normalization control verbs rather than
+    // attempting to distinguish wire representations HTTP treats as equal.
+    for (const action of [undefined, "BEGIN", "begin,prepare", "force", "skip", "reset"]) {
+      const response = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("POST", action), {
+        loadEnvironment,
+        getRuntime,
+      });
+      expect(response.status, `action=${String(action)}`).toBe(400);
+      expect(await response.text()).toBe("");
+    }
+    expect(getRuntime).not.toHaveBeenCalled();
+  });
+
+  it("dispatches each exact FIFO migration action to its one reviewed store primitive", async () => {
+    const getInboxFifoMigrationStatus = vi.fn();
+    const beginInboxFifoMigration = vi.fn(async () => ({ kind: "holding" as const }));
+    const prepareInboxFifoHoldingScopes = vi.fn(async () => ({
+      kind: "prepared" as const,
+      preparedScopes: 3,
+      remainingScopes: 1,
+    }));
+    const activateInboxFifoMigration = vi.fn(async () => ({ kind: "activated" as const }));
+    const runtime = {
+      store: {
+        getInboxFifoMigrationStatus,
+        beginInboxFifoMigration,
+        prepareInboxFifoHoldingScopes,
+        activateInboxFifoMigration,
+      },
+    } as unknown as StudioRuntime;
+
+    const begin = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("POST", "begin"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => runtime,
+    });
+    expect(begin.status).toBe(202);
+    await expect(begin.json()).resolves.toEqual({ kind: "holding" });
+
+    const prepare = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("POST", "prepare"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => runtime,
+    });
+    expect(prepare.status).toBe(202);
+    await expect(prepare.json()).resolves.toEqual({ kind: "prepared", preparedScopes: 3, remainingScopes: 1 });
+
+    const activate = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("POST", "activate"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => runtime,
+    });
+    expect(activate.status).toBe(202);
+    await expect(activate.json()).resolves.toEqual({ kind: "activated" });
+
+    expect(getInboxFifoMigrationStatus).not.toHaveBeenCalled();
+    expect(beginInboxFifoMigration).toHaveBeenCalledTimes(1);
+    expect(prepareInboxFifoHoldingScopes).toHaveBeenCalledTimes(1);
+    expect(activateInboxFifoMigration).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes only safe blocked or invalid FIFO migration outcomes", async () => {
+    const beginInboxFifoMigration = vi.fn(async () => ({ kind: "legacy_not_drained" as const }));
+    const prepareInboxFifoHoldingScopes = vi.fn(async () => ({ kind: "blocked" as const, preparedScopes: 0 }));
+    const activateInboxFifoMigration = vi.fn(async () => ({ kind: "invalid" as const }));
+    const runtime = {
+      store: { beginInboxFifoMigration, prepareInboxFifoHoldingScopes, activateInboxFifoMigration },
+    } as unknown as StudioRuntime;
+
+    const blockedBegin = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("POST", "begin"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => runtime,
+    });
+    expect(blockedBegin.status).toBe(409);
+    await expect(blockedBegin.json()).resolves.toEqual({ kind: "legacy_not_drained" });
+
+    const blockedPrepare = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("POST", "prepare"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => runtime,
+    });
+    expect(blockedPrepare.status).toBe(409);
+    await expect(blockedPrepare.json()).resolves.toEqual({ kind: "blocked", preparedScopes: 0 });
+
+    const invalidActivate = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("POST", "activate"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => runtime,
+    });
+    expect(invalidActivate.status).toBe(503);
+    await expect(invalidActivate.json()).resolves.toEqual({ kind: "invalid" });
+  });
+
+  it("returns a safe unavailable response for an invalid persisted FIFO migration status", async () => {
+    const response = await handleStudioInboxFifoMigration(inboxFifoMigrationRequest("GET"), {
+      loadEnvironment: releaseFenceEnvironment,
+      getRuntime: async () => ({
+        store: { getInboxFifoMigrationStatus: async () => ({ kind: "invalid" as const }) },
+      }) as unknown as StudioRuntime,
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({ kind: "invalid" });
   });
 });

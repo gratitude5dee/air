@@ -7,6 +7,7 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/healthz.ts",
   "api/index.ts",
   "api/internal/drain-inbox.ts",
+  "api/internal/inbox-fifo-migration.ts",
   "api/internal/provider-audit.ts",
   "api/internal/readiness.ts",
   "api/internal/release-fence.ts",
@@ -20,6 +21,7 @@ const EXPECTED_REWRITES = Object.freeze([
   ["/internal/provider-audit", "/api/internal/provider-audit"],
   ["/internal/readiness", "/api/internal/readiness"],
   ["/internal/release-fence", "/api/internal/release-fence"],
+  ["/internal/inbox-fifo-migration", "/api/internal/inbox-fifo-migration"],
 ]);
 
 /** Packages which would put the retired framework or an LLM runtime on Air's request path. */
@@ -168,6 +170,23 @@ async function verifyRouteSources() {
   const releaseFenceSource = await readFile(resolve(ROOT, "api/internal/release-fence.ts"), "utf8");
   if (!releaseFenceSource.includes("handleStudioReleaseFence")) {
     throw new Error("the release-fence route must use the Studio fence handler");
+  }
+  const inboxFifoMigrationSource = await readFile(resolve(ROOT, "api/internal/inbox-fifo-migration.ts"), "utf8");
+  if (!inboxFifoMigrationSource.includes("handleStudioInboxFifoMigration")) {
+    throw new Error("the inbox FIFO migration route must use the Studio migration handler");
+  }
+  const storeSource = await readFile(resolve(ROOT, "lib/studio/store.ts"), "utf8");
+  // MemoryRedis mirrors are useful, but production uses the embedded Lua.
+  // Keep its fail-closed head validator and atomic admission fence present in
+  // the shipped source so a later script-only refactor cannot silently fall
+  // back to Redis lexical tie-breaking or a config-only paid enablement.
+  if (
+    !storeSource.includes("INBOX_FIFO_LUA_VALIDATED_HEAD_HELPER")
+    || !storeSource.includes("ZRANGEBYSCORE", storeSource.indexOf("INBOX_FIFO_LUA_VALIDATED_HEAD_HELPER"))
+    || !storeSource.includes("9007199254740991")
+    || !storeSource.includes("inbox_fifo_required")
+  ) {
+    throw new Error("the production inbox FIFO Lua safety contract is incomplete");
   }
 }
 

@@ -100,10 +100,39 @@ flowchart LR
 | `/internal/provider-audit` | `GET` | Manually invoked, `CRON_SECRET` bearer-protected, read-only GMI contract review. |
 | `/internal/readiness` | `GET` | `CRON_SECRET` bearer-protected, secret-safe readiness report. |
 | `/internal/release-fence` | `GET`, `POST` | `AIR_RELEASE_FENCE_SECRET` bearer-protected epoch read and release-generation CAS. |
+| `/internal/inbox-fifo-migration` | `GET`, `POST` | `AIR_RELEASE_FENCE_SECRET` bearer-protected, one-way inbox ordering migration control plane. |
 
 `vercel.json` declares exactly one Cron: `/internal/drain-inbox` every minute,
 with a 60-second function limit. The provider-audit route is intentionally not
 a Cron and is never reachable without its bearer check.
+
+## Inbox FIFO migration
+
+Before pending prompt handling can ever be considered, an operator must move
+the durable inbox from its compatibility scheduler to per-conversation FIFO.
+This is an ordering safety control only: it never enables a model, changes a
+release fence, accepts a paid job, spends money, or relaxes any of the
+zero-spend gates above.
+
+The protected route exposes only the following one-way phases:
+
+- `legacy` is the compatibility behavior for already deployed receipts. It
+  must be completely drained before cutover; Air never guesses old receipts
+  into a new sequence or lets one overtake a missing predecessor.
+- `holding` durably accepts newly signed receipts, but a worker cannot claim
+  those held receipts. It gives an operator a stable cutover point while each
+  scope's validated head is prepared for the scheduler.
+- `fifo` permits only the exact durable receipt-order head for each
+  sender/thread scope to be claimed. A delayed, failed, or missing head blocks
+  only that scope; a later receipt cannot bypass it.
+
+Use this control plane only from an operator terminal where
+`AIR_RELEASE_FENCE_SECRET` is already set. Never paste, print, add to a URL,
+or put that value in chat, source, logs, or a handoff. The route deliberately
+does not accept the inbound Photon signing secret or `CRON_SECRET`, and it has
+no `force`, `skip`, `reset`, or arbitrary-phase operation. See
+[RUNBOOK.md](RUNBOOK.md#protected-inbox-fifo-cutover) for the exact safe
+sequence.
 
 ## Safe server-only GMI audit
 

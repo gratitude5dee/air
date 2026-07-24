@@ -87,6 +87,9 @@ const ONBOARDING_BUBBLES = Object.freeze([
   "Create with /imagine, /animate, /edit-image, or /edit-video. Try: /imagine a chrome hummingbird at sunrise. Settings: /model-settings • Help: /help. Generation is currently unavailable while Air completes provider review; any later approved path will disclose its media-retention terms.",
 ] as const);
 
+const FIFO_GENERATION_HOLD_TEXT = "Air is completing an ordering-safety migration. I didn’t retain that generation request; send it again after it is ready. No generation was submitted.";
+const FIFO_MEDIA_HOLD_TEXT = "Air is completing an ordering-safety migration. I didn’t retain that attachment. No generation was submitted.";
+
 type StoredModeSettings = {
   readonly modelSlug?: string | undefined;
   readonly outputCount: StudioOutputCount;
@@ -543,6 +546,11 @@ async function processInbox(runtime: StudioRuntime, record: StudioInboxRecord): 
         );
         return "maintenance_rejected";
       }
+      if (!await canAcceptNewStudioGeneration(runtime)) {
+        await runtime.store.clearPending(record);
+        await enqueueResponse(runtime, record, envelope, "media-first-fifo-unavailable", FIFO_MEDIA_HOLD_TEXT);
+        return "maintenance_rejected";
+      }
       const pendingWrite = await runtime.store.putPendingWithGuard<PendingIntent>(record, Object.freeze({
         schemaVersion: 1,
         kind: "media",
@@ -636,6 +644,11 @@ async function handleBareText(
   if (!canAcceptStudioJobs(runtime.environment)) {
     await runtime.store.clearPending(record);
     await enqueueMaintenanceNotice(runtime, record, envelope, "pending-prompt-maintenance");
+    return "maintenance_rejected";
+  }
+  if (!await canAcceptNewStudioGeneration(runtime)) {
+    await runtime.store.clearPending(record);
+    await enqueueResponse(runtime, record, envelope, "pending-prompt-fifo-unavailable", FIFO_GENERATION_HOLD_TEXT);
     return "maintenance_rejected";
   }
 
@@ -787,6 +800,11 @@ async function handleCreation(
   // provider code so a dark release cannot create a later paid surprise.
   if (!canAcceptStudioJobs(runtime.environment)) {
     await enqueueMaintenanceNotice(runtime, record, envelope, `maintenance-${mode}`);
+    return "maintenance_rejected";
+  }
+  if (!await canAcceptNewStudioGeneration(runtime)) {
+    await runtime.store.clearPending(record);
+    await enqueueResponse(runtime, record, envelope, `fifo-unavailable-${mode}`, FIFO_GENERATION_HOLD_TEXT);
     return "maintenance_rejected";
   }
 
@@ -964,6 +982,12 @@ async function handleCreation(
     case "canary_budget_required":
       await enqueueResponse(runtime, record, envelope, `canary-budget-required-${mode}`, "Air’s launch budget controls are unavailable right now. No generation was submitted.");
       return "processed";
+    case "inbox_fifo_required":
+      // The atomic admission primitive repeats the runtime gate so a stale
+      // worker cannot reserve paid work across a migration transition.
+      await runtime.store.clearPending(record);
+      await enqueueResponse(runtime, record, envelope, `fifo-required-${mode}`, FIFO_GENERATION_HOLD_TEXT);
+      return "maintenance_rejected";
     case "release_blocked":
       // A fence change means this worker is stale. Creating a second generic
       // response could cross the same rollback boundary, so leave no effect.
@@ -973,6 +997,22 @@ async function handleCreation(
       // retry the atomic boundary. A partial acknowledgement/job bundle is
       // impossible, so a transient store failure cannot spend or send.
       throw new Error("studio_atomic_admission_unavailable");
+  }
+}
+
+/**
+ * A release switch may authorize new work only after the one-way inbox
+ * migration has reached its durable FIFO state.  A successful `fifo` read is
+ * stable: the migration has no reverse transition.  Every other status,
+ * including a read failure, is deliberately a no-new-generation result.
+ */
+async function canAcceptNewStudioGeneration(runtime: StudioRuntime): Promise<boolean> {
+  if (!canAcceptStudioJobs(runtime.environment)) return false;
+  try {
+    const migration = await runtime.store.getInboxFifoMigrationStatus();
+    return migration.kind === "current" && migration.phase === "fifo";
+  } catch {
+    return false;
   }
 }
 

@@ -88,6 +88,17 @@ async function persistScopeRecord(
   return persisted.record;
 }
 
+function fifoScopeId(senderHash: SenderHash, threadHash: ThreadHash): string {
+  return deriveOpaqueId(identitySecret, "studio-inbox-fifo-scope", `${senderHash}\u0000${threadHash}`);
+}
+
+async function activateInboxFifo(store: StudioStore): Promise<void> {
+  await expect(store.beginInboxFifoMigration()).resolves.toEqual({ kind: "holding" });
+  const prepared = await store.prepareInboxFifoHoldingScopes();
+  expect(prepared).toMatchObject({ kind: "prepared", remainingScopes: 0 });
+  await expect(store.activateInboxFifoMigration()).resolves.toEqual({ kind: "activated" });
+}
+
 function job(
   cipher: QueueCipher,
   senderHash: SenderHash,
@@ -459,6 +470,276 @@ describe("Air v2 studio durable store", () => {
       .resolves.toEqual({ kind: "superseded" });
     await expect(store.getPending<{ attachmentId: string }>(senderHash, threadHash))
       .resolves.toEqual({ attachmentId: "attachment-b" });
+  });
+
+  it("refuses to begin the cutover while a legacy claim remains recoverable", async () => {
+    const { store } = fixture();
+    const { senderHash, threadHash } = identities();
+    const legacy = await persistScopeRecord(store, senderHash, threadHash, "fifo-legacy-leased");
+    const claim = await store.claimNextInbox();
+    expect(claim?.record.receiptId).toBe(legacy.receiptId);
+    if (!claim) throw new Error("expected legacy receipt to be leased");
+
+    // A claimed legacy receipt remains in the global recovery index. Starting
+    // the migration here would otherwise split one scope across schedulers.
+    await expect(store.beginInboxFifoMigration()).resolves.toEqual({ kind: "legacy_not_drained" });
+    await expect(store.getInboxFifoMigrationStatus()).resolves.toEqual({
+      kind: "current",
+      phase: "legacy",
+      holdingScopes: 0,
+    });
+
+    expect(await store.finishInbox(legacy.receiptId, claim.leaseToken, "processed")).toBe(true);
+    await expect(store.beginInboxFifoMigration()).resolves.toEqual({ kind: "holding" });
+  });
+
+  it("drains a valid-scope legacy receipt with no durable sequence before FIFO cutover", async () => {
+    const { redis, store, prefix } = fixture();
+    const { senderHash, threadHash } = identities();
+    const legacy = await persistScopeRecord(store, senderHash, threadHash, "unsequenced-legacy-receipt");
+    const metadataKey = `${prefix}:inbox:${legacy.receiptId}`;
+    const raw = await redis.get(metadataKey);
+    if (!raw) throw new Error("expected legacy metadata");
+    const unsequenced = { ...JSON.parse(raw) as Record<string, unknown>, scopeSequence: 0 };
+    await redis.set(metadataKey, JSON.stringify(unsequenced));
+
+    // Older receipts cannot be ordered by timestamp, but they must not be
+    // silently removed from the ready index. Lease and terminalize them in
+    // legacy mode, then the cutover can prove the old scheduler is drained.
+    const claim = await store.claimNextInbox();
+    expect(claim?.record).toMatchObject({ receiptId: legacy.receiptId, scopeSequence: 0 });
+    if (!claim) throw new Error("expected unsequenced legacy claim");
+    expect(await store.finishInbox(legacy.receiptId, claim.leaseToken, "maintenance_rejected")).toBe(true);
+    await expect(store.beginInboxFifoMigration()).resolves.toEqual({ kind: "holding" });
+  });
+
+  it("holds a later same-scope receipt behind a claimed or delayed FIFO head", async () => {
+    const { store, advance } = fixture();
+    const { senderHash, threadHash } = identities();
+    await activateInboxFifo(store);
+    const first = await persistScopeRecord(store, senderHash, threadHash, "fifo-claimed-first");
+    const second = await persistScopeRecord(store, senderHash, threadHash, "fifo-claimed-second");
+
+    const firstClaim = await store.claimNextInbox();
+    expect(firstClaim?.record.receiptId).toBe(first.receiptId);
+    if (!firstClaim) throw new Error("expected first FIFO head");
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+
+    expect(await store.retryInbox(first.receiptId, firstClaim.leaseToken, 5_000)).toBe(true);
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    advance(5_000);
+    const recovered = await store.claimNextInbox();
+    expect(recovered?.record.receiptId).toBe(first.receiptId);
+    if (!recovered) throw new Error("expected delayed FIFO head recovery");
+    expect(await store.finishInbox(first.receiptId, recovered.leaseToken, "processed")).toBe(true);
+
+    const secondClaim = await store.claimNextInbox();
+    expect(secondClaim?.record.receiptId).toBe(second.receiptId);
+  });
+
+  it("keeps a same-scope follower blocked through lease recovery and a later retry", async () => {
+    const { store, advance } = fixture();
+    const { senderHash, threadHash } = identities();
+    await activateInboxFifo(store);
+    const first = await persistScopeRecord(store, senderHash, threadHash, "fifo-crash-first");
+    const second = await persistScopeRecord(store, senderHash, threadHash, "fifo-crash-second");
+
+    const claimed = await store.claimNextInbox();
+    expect(claimed?.record.receiptId).toBe(first.receiptId);
+    if (!claimed) throw new Error("expected FIFO head claim");
+
+    // The worker crashes without calling retry. The expired head is the only
+    // member that can be recovered; B must not become independently ready.
+    advance(90_001);
+    const recovered = await store.claimNextInbox();
+    expect(recovered?.record.receiptId).toBe(first.receiptId);
+    if (!recovered) throw new Error("expected FIFO head lease recovery");
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+
+    expect(await store.retryInbox(first.receiptId, recovered.leaseToken, 1_000)).toBe(true);
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    advance(1_000);
+    const retried = await store.claimNextInbox();
+    expect(retried?.record.receiptId).toBe(first.receiptId);
+    if (!retried) throw new Error("expected retried FIFO head");
+    expect(await store.finishInbox(first.receiptId, retried.leaseToken, "processed")).toBe(true);
+
+    const follower = await store.claimNextInbox();
+    expect(follower?.record.receiptId).toBe(second.receiptId);
+  });
+
+  it("permits a different scope while a claimed FIFO head blocks only its own scope", async () => {
+    const { store, advance } = fixture();
+    const { senderHash, threadHash } = identities();
+    await activateInboxFifo(store);
+    const firstScopeFirst = await persistScopeRecord(store, senderHash, threadHash, "fifo-scope-a-first");
+    advance(1);
+    const secondThreadHash = hashThreadIdentifier(identitySecret, "iMessage;-;+14155550199\u0000+14155550001");
+    const otherScope = await persistScopeRecord(store, senderHash, secondThreadHash, "fifo-scope-b-first");
+    const firstScopeSecond = await persistScopeRecord(store, senderHash, threadHash, "fifo-scope-a-second");
+
+    const firstClaim = await store.claimNextInbox();
+    expect(firstClaim?.record.receiptId).toBe(firstScopeFirst.receiptId);
+    if (!firstClaim) throw new Error("expected first scope head");
+    const otherClaim = await store.claimNextInbox();
+    expect(otherClaim?.record.receiptId).toBe(otherScope.receiptId);
+    expect(otherClaim?.record.receiptId).not.toBe(firstScopeSecond.receiptId);
+  });
+
+  it("never promotes a later FIFO receipt over a missing predecessor", async () => {
+    const { redis, store, prefix } = fixture();
+    const { senderHash, threadHash } = identities();
+    await activateInboxFifo(store);
+    const first = await persistScopeRecord(store, senderHash, threadHash, "fifo-gap-first");
+    const missing = await persistScopeRecord(store, senderHash, threadHash, "fifo-gap-missing");
+    const later = await persistScopeRecord(store, senderHash, threadHash, "fifo-gap-later");
+    const scopeQueueKey = `${prefix}:inbox:fifo:queue:${fifoScopeId(senderHash, threadHash)}`;
+    // Simulate a durable-store integrity loss after accepted receipt B. The
+    // scheduler must hold C rather than manufacture an order around B.
+    await redis.zRem(scopeQueueKey, missing.receiptId);
+    await redis.del(`${prefix}:inbox:${missing.receiptId}`);
+
+    const firstClaim = await store.claimNextInbox();
+    expect(firstClaim?.record.receiptId).toBe(first.receiptId);
+    if (!firstClaim) throw new Error("expected FIFO head before gap");
+    expect(await store.finishInbox(first.receiptId, firstClaim.leaseToken, "processed")).toBe(true);
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    await expect(store.readInbox(later.receiptId)).resolves.toMatchObject({ state: "received", scopeSequence: 3 });
+  });
+
+  it("fails closed when a corrupted global-ready index names a FIFO follower before its head", async () => {
+    const { redis, store, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    await activateInboxFifo(store);
+    const first = await persistScopeRecord(store, senderHash, threadHash, "fifo-global-gap-first");
+    const second = await persistScopeRecord(store, senderHash, threadHash, "fifo-global-gap-second");
+    const readyKey = `${prefix}:inbox:ready`;
+
+    // Simulate an index corruption that makes B look schedulable while A is
+    // still the durable scope head. The scheduler must stop, not claim B.
+    await redis.zRem(readyKey, first.receiptId);
+    await redis.zAdd(readyKey, [{ score: now(), value: second.receiptId }]);
+
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    await expect(store.readInbox(first.receiptId)).resolves.toMatchObject({ state: "received", scopeSequence: 1 });
+    await expect(store.readInbox(second.receiptId)).resolves.toMatchObject({ state: "received", scopeSequence: 2 });
+  });
+
+  it("fails closed on duplicate or malformed FIFO head scores instead of using member sort order", async () => {
+    const { redis, store, prefix } = fixture();
+    const { senderHash, threadHash } = identities();
+    await activateInboxFifo(store);
+    const first = await persistScopeRecord(store, senderHash, threadHash, "fifo-duplicate-score-first");
+    const second = await persistScopeRecord(store, senderHash, threadHash, "fifo-duplicate-score-second");
+    const scopeQueueKey = `${prefix}:inbox:fifo:queue:${fifoScopeId(senderHash, threadHash)}`;
+
+    // Redis ZSET ties sort by member. That must never become an ordering
+    // decision, so a duplicated receipt sequence blocks the scope entirely.
+    await redis.zAdd(scopeQueueKey, [{ score: first.scopeSequence, value: second.receiptId }]);
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    await expect(store.readInbox(first.receiptId)).resolves.toMatchObject({ state: "received" });
+
+    // Restore the second score only to isolate malformed-head behavior.
+    await redis.zAdd(scopeQueueKey, [{ score: second.scopeSequence, value: second.receiptId }]);
+    await redis.zRem(scopeQueueKey, first.receiptId);
+    await redis.zAdd(scopeQueueKey, [{ score: first.scopeSequence, value: "not-an-opaque-receipt-id" }]);
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+  });
+
+  it("rejects FIFO persistence at the JavaScript safe-integer sequence boundary", async () => {
+    const { redis, store, prefix } = fixture();
+    const { senderHash, threadHash } = identities();
+    await activateInboxFifo(store);
+    await redis.set(
+      `${prefix}:inbox:scope-sequence:${senderHash}:${threadHash}`,
+      String(Number.MAX_SAFE_INTEGER),
+    );
+
+    await expect(persistScopeRecord(store, senderHash, threadHash, "fifo-safe-integer-exhausted"))
+      .rejects.toThrow("durable inbox publication could not be confirmed");
+  });
+
+  it("uses holding as a no-claim migration barrier and refuses activation on an invalid head", async () => {
+    const { redis, store, prefix } = fixture();
+    const { senderHash, threadHash } = identities();
+    const legacy = await persistScopeRecord(store, senderHash, threadHash, "fifo-legacy-not-drained");
+    await expect(store.beginInboxFifoMigration()).resolves.toEqual({ kind: "legacy_not_drained" });
+    const legacyClaim = await store.claimNextInbox();
+    if (!legacyClaim) throw new Error("expected legacy receipt");
+    expect(await store.finishInbox(legacy.receiptId, legacyClaim.leaseToken, "processed")).toBe(true);
+
+    await expect(store.beginInboxFifoMigration()).resolves.toEqual({ kind: "holding" });
+    const held = await persistScopeRecord(store, senderHash, threadHash, "fifo-held-receipt");
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    await expect(store.getInboxFifoMigrationStatus()).resolves.toEqual({
+      kind: "current",
+      phase: "holding",
+      holdingScopes: 1,
+    });
+    await redis.del(`${prefix}:inbox:${held.receiptId}`);
+    await expect(store.prepareInboxFifoHoldingScopes()).resolves.toEqual({ kind: "blocked", preparedScopes: 0 });
+    await expect(store.activateInboxFifoMigration()).resolves.toEqual({ kind: "holding_not_prepared" });
+  });
+
+  it("publishes a validated holding head only after the barrier is prepared and activated", async () => {
+    const { store } = fixture();
+    const { senderHash, threadHash } = identities();
+    await expect(store.beginInboxFifoMigration()).resolves.toEqual({ kind: "holding" });
+    const first = await persistScopeRecord(store, senderHash, threadHash, "fifo-holding-first");
+    const second = await persistScopeRecord(store, senderHash, threadHash, "fifo-holding-second");
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    await expect(store.prepareInboxFifoHoldingScopes()).resolves.toEqual({
+      kind: "prepared",
+      preparedScopes: 1,
+      remainingScopes: 0,
+    });
+    // Preparation may populate the global scheduler, but holding remains a
+    // complete execution barrier until the one-way activation succeeds.
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    await expect(store.activateInboxFifoMigration()).resolves.toEqual({ kind: "activated" });
+
+    const firstClaim = await store.claimNextInbox();
+    expect(firstClaim?.record.receiptId).toBe(first.receiptId);
+    if (!firstClaim) throw new Error("expected prepared FIFO head");
+    expect(await store.finishInbox(first.receiptId, firstClaim.leaseToken, "processed")).toBe(true);
+    const secondClaim = await store.claimNextInbox();
+    expect(secondClaim?.record.receiptId).toBe(second.receiptId);
+  });
+
+  it("requires a newly received holding scope to be prepared before activation", async () => {
+    const { store } = fixture();
+    const { senderHash, threadHash } = identities();
+    const secondThreadHash = hashThreadIdentifier(identitySecret, "iMessage;-;+14155550199\u0000+14155550001");
+    await expect(store.beginInboxFifoMigration()).resolves.toEqual({ kind: "holding" });
+
+    const firstScope = await persistScopeRecord(store, senderHash, threadHash, "fifo-holding-before-prepare");
+    await expect(store.prepareInboxFifoHoldingScopes()).resolves.toEqual({
+      kind: "prepared",
+      preparedScopes: 1,
+      remainingScopes: 0,
+    });
+
+    // Webhooks continue to be receipt-durable during the operator cutover.
+    // A new scope must reopen preparation rather than racing into FIFO.
+    const secondScope = await persistScopeRecord(store, senderHash, secondThreadHash, "fifo-holding-after-prepare");
+    await expect(store.activateInboxFifoMigration()).resolves.toEqual({ kind: "holding_not_prepared" });
+    await expect(store.claimNextInbox()).resolves.toBeNull();
+    await expect(store.prepareInboxFifoHoldingScopes()).resolves.toEqual({
+      kind: "prepared",
+      preparedScopes: 1,
+      remainingScopes: 0,
+    });
+    await expect(store.activateInboxFifoMigration()).resolves.toEqual({ kind: "activated" });
+
+    const firstClaim = await store.claimNextInbox();
+    if (!firstClaim) throw new Error("expected a prepared holding head");
+    expect([firstScope.receiptId, secondScope.receiptId]).toContain(firstClaim.record.receiptId);
+    expect(await store.finishInbox(firstClaim.record.receiptId, firstClaim.leaseToken, "processed")).toBe(true);
+
+    const secondClaim = await store.claimNextInbox();
+    if (!secondClaim) throw new Error("expected the other prepared holding head");
+    expect([firstScope.receiptId, secondScope.receiptId]).toContain(secondClaim.record.receiptId);
+    expect(secondClaim.record.receiptId).not.toBe(firstClaim.record.receiptId);
   });
 
   it("uses tombstones for cancel and maintenance while allowing a genuinely later receipt", async () => {
@@ -1714,6 +1995,7 @@ describe("Air v2 studio durable store", () => {
     });
     expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
     expect(await activeStore.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+    await activateInboxFifo(activeStore);
     const policy = Object.freeze({ budgetId: "fal-zero-canary-budget", totalCapCents: 100, falCapCents: 0 });
     const candidate = job(cipher, senderHash, threadHash, "canary-fal-subcap", now(), activeStamp, 1, "fal");
     const notifications = initialNotifications({ tapback: true });
@@ -1731,6 +2013,42 @@ describe("Air v2 studio durable store", () => {
     expect(await redis.get(`${prefix}:outbox:${notifications.acknowledgement.outboxId}`)).toBeNull();
     const budgetKey = `${prefix}:canary:budget:${deriveOpaqueId(identitySecret, "studio-canary-budget", policy.budgetId)}`;
     expect(await redis.get(budgetKey)).toBeNull();
+  });
+
+  it("atomically requires durable FIFO for a new active iMessage admission", async () => {
+    const { redis, store: darkStore, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const activeStamp: StudioReleaseStamp = { generation: 1, phase: "canary" };
+    const activeStore = new StudioStore({
+      redis,
+      cipher,
+      identityHashSecret: identitySecret,
+      prefix,
+      clock: now,
+      releaseStamp: activeStamp,
+    });
+    expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+    expect(await activeStore.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+    const candidate = job(cipher, senderHash, threadHash, "fifo-admission-gate", now(), activeStamp);
+    const notifications = initialNotifications({ tapback: true });
+    const input = {
+      job: candidate,
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+      canaryBudget: { budgetId: "fifo-admission-gate-budget", totalCapCents: 100, falCapCents: 0 },
+      ...notifications,
+    } as const;
+
+    await expect(activeStore.admitJobWithInitialNotifications(input))
+      .resolves.toEqual({ admitted: false, reason: "inbox_fifo_required" });
+    expect(await redis.get(`${prefix}:job:${candidate.jobId}`)).toBeNull();
+    expect(await redis.get(`${prefix}:outbox:${notifications.acknowledgement.outboxId}`)).toBeNull();
+
+    await activateInboxFifo(activeStore);
+    await expect(activeStore.admitJobWithInitialNotifications(input))
+      .resolves.toMatchObject({ admitted: true, job: { jobId: candidate.jobId } });
   });
 
   it("never reserves a canary budget from dark or fence-blocked admission", async () => {
