@@ -266,7 +266,14 @@ describe("Air iMessage webhook", () => {
         enableLinkPreview: false,
       }),
     );
-    expect(getClient).toHaveBeenCalledWith("+14155550999");
+    expect(getClient).toHaveBeenCalledWith(
+      "+14155550999",
+      expect.objectContaining({
+        deadlineAtMs: expect.any(Number),
+        minimumPhysicalActionRemainingMs: expect.any(Number),
+        minimumDeliveryPreparationRemainingMs: expect.any(Number),
+      }),
+    );
     expect(submit).not.toHaveBeenCalled();
     expect(await store.getActiveJob(createSenderIdentity(identitySecret, senderId).senderHash)).toBeNull();
   });

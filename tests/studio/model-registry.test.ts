@@ -260,6 +260,119 @@ describe("Air model registry", () => {
     expect(() => registry([broadOutputPath])).toThrow(ModelRegistryValidationError);
   });
 
+  it("keeps enabled model locations and USD-cent reservations canonical", () => {
+    const unsafeHostedInput = verifiedAnimateModel({
+      inputHosting: { mode: "hosted-public", host: "storage.example.test", pathPrefix: "/air-input//other/" },
+      hostedPublicInputAcknowledged: true,
+    });
+    expect(() => registry([unsafeHostedInput])).toThrow(ModelRegistryValidationError);
+
+    const ambiguousOutputPrefix = verifiedAnimateModel({
+      outputRetrieval: {
+        host: "storage.example.test",
+        pathPrefix: "/air-output",
+        access: "signed-url",
+        publiclyAccessible: false,
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("missing-output-trailing-slash"),
+      },
+    });
+    expect(() => registry([ambiguousOutputPrefix])).toThrow(ModelRegistryValidationError);
+
+    const encodedOutputPrefix = verifiedAnimateModel({
+      outputRetrieval: {
+        host: "storage.example.test",
+        pathPrefix: "/air-output/%2f/",
+        access: "signed-url",
+        publiclyAccessible: false,
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("encoded-output-prefix"),
+      },
+    });
+    expect(() => registry([encodedOutputPrefix])).toThrow(ModelRegistryValidationError);
+
+    const numericHostedInput = verifiedAnimateModel({
+      inputHosting: { mode: "hosted-public", host: "169.254.169.254", pathPrefix: "/air-input/" },
+      hostedPublicInputAcknowledged: true,
+    });
+    expect(() => registry([numericHostedInput])).toThrow(ModelRegistryValidationError);
+
+    const numericOutputHost = verifiedAnimateModel({
+      outputRetrieval: {
+        host: "169.254.169.254",
+        pathPrefix: "/air-output/",
+        access: "signed-url",
+        publiclyAccessible: false,
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("numeric-output-host"),
+      },
+    });
+    expect(() => registry([numericOutputHost])).toThrow(ModelRegistryValidationError);
+
+    const legacyNumericOutputHost = verifiedAnimateModel({
+      outputRetrieval: {
+        host: "127.1",
+        pathPrefix: "/air-output/",
+        access: "signed-url",
+        publiclyAccessible: false,
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("legacy-numeric-output-host"),
+      },
+    });
+    expect(() => registry([legacyNumericOutputHost])).toThrow(ModelRegistryValidationError);
+
+    const nonUsdEnabled = verifiedAnimateModel({
+      pricing: {
+        source: "https://catalog.example.test/pricing/verified-test-video",
+        currency: "EUR",
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("non-usd-enabled-pricing"),
+        quotes: [
+          { count: 1, durationSeconds: 5, maximumQuotedCostCents: 25 },
+          { count: 1, durationSeconds: 10, maximumQuotedCostCents: 50 },
+          { count: 2, durationSeconds: 5, maximumQuotedCostCents: 50 },
+          { count: 2, durationSeconds: 10, maximumQuotedCostCents: 100 },
+        ],
+      },
+    });
+    expect(() => registry([nonUsdEnabled])).toThrow(ModelRegistryValidationError);
+
+    const zeroReservationEnabled = verifiedAnimateModel({
+      pricing: {
+        source: "https://catalog.example.test/pricing/verified-test-video",
+        currency: "USD",
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("zero-reservation-enabled-pricing"),
+        quotes: [
+          { count: 1, durationSeconds: 5, maximumQuotedCostCents: 0 },
+          { count: 1, durationSeconds: 10, maximumQuotedCostCents: 50 },
+          { count: 2, durationSeconds: 5, maximumQuotedCostCents: 50 },
+          { count: 2, durationSeconds: 10, maximumQuotedCostCents: 100 },
+        ],
+      },
+    });
+    expect(() => registry([zeroReservationEnabled])).toThrow(ModelRegistryValidationError);
+
+    // Catalog discoveries remain recordable before a reviewer supplies a
+    // USD conversion/paid-cap policy and explicitly enables a model.
+    const nonUsdDiscovery = verifiedAnimateModel({
+      status: "unavailable",
+      pricing: {
+        source: "https://catalog.example.test/pricing/verified-test-video",
+        currency: "EUR",
+        verifiedAt: "2026-07-18T00:00:00Z",
+        evidenceFingerprint: sha256Fixture("non-usd-discovery-pricing"),
+        quotes: [
+          { count: 1, durationSeconds: 5, maximumQuotedCostCents: 0 },
+          { count: 1, durationSeconds: 10, maximumQuotedCostCents: 0 },
+          { count: 2, durationSeconds: 5, maximumQuotedCostCents: 0 },
+          { count: 2, durationSeconds: 10, maximumQuotedCostCents: 0 },
+        ],
+      },
+    });
+    expect(() => registry([nonUsdDiscovery])).not.toThrow();
+  });
+
   it("requires a reviewed, provider-bound contract and immutable pricing evidence", () => {
     const catalog = registry([verifiedAnimateModel()]);
     const model = catalog.models[0];

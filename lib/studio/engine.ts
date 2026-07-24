@@ -28,6 +28,7 @@ import {
   isSafeTransportText,
   type IMessageThreadReference,
   type StudioIMessageTransport,
+  type StudioTransportOperationOptions,
   type TransportOutcome,
 } from "./imessage-transport.js";
 import { getStudioDeliveryTransport, type StudioRuntime } from "./runtime.js";
@@ -44,7 +45,6 @@ import type {
 } from "./store.js";
 import { createStudioJob, isJobQueueEligibleState } from "./store.js";
 import {
-  advanceStudioProviderResultLifecycle,
   authorizeStudioJobResultDispatch,
   reconcileStudioJobResultDelivery,
   type StudioProviderResultLifecycleResult,
@@ -63,6 +63,15 @@ const MAX_JOBS_PER_DRAIN = 8;
 const JOB_RECHECK_DELAY_MS = 60_000;
 const TYPING_DWELL_MS = 300;
 const MEDIA_FIRST_CORRECTION_DELAY_MS = 500;
+/** Vercel hard-stops the route at 60 seconds; retain room for persistence. */
+const DRAIN_INVOCATION_BUDGET_MS = 50_000;
+/** Never begin a physical Photon message without its full bounded window. */
+const OUTBOX_START_RESERVE_MS = 36_000;
+/** After bounded token setup, a send still needs RPC + typing cleanup room. */
+const OUTBOX_PHYSICAL_ACTION_MARGIN_MS = 22_000;
+const INBOX_START_RESERVE_MS = 1_000;
+/** GMI's direct queue operation is bounded at 12s; leave persistence headroom. */
+const JOB_START_RESERVE_MS = 20_000;
 
 const HELP_TEXT = [
   "Air commands:",
@@ -120,23 +129,67 @@ export interface StudioDrainStats {
   readonly outbox: number;
 }
 
+export interface StudioDrainBudgetOptions {
+  /** Test-only clock injection; production uses the current wall clock. */
+  readonly now?: (() => number) | undefined;
+  /** Test-only explicit absolute cutoff. */
+  readonly deadlineAtMs?: number | undefined;
+}
+
+/**
+ * A single deadline shared by inbox, outbox, and job phases.  It is not a
+ * queue deadline: stopping here leaves every unstarted durable record for the
+ * following minute Cron.
+ */
+export interface StudioDrainBudget {
+  readonly deadlineAtMs: number;
+  remainingMs(): number;
+  canStart(minimumRemainingMs: number): boolean;
+  transportOptions(): StudioTransportOperationOptions;
+}
+
+export function createStudioDrainBudget(options: StudioDrainBudgetOptions = {}): StudioDrainBudget {
+  const now = options.now ?? Date.now;
+  const startedAtMs = now();
+  const deadlineAtMs = options.deadlineAtMs ?? startedAtMs + DRAIN_INVOCATION_BUDGET_MS;
+  if (!Number.isSafeInteger(startedAtMs) || !Number.isSafeInteger(deadlineAtMs)) {
+    throw new Error("invalid_studio_drain_deadline");
+  }
+  const remainingMs = (): number => Math.max(0, deadlineAtMs - now());
+  return Object.freeze({
+    deadlineAtMs,
+    remainingMs,
+    canStart(minimumRemainingMs: number): boolean {
+      return Number.isSafeInteger(minimumRemainingMs) && minimumRemainingMs > 0 && remainingMs() >= minimumRemainingMs;
+    },
+    transportOptions(): StudioTransportOperationOptions {
+      return Object.freeze({
+        deadlineAtMs,
+        minimumPhysicalActionRemainingMs: OUTBOX_PHYSICAL_ACTION_MARGIN_MS,
+        minimumDeliveryPreparationRemainingMs: OUTBOX_START_RESERVE_MS,
+      });
+    },
+  });
+}
+
 /**
  * Authoritative bounded worker entrypoint. The minute Vercel Cron invokes it;
  * webhook-triggered work is only a latency hint. It is deliberately safe to
  * run more than once because receipts and outbox IDs are stable.
  */
-export async function drainStudio(runtime: StudioRuntime): Promise<void> {
-  await drainStudioWithStats(runtime);
-  await drainStudioJobs(runtime);
-  // A webhook-triggered drain can now publish a completed result during the
-  // job phase. Run one bounded second outbox pass so its ordered preamble and
-  // attachment do not need to wait for the next minute Cron.
-  await drainStudioOutbox(runtime);
+export async function drainStudio(runtime: StudioRuntime, budget = createStudioDrainBudget()): Promise<void> {
+  await drainStudioWithStats(runtime, budget);
+  if (!budget.canStart(JOB_START_RESERVE_MS)) return;
+  await drainStudioJobs(runtime, budget);
 }
 
-export async function drainStudioWithStats(runtime: StudioRuntime): Promise<StudioDrainStats> {
+export async function drainStudioWithStats(
+  runtime: StudioRuntime,
+  budget = createStudioDrainBudget(),
+): Promise<StudioDrainStats> {
   let inbox = 0;
   for (let index = 0; index < MAX_INBOX_PER_DRAIN; index += 1) {
+    if (!budget.canStart(INBOX_START_RESERVE_MS)) break;
     const claim = await runtime.store.claimNextInbox();
     if (!claim) break;
 
@@ -157,7 +210,7 @@ export async function drainStudioWithStats(runtime: StudioRuntime): Promise<Stud
     }
   }
 
-  return Object.freeze({ inbox, outbox: await drainStudioOutbox(runtime) });
+  return Object.freeze({ inbox, outbox: await drainStudioOutbox(runtime, budget) });
 }
 
 /**
@@ -168,7 +221,10 @@ export async function drainStudioWithStats(runtime: StudioRuntime): Promise<Stud
  * The default runtime cannot enter this loop: both the release policy and a
  * reviewed provider adapter must be explicitly active first.
  */
-export async function drainStudioJobs(runtime: StudioRuntime): Promise<number> {
+export async function drainStudioJobs(
+  runtime: StudioRuntime,
+  budget = createStudioDrainBudget(),
+): Promise<number> {
   // The version is a release binding, not a display-only readiness signal.
   // Do not submit, poll, or fetch a provider result through an injected or
   // stale runtime when its configured registry version differs from the
@@ -186,6 +242,7 @@ export async function drainStudioJobs(runtime: StudioRuntime): Promise<number> {
 
   let advanced = 0;
   for (let index = 0; index < MAX_JOBS_PER_DRAIN; index += 1) {
+    if (!budget.canStart(JOB_START_RESERVE_MS)) break;
     const claim = await runtime.store.claimNextJob();
     if (!claim) break;
     advanced += 1;
@@ -261,7 +318,13 @@ async function advanceClaimedStudioJob(
     return await reconcileStudioJobResultDelivery(runtime, current.jobId);
   }
   if (current.state !== "executing" || !mayRecover) return undefined;
-  return await advanceStudioProviderResultLifecycle(runtime, current.jobId);
+  // A fresh provider-result observation may serially perform a status GET,
+  // private artifact read/validation, Photon token mint, upload, and Redis
+  // finalization. That does not fit a proven Vercel Cron deadline yet. Leave
+  // the executing job durably scheduled rather than starting any part of that
+  // chain; `advanceStudioProviderResultLifecycle` carries the same defensive
+  // no-side-effect rule if it is ever called with deadline options directly.
+  return undefined;
 }
 
 /**
@@ -269,15 +332,26 @@ async function advanceClaimedStudioJob(
  * it exits before claiming any intent, which preserves every durable intent
  * for the later verified transport/release gate.
  */
-export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number> {
+export async function drainStudioOutbox(
+  runtime: StudioRuntime,
+  budget = createStudioDrainBudget(),
+): Promise<number> {
   if (!canDeliverStudioMessages(runtime.environment)) return 0;
+  // Do not start a token mint (or claim an intent) when there is no complete
+  // bounded message window left in this Vercel invocation.
+  if (!budget.canStart(OUTBOX_START_RESERVE_MS)) return 0;
 
   // Photon credential issuance is intentionally deferred until a durable
   // outbox drain. A failed mint happens before any physical message RPC, so
   // leave every intent untouched for the next bounded recovery attempt.
   let transport: StudioIMessageTransport;
   try {
-    transport = await getStudioDeliveryTransport(runtime);
+    const resolved = await awaitWithinDrainBudget(
+      () => getStudioDeliveryTransport(runtime, budget.transportOptions()),
+      budget,
+    );
+    if (resolved.kind === "expired") return 0;
+    transport = resolved.value;
   } catch {
     return 0;
   }
@@ -285,8 +359,22 @@ export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number>
 
   let delivered = 0;
   for (let index = 0; index < MAX_OUTBOX_PER_DRAIN; index += 1) {
+    if (!budget.canStart(OUTBOX_PHYSICAL_ACTION_MARGIN_MS)) break;
     const claim = await runtime.store.claimNextOutbox();
     if (!claim) break;
+
+    // A slow Redis claim may consume the last window. No Photon method has
+    // been invoked, so return the intent to its normal retry-safe state.
+    if (!budget.canStart(OUTBOX_PHYSICAL_ACTION_MARGIN_MS)) {
+      try {
+        await runtime.store.deferOutboxBeforePhoton(claim.record.outboxId, claim.leaseToken);
+      } catch {
+        // If this best-effort rollback cannot persist before the invocation
+        // cutoff, the existing lease-expiry reconciliation stays
+        // conservative rather than guessing a delivery outcome.
+      }
+      break;
+    }
 
     let payload: StudioOutboxPayload;
     try {
@@ -301,11 +389,28 @@ export async function drainStudioOutbox(runtime: StudioRuntime): Promise<number>
       await runtime.store.finishOutbox(claim.record.outboxId, claim.leaseToken, "failed");
       continue;
     }
-    const outcome = await dispatchOutboxEntry(runtime, transport, claim.record, claim.leaseToken, payload);
+    const outcome = await dispatchOutboxEntry(
+      runtime,
+      transport,
+      claim.record,
+      claim.leaseToken,
+      payload,
+      budget,
+    );
     // A dark/rollback guard can revoke a media acknowledgement after its
     // queue claim but before the physical iMessage send. The store has already
     // terminalized that intent as canceled, so there is nothing to finish.
     if (outcome === null) continue;
+    if (outcome.kind === "deferred_before_photon") {
+      try {
+        await runtime.store.deferOutboxBeforePhoton(claim.record.outboxId, claim.leaseToken);
+      } catch {
+        // No Photon operation was started. If Redis cannot persist this
+        // narrow rollback, leave the lease to the existing conservative
+        // recovery path rather than guessing a delivery outcome.
+      }
+      break;
+    }
     const finished = await runtime.store.finishOutbox(claim.record.outboxId, claim.leaseToken, outcome.kind);
     if (finished) delivered += 1;
     if (finished && claim.record.lane === "job-result" && claim.record.jobId !== undefined) {
@@ -557,14 +662,19 @@ async function handleCommand(
       await enqueueResponse(runtime, record, envelope, "help", HELP_TEXT);
       return "processed";
     case "privacy":
-      await enqueueResponse(runtime, record, envelope, "privacy", privacyText());
+      await enqueueResponse(runtime, record, envelope, "privacy", privacyText(studioRegistry(runtime)));
       return "processed";
     case "status":
       {
         const activeJob = await runtime.store.getActiveJob(record.senderHash);
+        const recentTerminalJob = activeJob === null
+          ? await runtime.store.getMostRecentTerminalJob(record.senderHash)
+          : null;
         const text = activeJob
           ? activeJobStatusText(activeJob)
-          : "No active or recent jobs are available in this deployment. Use /help for the command reference.";
+          : recentTerminalJob
+            ? recentTerminalJobStatusText(recentTerminalJob)
+            : "No active or recent jobs are available in this deployment. Use /help for the command reference.";
         await enqueueResponse(
           runtime,
           record,
@@ -583,7 +693,7 @@ async function handleCommand(
         record,
         envelope,
         `models-${command.mode ?? "all"}`,
-        modelsText(command.mode, studioRegistry(runtime)),
+        modelsText(settings, command.mode, studioRegistry(runtime)),
       );
       return "processed";
     case "model-settings":
@@ -1074,9 +1184,36 @@ function modelSupportsStoredValues(model: StudioModel, settings: StoredModeSetti
   return settings.durationSeconds !== undefined && model.output.supportedDurationSeconds.includes(settings.durationSeconds);
 }
 
-function modelsText(mode: StudioMode | null, registry: AirModelRegistry = AIR_MODEL_REGISTRY): string {
-  const models = listEnabledModels(registry, mode);
+/**
+ * A model that cannot honor the caller's already-saved count/duration is not
+ * selectable without an explicit settings change, so do not advertise it as
+ * compatible in `/models`. This preserves the no-implicit-reset contract.
+ */
+function compatibleModelsForSettings(
+  settings: StudioUserSettings,
+  mode: StudioMode,
+  registry: AirModelRegistry = AIR_MODEL_REGISTRY,
+): readonly StudioModel[] {
+  return listEnabledModels(registry, mode).filter((model) => modelSupportsStoredValues(model, settings.modes[mode]));
+}
+
+function modelsText(
+  settings: StudioUserSettings,
+  mode: StudioMode | null,
+  registry: AirModelRegistry = AIR_MODEL_REGISTRY,
+): string {
+  const modes = mode === null ? (['imagine', 'animate', 'edit-image', 'edit-video'] as const) : [mode];
+  const models = modes.flatMap((candidateMode) => compatibleModelsForSettings(settings, candidateMode, registry));
   if (models.length === 0) {
+    const enabled = listEnabledModels(registry, mode);
+    if (enabled.length > 0) {
+      if (mode !== null) {
+        return `No enabled ${mode} model is compatible with your saved settings. Use /model-settings ${mode} to review the exact supported values.`;
+      }
+      const enabledModes = modes.filter((candidateMode) => listEnabledModels(registry, candidateMode).length > 0);
+      const commands = enabledModes.map((candidateMode) => `/model-settings ${candidateMode}`);
+      return `No enabled model is compatible with your saved settings. Use ${commands.join(", ")} to review the exact supported values.`;
+    }
     return mode === null
       ? "No verified models are enabled in this deployment. Candidate names are not selectable until catalog, schema, price, and privacy review complete."
       : noModelText(mode);
@@ -1106,11 +1243,43 @@ function modeSettingsText(
     ? `, duration ${values.durationSeconds ?? DEFAULT_VIDEO_DURATION_SECONDS}s`
     : "";
   const aspectRatio = selected ? `, aspect ${selected.output.lockedAspectRatio}` : "";
-  const choices = listEnabledModels(registry, mode);
-  const choiceText = choices.length > 0
-    ? ` Models: ${choices.map((candidate) => candidate.slug).join(", ")}.`
-    : " No verified models enabled.";
-  return `${mode}: ${model}; count ${values.outputCount}${duration}${aspectRatio}.${choiceText}`;
+  const enabled = listEnabledModels(registry, mode);
+  const compatible = compatibleModelsForSettings(settings, mode, registry);
+  const choiceText = compatible.length > 0
+    ? ` Compatible models: ${compatible.map(modelChoiceSummary).join(" • ")}.`
+    : enabled.length > 0
+      ? ` No enabled model is compatible with the saved count/duration. Use the exact values shown by /model-settings ${mode}.`
+      : " No verified models enabled.";
+  return `${mode}: ${model}; count ${values.outputCount}${duration}${aspectRatio}. ${choiceText}\n${settingsExamplesText(settings, mode, compatible)}`;
+}
+
+function modelChoiceSummary(model: StudioModel): string {
+  const duration = model.output.type === "video"
+    ? `; durations ${model.output.supportedDurationSeconds.join(", ")}s`
+    : "";
+  return `${model.slug} (counts ${model.output.supportedOutputCounts.join(", ")}${duration}; aspect ${model.output.lockedAspectRatio})`;
+}
+
+/**
+ * Keep examples literal and directly parsable. They use an already-compatible
+ * model slug, never a placeholder or a model which would trigger a hidden
+ * count/duration reset.
+ */
+function settingsExamplesText(
+  settings: StudioUserSettings,
+  mode: StudioMode,
+  compatible: readonly StudioModel[],
+): string {
+  const values = settings.modes[mode];
+  const examples: string[] = [];
+  const model = compatible[0];
+  if (model !== undefined) examples.push(`/model-settings ${mode} ${model.slug}`);
+  examples.push(`/model-settings ${mode} count ${values.outputCount}`);
+  if (mode === "animate" || mode === "edit-video") {
+    examples.push(`/model-settings ${mode} duration ${values.durationSeconds ?? DEFAULT_VIDEO_DURATION_SECONDS}`);
+  }
+  examples.push(`/model-settings reset ${mode}`);
+  return `Examples: ${examples.join(" • ")}`;
 }
 
 function supportedValuesText(model: StudioModel): string {
@@ -1165,8 +1334,41 @@ function activeJobStatusText(job: StudioJobRecord): string {
   }
 }
 
-function privacyText(): string {
-  return "Air is private and allowlist-only. This deployment accepts no generation work and is not sending media to a generation provider. Any later approved path must disclose provider retention terms and limit Air-owned accepted-work references to 24 hours. Avoid sending sensitive media.";
+/** `/status` may report a caller's terminal job, but never provider internals. */
+function recentTerminalJobStatusText(job: StudioJobRecord): string {
+  switch (job.state) {
+    case "delivered":
+      return "Your most recent request was delivered.";
+    case "failed":
+      return "Your most recent request ended without a delivered result.";
+    case "canceled":
+      return "Your most recent request was canceled.";
+    case "maintenance_rejected":
+      return "Your most recent request was not accepted. No generation was submitted.";
+    default:
+      // `getMostRecentTerminalJob` filters the state, but do not make a
+      // stale/corrupt record look like a known terminal outcome.
+      return "Your most recent request is changing state. Send /status again shortly for a truthful update.";
+  }
+}
+
+function privacyText(registry: AirModelRegistry = AIR_MODEL_REGISTRY): string {
+  const enabled = listEnabledModels(registry);
+  if (enabled.length === 0) {
+    return "Air is private and allowlist-only. This deployment accepts no generation work and is not sending media to a generation provider. Air keeps its own accepted-work media references for up to 24 hours; any later approved path must disclose provider retention and hosted-public input terms. Avoid sending sensitive media.";
+  }
+
+  const hostedPublic = enabled.filter((model) => model.inputHosting.mode === "hosted-public");
+  const common = "Air is private and allowlist-only. Air keeps its own accepted-work media references for up to 24 hours. Providers process media under their own retention terms; Air does not promise provider-side deletion.";
+  if (hostedPublic.length === 0) {
+    return `${common} The enabled models do not use a stable publicly accessible provider-hosted input path. Avoid sending sensitive media.`;
+  }
+
+  const paths = hostedPublic.map((model) => {
+    if (model.inputHosting.mode !== "hosted-public") return "";
+    return `${model.slug}: ${model.inputHosting.host}${model.inputHosting.pathPrefix}`;
+  }).filter((path) => path.length > 0);
+  return `${common} The following enabled models can place input media at a provider-hosted publicly accessible path during processing: ${paths.join("; ")}. Do not send sensitive media.`;
 }
 
 async function enqueueMaintenanceNotice(
@@ -1266,13 +1468,85 @@ function stableJobId(receiptId: string): string {
   return createHash("sha256").update(`air:v2:job:${receiptId}`, "utf8").digest("hex");
 }
 
+type DrainDeadlineResult<T> =
+  | { readonly kind: "completed"; readonly value: T }
+  | { readonly kind: "expired" };
+
+/**
+ * A strictly local worker result: shared-Cron time expired before any Photon
+ * RPC started, so its claim may be safely returned without consuming a
+ * physical-send attempt. This is not a transport outcome and is never used
+ * for a real retryable Photon failure.
+ */
+type PrePhotonDeadlineDeferral = {
+  readonly kind: "deferred_before_photon";
+  readonly code: string;
+};
+
+type OutboxDispatchOutcome = TransportOutcome | PrePhotonDeadlineDeferral | null;
+
+// Text and prepared-output flows invoke best-effort typing first, so even a
+// later send preflight result cannot prove that no Photon RPC happened. A
+// tapback has no earlier Photon boundary and its direct binding emits this
+// code only when it refused to start the reaction RPC.
+const PRE_PHOTON_DEADLINE_CODES = new Set([
+  "photon_tapback_deadline_exhausted",
+]);
+
+function deadlineDeferral(code: string): PrePhotonDeadlineDeferral {
+  return Object.freeze({ kind: "deferred_before_photon", code });
+}
+
+function classifyPrePhotonDeadlineOutcome(outcome: TransportOutcome): TransportOutcome | PrePhotonDeadlineDeferral {
+  if (outcome.kind === "retryable_failure" && PRE_PHOTON_DEADLINE_CODES.has(outcome.code)) {
+    return deadlineDeferral(outcome.code);
+  }
+  return outcome;
+}
+
+/**
+ * A generic injected transport may not understand Air's optional deadline.
+ * Race it here as a final worker guard. The operation is supplied as a thunk
+ * so an elapsed budget never even invokes a physical transport method.
+ */
+async function awaitWithinDrainBudget<T>(
+  operation: () => Promise<T>,
+  budget: StudioDrainBudget,
+): Promise<DrainDeadlineResult<T>> {
+  const remainingMs = budget.remainingMs();
+  if (remainingMs < 1) return Object.freeze({ kind: "expired" });
+
+  return await new Promise<DrainDeadlineResult<T>>((resolve, reject) => {
+    const timeout = setTimeout(() => resolve(Object.freeze({ kind: "expired" })), remainingMs);
+    let operationPromise: Promise<T>;
+    try {
+      operationPromise = Promise.resolve().then(operation);
+    } catch (error) {
+      clearTimeout(timeout);
+      reject(error);
+      return;
+    }
+    void operationPromise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(Object.freeze({ kind: "completed", value }));
+      },
+      (error: unknown) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function dispatchOutboxEntry(
   runtime: StudioRuntime,
   transport: StudioIMessageTransport,
   record: StudioOutboxRecord,
   leaseToken: string,
   payload: StudioOutboxPayload,
-): Promise<TransportOutcome | null> {
+  budget: StudioDrainBudget,
+): Promise<OutboxDispatchOutcome> {
   if (record.lane === "job-result") {
     const authorization = await authorizeStudioJobResultDispatch(runtime, record);
     if (authorization === "defer") {
@@ -1287,9 +1561,25 @@ async function dispatchOutboxEntry(
 
   if (payload.kind === "tapback") {
     if (!payload.targetMessageId) return Object.freeze({ kind: "failed", code: "missing_tapback_target" });
-    if (!await runtime.store.authorizeOutboxDelivery(record, leaseToken)) return null;
+    const authorization = await awaitWithinDrainBudget(
+      () => runtime.store.authorizeOutboxDelivery(record, leaseToken),
+      budget,
+    );
+    if (authorization.kind === "expired") {
+      return deadlineDeferral("outbox_deadline_before_photon");
+    }
+    if (!authorization.value) return null;
+    if (!budget.canStart(OUTBOX_PHYSICAL_ACTION_MARGIN_MS)) {
+      return deadlineDeferral("outbox_deadline_before_photon");
+    }
     try {
-      return await transport.addLikeTapback(thread, payload.targetMessageId, idempotencyKey);
+      const outcome = await awaitWithinDrainBudget(
+        () => transport.addLikeTapback(thread, payload.targetMessageId, idempotencyKey, budget.transportOptions()),
+        budget,
+      );
+      return outcome.kind === "expired"
+        ? Object.freeze({ kind: "send_unknown", code: "tapback_dispatch_deadline_unknown" })
+        : classifyPrePhotonDeadlineOutcome(outcome.value);
     } catch {
       return Object.freeze({ kind: "send_unknown", code: "tapback_dispatch_unknown" });
     }
@@ -1297,36 +1587,77 @@ async function dispatchOutboxEntry(
 
   let typingStarted = false;
   try {
-    if (!await runtime.store.authorizeOutboxDelivery(record, leaseToken)) return null;
+    const initialAuthorization = await awaitWithinDrainBudget(
+      () => runtime.store.authorizeOutboxDelivery(record, leaseToken),
+      budget,
+    );
+    if (initialAuthorization.kind === "expired") {
+      return deadlineDeferral("outbox_deadline_before_photon");
+    }
+    if (!initialAuthorization.value) return null;
+    // Authorization is Redis-only. It can consume the shared window, but no
+    // Photon method has run yet, so return the claim without charging a
+    // physical-delivery attempt.
+    if (!budget.canStart(OUTBOX_PHYSICAL_ACTION_MARGIN_MS)) {
+      return deadlineDeferral("outbox_deadline_before_photon");
+    }
     try {
-      await transport.showTyping(thread);
-      typingStarted = true;
+      const typing = await awaitWithinDrainBudget(
+        () => transport.showTyping(thread, budget.transportOptions()),
+        budget,
+      );
+      typingStarted = typing.kind === "completed";
     } catch {
       // Typing is strictly best-effort and never blocks a durable message.
     }
-    await dwell(TYPING_DWELL_MS);
+    const dwellResult = await awaitWithinDrainBudget(() => dwell(TYPING_DWELL_MS), budget);
+    if (dwellResult.kind === "expired") {
+      return Object.freeze({ kind: "retryable_failure", code: "outbox_deadline_before_send" });
+    }
     // This second check closes the typing-dwell interval. The successful
     // authorization immediately below is the durable commitment point for
     // the following non-transactional transport call.
-    if (!await runtime.store.authorizeOutboxDelivery(record, leaseToken)) return null;
+    const sendAuthorization = await awaitWithinDrainBudget(
+      () => runtime.store.authorizeOutboxDelivery(record, leaseToken),
+      budget,
+    );
+    if (sendAuthorization.kind === "expired") {
+      return Object.freeze({ kind: "retryable_failure", code: "outbox_deadline_before_send" });
+    }
+    if (!sendAuthorization.value) return null;
+    if (!budget.canStart(OUTBOX_PHYSICAL_ACTION_MARGIN_MS)) {
+      return Object.freeze({ kind: "retryable_failure", code: "outbox_deadline_before_send" });
+    }
     if (payload.kind === "text") {
       if (!payload.text || !isSafeTransportText(payload.text)) {
         return Object.freeze({ kind: "failed", code: "invalid_text_payload" });
       }
-      return await transport.sendText(thread, payload.text, idempotencyKey);
+      const outcome = await awaitWithinDrainBudget(
+        () => transport.sendText(thread, payload.text, idempotencyKey, budget.transportOptions()),
+        budget,
+      );
+      return outcome.kind === "expired"
+        ? Object.freeze({ kind: "send_unknown", code: "transport_dispatch_deadline_unknown" })
+        : classifyPrePhotonDeadlineOutcome(outcome.value);
     }
     if (payload.kind !== "prepared-output" || !isStudioPreparedOutputTransport(transport)) {
       return Object.freeze({ kind: "failed", code: "prepared_output_transport_unavailable" });
     }
-    return await transport.sendPreparedOutput(thread, payload.output, idempotencyKey);
+    const outcome = await awaitWithinDrainBudget(
+      () => transport.sendPreparedOutput(thread, payload.output, idempotencyKey, budget.transportOptions()),
+      budget,
+    );
+    return outcome.kind === "expired"
+      ? Object.freeze({ kind: "send_unknown", code: "transport_dispatch_deadline_unknown" })
+      : classifyPrePhotonDeadlineOutcome(outcome.value);
   } catch {
     // A rejected send promise can occur after the transport accepted bytes, so
     // it is intentionally unknown rather than a retryable failure.
     return Object.freeze({ kind: "send_unknown", code: "transport_dispatch_unknown" });
   } finally {
-    if (typingStarted) {
+    if (typingStarted && budget.canStart(1)) {
       try {
-        await transport.stopTyping(thread);
+        await awaitWithinDrainBudget(() => transport.stopTyping(thread, budget.transportOptions()), budget);
       } catch {
         // No action: a failed stop must not alter the message outcome.
       }

@@ -4,7 +4,12 @@ import { createQueueCipher } from "../../lib/crypto.js";
 import { MemoryRedis } from "../../lib/redis.js";
 import { hashSenderIdentifier, hashThreadIdentifier } from "../../lib/security.js";
 import type { StudioEnvironment, StudioReleasePhase } from "../../lib/studio/config.js";
-import { drainStudioJobs, drainStudioOutbox, drainStudioWithStats } from "../../lib/studio/engine.js";
+import {
+  createStudioDrainBudget,
+  drainStudioJobs,
+  drainStudioOutbox,
+  drainStudioWithStats,
+} from "../../lib/studio/engine.js";
 import type { IMessageThreadReference, StudioIMessageTransport, TransportOutcome } from "../../lib/studio/imessage-transport.js";
 import { validateModelRegistry, type AirModelRegistry } from "../../lib/studio/model-registry.js";
 import { UnprovisionedStudioProvider, type StudioProviderPort } from "../../lib/studio/provider-port.js";
@@ -143,55 +148,77 @@ async function armFixtureReleaseFence(fixture: ReturnType<typeof createDarkFixtu
   expect(await fixture.store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
 }
 
-function reviewedImagineRegistry(): AirModelRegistry {
+function reviewedImagineRegistry(options: {
+  readonly hostedPublicInput?: boolean;
+  readonly includeIncompatibleImagine?: boolean;
+} = {}): AirModelRegistry {
+  const reviewedModel = {
+    displayName: "Reviewed GMI Imagine",
+    slug: "reviewed-gmi-imagine",
+    mode: "imagine",
+    provider: "gmi",
+    providerModelId: "reviewed-provider-image-model",
+    providerBinding: {
+      adapterKey: "gmi.test-adapter.v1",
+      requestSchemaFingerprint: "sha256:15c9c4c639d7a17e24f635771f2d8f39840e769eec92e9d5a2f6a5b864f74c9f",
+      resultSchemaFingerprint: "sha256:7c00f55d2774e6212e2c14f035d5096df824ad2f2430cf4960899258a893c5c7",
+    },
+    verification: {
+      verifiedAt: "2026-07-18T12:00:00Z",
+      catalogFingerprint: "sha256:0e1fc0e407a81cce262b73cb17d6e8709b12a038aee452ff77c11eaf5f01a4e0",
+      schemaFingerprint: "sha256:572f6d4c2e2da341c2f9465d3fd8c834a85f4a533e8bf452ec1c89d4a862fa82",
+    },
+    input: { prompt: "required", image: false, video: false, mediaOnly: false },
+    inputHosting: options.hostedPublicInput
+      ? { mode: "hosted-public", host: "inputs.example.test", pathPrefix: "/reviewed-air-input/" }
+      : { mode: "data-uri" },
+    output: {
+      type: "image",
+      maximumOutputCount: 1,
+      supportedOutputCounts: [1],
+      supportedDurationSeconds: [],
+      lockedAspectRatio: "1:1",
+    },
+    outputRetrieval: {
+      host: "storage.example.test",
+      pathPrefix: "/air-output/",
+      access: "signed-url",
+      publiclyAccessible: false,
+      verifiedAt: "2026-07-18T12:00:00Z",
+      evidenceFingerprint: "sha256:4ba1aa35208012ff19979eb847e0202d89d5e72634ff7bc8d97ed3370461ed4b",
+    },
+    requiredPayloadFields: [{ name: "prompt", declaredType: "string", required: true }],
+    pricing: {
+      source: "https://pricing.example.test/reviewed-gmi-imagine",
+      currency: "USD",
+      verifiedAt: "2026-07-18T12:00:00Z",
+      evidenceFingerprint: "sha256:69b7d0c3f7a681c18f1b8590ab3276d1c081ed510916e094d604284a7475e350",
+      quotes: [{ count: 1, durationSeconds: null, maximumQuotedCostCents: 25 }],
+    },
+    polling: { requestTimeoutMs: 5_000, pollIntervalMs: 1_000, maxPollAttempts: 3, deadlineMs: 15_000 },
+    status: "enabled",
+    hostedPublicInputAcknowledged: options.hostedPublicInput ?? false,
+  };
   return validateModelRegistry({
     schemaVersion: "air-model-registry/v1",
     registryVersion: "2.1.0",
-    models: [{
-      displayName: "Reviewed GMI Imagine",
-      slug: "reviewed-gmi-imagine",
-      mode: "imagine",
-      provider: "gmi",
-      providerModelId: "reviewed-provider-image-model",
-      providerBinding: {
-        adapterKey: "gmi.test-adapter.v1",
-        requestSchemaFingerprint: "sha256:15c9c4c639d7a17e24f635771f2d8f39840e769eec92e9d5a2f6a5b864f74c9f",
-        resultSchemaFingerprint: "sha256:7c00f55d2774e6212e2c14f035d5096df824ad2f2430cf4960899258a893c5c7",
-      },
-      verification: {
-        verifiedAt: "2026-07-18T12:00:00Z",
-        catalogFingerprint: "sha256:0e1fc0e407a81cce262b73cb17d6e8709b12a038aee452ff77c11eaf5f01a4e0",
-        schemaFingerprint: "sha256:572f6d4c2e2da341c2f9465d3fd8c834a85f4a533e8bf452ec1c89d4a862fa82",
-      },
-      input: { prompt: "required", image: false, video: false, mediaOnly: false },
-      inputHosting: { mode: "data-uri" },
-      output: {
-        type: "image",
-        maximumOutputCount: 1,
-        supportedOutputCounts: [1],
-        supportedDurationSeconds: [],
-        lockedAspectRatio: "1:1",
-      },
-      outputRetrieval: {
-        host: "storage.example.test",
-        pathPrefix: "/air-output/",
-        access: "signed-url",
-        publiclyAccessible: false,
-        verifiedAt: "2026-07-18T12:00:00Z",
-        evidenceFingerprint: "sha256:4ba1aa35208012ff19979eb847e0202d89d5e72634ff7bc8d97ed3370461ed4b",
-      },
-      requiredPayloadFields: [{ name: "prompt", declaredType: "string", required: true }],
-      pricing: {
-        source: "https://pricing.example.test/reviewed-gmi-imagine",
-        currency: "USD",
-        verifiedAt: "2026-07-18T12:00:00Z",
-        evidenceFingerprint: "sha256:69b7d0c3f7a681c18f1b8590ab3276d1c081ed510916e094d604284a7475e350",
-        quotes: [{ count: 1, durationSeconds: null, maximumQuotedCostCents: 25 }],
-      },
-      polling: { requestTimeoutMs: 5_000, pollIntervalMs: 1_000, maxPollAttempts: 3, deadlineMs: 15_000 },
-      status: "enabled",
-      hostedPublicInputAcknowledged: false,
-    }],
+    models: [
+      reviewedModel,
+      ...(options.includeIncompatibleImagine ? [{
+        ...reviewedModel,
+        displayName: "Two Output GMI Imagine",
+        slug: "two-output-gmi-imagine",
+        output: {
+          ...reviewedModel.output,
+          maximumOutputCount: 2,
+          supportedOutputCounts: [2],
+        },
+        pricing: {
+          ...reviewedModel.pricing,
+          quotes: [{ count: 2, durationSeconds: null, maximumQuotedCostCents: 50 }],
+        },
+      }] : []),
+    ],
     defaults: { imagine: "reviewed-gmi-imagine" },
   });
 }
@@ -434,6 +461,11 @@ describe("Air studio dark engine", () => {
       { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
       { transport: "photon", attachmentGuid: "already-uploaded-photon-guid" },
       expect.stringContaining("prepared-output-intent"),
+      expect.objectContaining({
+        deadlineAtMs: expect.any(Number),
+        minimumPhysicalActionRemainingMs: expect.any(Number),
+        minimumDeliveryPreparationRemainingMs: expect.any(Number),
+      }),
     );
     expect(fixture.transport.sendAttachment).not.toHaveBeenCalled();
     await expect(fixture.store.getOutbox("prepared-output-intent")).resolves.toMatchObject({ state: "sent" });
@@ -474,6 +506,136 @@ describe("Air studio dark engine", () => {
     });
     expect(fixture.transport.showTyping).not.toHaveBeenCalled();
     expect(fixture.transport.sendText).not.toHaveBeenCalled();
+  });
+
+  it("returns repeated post-claim deadline deferrals without exhausting an outbox", async () => {
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      deliveryEnabled: true,
+      transportVerified: true,
+    });
+    await armFixtureReleaseFence(fixture);
+    const outboxId = "post-claim-deadline-deferral";
+    await fixture.store.createOutbox({
+      outboxId,
+      senderHash: fixture.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: {
+        kind: "text",
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+        text: "No Photon operation should begin after this shared deadline closes.",
+      },
+    });
+
+    const claimNextOutbox = fixture.store.claimNextOutbox.bind(fixture.store);
+    let budgetNow = 1_000;
+    let activeDeadline = 37_000;
+    vi.spyOn(fixture.store, "claimNextOutbox").mockImplementation(async () => {
+      const claim = await claimNextOutbox();
+      if (claim) budgetNow = activeDeadline - 21_999;
+      return claim;
+    });
+
+    // Each loop starts with the 36s admission window, then deterministically
+    // closes it just after Redis claims the intent. Four passes prove the
+    // normal three-attempt terminalization cannot be reached without a
+    // physical Photon action.
+    for (let cron = 0; cron < 4; cron += 1) {
+      budgetNow = 1_000;
+      activeDeadline = budgetNow + 36_000;
+      const budget = createStudioDrainBudget({ now: () => budgetNow, deadlineAtMs: activeDeadline });
+
+      await expect(drainStudioOutbox(fixture.runtime, budget)).resolves.toBe(0);
+      await expect(fixture.store.getOutbox(outboxId)).resolves.toMatchObject({
+        state: "intent",
+        attempts: 0,
+      });
+    }
+
+    expect(fixture.transport.showTyping).not.toHaveBeenCalled();
+    expect(fixture.transport.sendText).not.toHaveBeenCalled();
+    expect(fixture.transport.stopTyping).not.toHaveBeenCalled();
+  });
+
+  it("does not charge an attempt when Redis authorization consumes the Photon admission window", async () => {
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      deliveryEnabled: true,
+      transportVerified: true,
+    });
+    await armFixtureReleaseFence(fixture);
+    const outboxId = "pre-typing-authorization-deadline";
+    await fixture.store.createOutbox({
+      outboxId,
+      senderHash: fixture.senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: {
+        kind: "text",
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+        text: "Redis-only authorization must not spend a Photon retry.",
+      },
+    });
+
+    const authorizeOutboxDelivery = fixture.store.authorizeOutboxDelivery.bind(fixture.store);
+    let budgetNow = 1_000;
+    let activeDeadline = 37_000;
+    vi.spyOn(fixture.store, "authorizeOutboxDelivery").mockImplementation(async (...args) => {
+      const allowed = await authorizeOutboxDelivery(...args);
+      // The authorization has completed, but it consumed the full 22s
+      // physical-action reserve before `showTyping` can be called.
+      budgetNow = activeDeadline - 21_999;
+      return allowed;
+    });
+
+    for (let cron = 0; cron < 4; cron += 1) {
+      budgetNow = 1_000;
+      activeDeadline = budgetNow + 36_000;
+      const budget = createStudioDrainBudget({ now: () => budgetNow, deadlineAtMs: activeDeadline });
+
+      await expect(drainStudioOutbox(fixture.runtime, budget)).resolves.toBe(0);
+      await expect(fixture.store.getOutbox(outboxId)).resolves.toMatchObject({
+        state: "intent",
+        attempts: 0,
+      });
+    }
+
+    expect(fixture.transport.showTyping).not.toHaveBeenCalled();
+    expect(fixture.transport.sendText).not.toHaveBeenCalled();
+  });
+
+  it("returns a verified Photon tapback preflight deadline without charging a send attempt", async () => {
+    const fixture = createDarkFixture({
+      releasePhase: "canary",
+      deliveryEnabled: true,
+      transportVerified: true,
+    });
+    await armFixtureReleaseFence(fixture);
+    fixture.transport.addLikeTapback.mockResolvedValueOnce({
+      kind: "retryable_failure",
+      code: "photon_tapback_deadline_exhausted",
+    });
+    await fixture.store.createOutbox({
+      outboxId: "tapback-preflight-deadline",
+      senderHash: fixture.senderHash,
+      lane: "tapback",
+      sequence: 1,
+      payload: {
+        kind: "tapback",
+        targetMessageId: "target-message-guid",
+        thread: { chatGuid: CHAT_GUID, sendingLine: SENDING_LINE },
+      },
+    });
+
+    await expect(drainStudioOutbox(fixture.runtime)).resolves.toBe(0);
+
+    expect(fixture.transport.addLikeTapback).toHaveBeenCalledTimes(1);
+    expect(fixture.transport.showTyping).not.toHaveBeenCalled();
+    await expect(fixture.store.getOutbox("tapback-preflight-deadline")).resolves.toMatchObject({
+      state: "intent",
+      attempts: 0,
+    });
   });
 
   it("defines every launch workflow as exactly one provider-generation paid step", () => {
@@ -918,5 +1080,113 @@ describe("Air studio dark engine", () => {
     expect(readyPayloads).toContainEqual(expect.objectContaining({
       text: "Canceled your queued request. No generation was submitted.",
     }));
+
+    await persistInbound(fixture, "status-recent-canceled-001", "/status");
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    expect(createOutbox).toHaveBeenLastCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({ text: "Your most recent request was canceled." }),
+    }));
+    // Utility commands cannot consume a saved media reference while they read
+    // the terminal job history.
+    await expect(fixture.store.getPending(fixture.senderHash, fixture.threadHash)).resolves.toMatchObject({
+      kind: "media",
+      attachment: { id: "saved-before-cancel" },
+    });
+  });
+
+  it("shows only setting-compatible models with exact change examples", async () => {
+    const fixture = createDarkFixture({ registry: reviewedImagineRegistry({ includeIncompatibleImagine: true }) });
+    await fixture.store.putSettings(fixture.senderHash, {
+      schemaVersion: 1,
+      onboardingVersion: 1,
+      modes: {
+        imagine: { outputCount: 1 },
+        animate: { outputCount: 1, durationSeconds: 5 },
+        "edit-image": { outputCount: 1 },
+        "edit-video": { outputCount: 1, durationSeconds: 5 },
+      },
+    });
+    const createOutbox = vi.spyOn(fixture.store, "createOutbox");
+    await persistInbound(fixture, "settings-command-reference-001", "/model-settings imagine");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+
+    const settingText = createOutbox.mock.calls
+      .map(([input]) => input.payload.kind === "text" ? input.payload.text : undefined)
+      .find((text) => text?.startsWith("imagine:"));
+    expect(settingText).toContain("Compatible models: reviewed-gmi-imagine (counts 1; aspect 1:1).");
+    expect(settingText).toContain("/model-settings imagine reviewed-gmi-imagine");
+    expect(settingText).toContain("/model-settings imagine count 1");
+    expect(settingText).toContain("/model-settings reset imagine");
+    expect(settingText).not.toContain("two-output-gmi-imagine");
+
+    await persistInbound(fixture, "models-compatible-only-001", "/models imagine");
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    const modelsText = createOutbox.mock.calls
+      .map(([input]) => input.payload.kind === "text" ? input.payload.text : undefined)
+      .find((text) => text === "reviewed-gmi-imagine — Reviewed GMI Imagine");
+    expect(modelsText).toBe("reviewed-gmi-imagine — Reviewed GMI Imagine");
+    expect(createOutbox.mock.calls
+      .map(([input]) => input.payload.kind === "text" ? input.payload.text : "")
+      .join("\n")).not.toContain("two-output-gmi-imagine");
+  });
+
+  it("explains all-mode model incompatibility without claiming no models are enabled", async () => {
+    const fixture = createDarkFixture({ registry: reviewedImagineRegistry() });
+    await fixture.store.putSettings(fixture.senderHash, {
+      schemaVersion: 1,
+      onboardingVersion: 1,
+      modes: {
+        imagine: { outputCount: 3 },
+        animate: { outputCount: 1, durationSeconds: 5 },
+        "edit-image": { outputCount: 1 },
+        "edit-video": { outputCount: 1, durationSeconds: 5 },
+      },
+    });
+    const createOutbox = vi.spyOn(fixture.store, "createOutbox");
+    await persistInbound(fixture, "models-all-incompatible-001", "/models");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+
+    const reply = createOutbox.mock.calls
+      .map(([input]) => input.payload.kind === "text" ? input.payload.text : undefined)
+      .find((text) => text?.startsWith("No enabled model is compatible"));
+    expect(reply).toBe(
+      "No enabled model is compatible with your saved settings. Use /model-settings imagine to review the exact supported values.",
+    );
+    expect(reply).not.toContain("No verified models are enabled");
+
+    await persistInbound(fixture, "models-mode-incompatible-001", "/models imagine");
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+    expect(createOutbox).toHaveBeenLastCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({
+        text: "No enabled imagine model is compatible with your saved settings. Use /model-settings imagine to review the exact supported values.",
+      }),
+    }));
+  });
+
+  it("discloses an enabled hosted-public input path without claiming provider deletion", async () => {
+    const fixture = createDarkFixture({ registry: reviewedImagineRegistry({ hostedPublicInput: true }) });
+    await fixture.store.putSettings(fixture.senderHash, {
+      schemaVersion: 1,
+      onboardingVersion: 1,
+      modes: {
+        imagine: { outputCount: 1 },
+        animate: { outputCount: 1, durationSeconds: 5 },
+        "edit-image": { outputCount: 1 },
+        "edit-video": { outputCount: 1, durationSeconds: 5 },
+      },
+    });
+    const createOutbox = vi.spyOn(fixture.store, "createOutbox");
+    await persistInbound(fixture, "privacy-hosted-public-001", "/privacy");
+
+    await expect(drainStudioWithStats(fixture.runtime)).resolves.toEqual({ inbox: 1, outbox: 0 });
+
+    const privacy = createOutbox.mock.calls
+      .map(([input]) => input.payload.kind === "text" ? input.payload.text : undefined)
+      .find((text) => text?.startsWith("Air is private and allowlist-only."));
+    expect(privacy).toContain("Air does not promise provider-side deletion.");
+    expect(privacy).toContain("reviewed-gmi-imagine: inputs.example.test/reviewed-air-input/");
+    expect(privacy).toContain("publicly accessible path during processing");
   });
 });

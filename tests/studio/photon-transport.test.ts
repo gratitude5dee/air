@@ -1,4 +1,10 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mocks = vi.hoisted(() => ({
+  createClient: vi.fn(),
+}));
+
+vi.mock("@photon-ai/advanced-imessage", () => ({ createClient: mocks.createClient }));
 
 import {
   validateStudioProviderArtifact,
@@ -12,8 +18,10 @@ import {
 import type { StudioPreparedOutput } from "../../lib/studio/store.js";
 import { assertNoPhotonTelemetryExporters } from "../../lib/studio/photon-telemetry.js";
 import {
+  createPhotonIMessageTransport,
   PhotonIMessageTransport,
   resolvePhotonIMessageClientRoute,
+  type PhotonTokenIssuer,
   type PhotonIMessagePort,
 } from "../../lib/studio/photon-transport.js";
 
@@ -26,7 +34,7 @@ const REPLY_THREAD: IMessageThreadReference = Object.freeze({
   replyTargetId: "incoming-message-guid",
 });
 const ONE_PIXEL_PNG = Uint8Array.from(Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl54P8AAAAASUVORK5CYII=",
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
 ));
 
@@ -76,6 +84,10 @@ function fixture(): {
 }
 
 describe("Photon iMessage text transport", () => {
+  beforeEach(() => {
+    mocks.createClient.mockReset();
+  });
+
   it("uses the pooled client for a shared Cloud token while preserving dedicated-line routing", () => {
     expect(resolvePhotonIMessageClientRoute("shared", "+15555550101")).toBe("shared");
     expect(resolvePhotonIMessageClientRoute("dedicated", "+15555550101")).toBe("+15555550101");
@@ -90,6 +102,139 @@ describe("Photon iMessage text transport", () => {
       webhookSecret: "",
       port,
     })).toThrow("IMESSAGE_WEBHOOK_SECRET is invalid");
+  });
+
+  it("bounds Cloud token issuance before any iMessage client can be created", async () => {
+    vi.useFakeTimers();
+    try {
+      const issueImessageTokens = vi.fn<PhotonTokenIssuer>(() => new Promise(() => undefined));
+      const creation = createPhotonIMessageTransport({
+        projectId: "project",
+        projectSecret: "project-secret",
+        webhookSecret: "webhook-secret",
+        issueImessageTokens,
+        tokenIssueTimeoutMs: 5,
+      });
+      const result = creation.then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      await vi.advanceTimersByTimeAsync(5);
+
+      expect(await result).toBeInstanceOf(Error);
+      expect((await result as Error).message).toBe("photon_operation_deadline_exceeded");
+      expect(issueImessageTokens).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refreshes a short-lived Cloud token before SDK dispatch and never mints from the token callback", async () => {
+    vi.useFakeTimers();
+    try {
+      let sdkToken: (() => Promise<string>) | undefined;
+      const client = {
+        chats: { setTyping: vi.fn(async () => undefined) },
+        attachments: { upload: vi.fn(async () => ({ attachment: { guid: "uploaded-attachment-guid" } })) },
+        messages: {
+          sendText: vi.fn(async () => {
+            const token = sdkToken;
+            if (!token) throw new Error("sdk_token_callback_unavailable");
+            await token();
+            return { guid: "sent-message" };
+          }),
+          sendAttachment: vi.fn(async () => ({ guid: "sent-attachment-message" })),
+          setReaction: vi.fn(async () => ({ guid: "reaction-message" })),
+        },
+      };
+      mocks.createClient.mockImplementation((options: { readonly token: () => Promise<string> }) => {
+        sdkToken = options.token;
+        return client;
+      });
+      const issueImessageTokens = vi.fn<PhotonTokenIssuer>()
+        .mockResolvedValueOnce({ type: "shared", token: "initial-short-token", expiresIn: 1 })
+        .mockResolvedValueOnce({ type: "shared", token: "refreshed-token", expiresIn: 60 });
+      const transport = await createPhotonIMessageTransport({
+        projectId: "project",
+        projectSecret: "project-secret",
+        webhookSecret: "webhook-secret",
+        issueImessageTokens,
+      });
+
+      await expect(transport.sendText(THREAD, "Air is ready.", "short-token-outbox-key", {
+        deadlineAtMs: Date.now() + 50_000,
+      })).resolves.toEqual({ kind: "sent" });
+      expect(sdkToken).toBeTypeOf("function");
+      expect(issueImessageTokens).toHaveBeenCalledTimes(2);
+
+      // If the SDK asks again after the token crosses the normal refresh
+      // window, it receives the existing token. It must not trigger a new
+      // network mint without the caller-owned deadline from getClient.
+      await vi.advanceTimersByTimeAsync(31_000);
+      await expect(sdkToken?.()).resolves.toBe("refreshed-token");
+      expect(issueImessageTokens).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects a repeated short-TTL refresh before the SDK can admit a physical RPC", async () => {
+    const client = {
+      chats: { setTyping: vi.fn(async () => undefined) },
+      attachments: { upload: vi.fn(async () => ({ attachment: { guid: "uploaded-attachment-guid" } })) },
+      messages: {
+        sendText: vi.fn(async () => ({ guid: "sent-message" })),
+        sendAttachment: vi.fn(async () => ({ guid: "sent-attachment-message" })),
+        setReaction: vi.fn(async () => ({ guid: "reaction-message" })),
+      },
+    };
+    mocks.createClient.mockReturnValue(client);
+    const issueImessageTokens = vi.fn<PhotonTokenIssuer>()
+      .mockResolvedValueOnce({ type: "shared", token: "initial-short-token", expiresIn: 1 })
+      .mockResolvedValueOnce({ type: "shared", token: "still-short-token", expiresIn: 1 })
+      .mockResolvedValueOnce({ type: "shared", token: "must-not-be-minted", expiresIn: 60 });
+    const transport = await createPhotonIMessageTransport({
+      projectId: "project",
+      projectSecret: "project-secret",
+      webhookSecret: "webhook-secret",
+      issueImessageTokens,
+    });
+
+    await expect(transport.sendText(THREAD, "Air is ready.", "repeated-short-token-outbox-key", {
+      deadlineAtMs: Date.now() + 50_000,
+    })).resolves.toEqual({ kind: "retryable_failure", code: "photon_client_unavailable" });
+
+    expect(issueImessageTokens).toHaveBeenCalledTimes(2);
+    expect(client.messages.sendText).not.toHaveBeenCalled();
+  });
+
+  it("does not begin a replacement token mint after the caller deadline has elapsed", async () => {
+    const client = {
+      chats: { setTyping: vi.fn(async () => undefined) },
+      attachments: { upload: vi.fn(async () => ({ attachment: { guid: "uploaded-attachment-guid" } })) },
+      messages: {
+        sendText: vi.fn(async () => ({ guid: "sent-message" })),
+        sendAttachment: vi.fn(async () => ({ guid: "sent-attachment-message" })),
+        setReaction: vi.fn(async () => ({ guid: "reaction-message" })),
+      },
+    };
+    mocks.createClient.mockReturnValue(client);
+    const issueImessageTokens = vi.fn<PhotonTokenIssuer>()
+      .mockResolvedValueOnce({ type: "shared", token: "initial-short-token", expiresIn: 1 });
+    const transport = await createPhotonIMessageTransport({
+      projectId: "project",
+      projectSecret: "project-secret",
+      webhookSecret: "webhook-secret",
+      issueImessageTokens,
+    });
+
+    await expect(transport.sendText(THREAD, "Air is ready.", "expired-token-deadline-key", {
+      deadlineAtMs: Date.now(),
+    })).resolves.toEqual({ kind: "retryable_failure", code: "photon_client_unavailable" });
+
+    expect(issueImessageTokens).toHaveBeenCalledTimes(1);
+    expect(client.messages.sendText).not.toHaveBeenCalled();
   });
 
   it("rebuilds the stored sending line and carries Air's stable outbox key to Photon", async () => {
@@ -126,6 +271,24 @@ describe("Photon iMessage text transport", () => {
 
     await expect(transport.sendText(THREAD, "Air is ready.", "stable-outbox-key"))
       .resolves.toEqual({ kind: "send_unknown", code: "photon_text_send_unknown" });
+  });
+
+  it("records a started send that outlives its deadline as unknown", async () => {
+    vi.useFakeTimers();
+    try {
+      const { transport, client } = fixture();
+      client.messages.sendText.mockImplementationOnce(async () => await new Promise<never>(() => undefined));
+      const result = transport.sendText(THREAD, "Air is ready.", "deadline-outbox-key", {
+        deadlineAtMs: Date.now() + 5,
+      });
+
+      await vi.advanceTimersByTimeAsync(5);
+
+      await expect(result).resolves.toEqual({ kind: "send_unknown", code: "photon_text_send_unknown" });
+      expect(client.messages.sendText).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("uses a retryable result only when a client cannot be resolved before a send RPC", async () => {

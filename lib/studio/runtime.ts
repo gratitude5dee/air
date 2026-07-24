@@ -8,7 +8,11 @@ import {
   studioReadinessProblems,
   type StudioEnvironment,
 } from "./config.js";
-import { UnverifiedPhotonTransport, type StudioIMessageTransport } from "./imessage-transport.js";
+import {
+  UnverifiedPhotonTransport,
+  type StudioIMessageTransport,
+  type StudioTransportOperationOptions,
+} from "./imessage-transport.js";
 import {
   AIR_MODEL_REGISTRY,
   resolveDefaultModel,
@@ -44,7 +48,7 @@ export interface StudioRuntime {
    * Photon. It is optional so already-constructed test and drain runtimes
    * retain their exact injected transport behavior.
    */
-  readonly getDeliveryTransport?: (() => Promise<StudioIMessageTransport>) | undefined;
+  readonly getDeliveryTransport?: ((options?: StudioTransportOperationOptions) => Promise<StudioIMessageTransport>) | undefined;
   /** Never live by default; the executor rejects this unverified provider. */
   readonly provider: StudioProviderPort;
   /** Committed registry; tests may inject a reviewed fixture without mutating code defaults. */
@@ -80,10 +84,13 @@ export async function getStudioRuntime(): Promise<StudioRuntime> {
  * the durable outbox can retry later, while signed inbound receipt persistence
  * remains independent of all outbound credentials.
  */
-export async function getStudioDeliveryTransport(runtime: StudioRuntime): Promise<StudioIMessageTransport> {
+export async function getStudioDeliveryTransport(
+  runtime: StudioRuntime,
+  options?: StudioTransportOperationOptions,
+): Promise<StudioIMessageTransport> {
   return runtime.getDeliveryTransport === undefined
     ? runtime.transport
-    : await runtime.getDeliveryTransport();
+    : await runtime.getDeliveryTransport(options);
 }
 
 export async function createStudioRuntime(
@@ -101,7 +108,7 @@ export async function createStudioRuntime(
   // the transport immediately before a physical Photon action.
   const configuredTransport = transport ?? new UnverifiedPhotonTransport();
   const getDeliveryTransport = transport === undefined
-    ? createLazyIMessageTransportResolver(() => createConfiguredIMessageTransport(environment))
+    ? createLazyIMessageTransportResolver((options) => createConfiguredIMessageTransport(environment, options))
     : undefined;
   return runtimeFromConnectedRedis(
     environment,
@@ -239,7 +246,10 @@ function reviewedFluxKontextProImagineDefault(registry: AirModelRegistry): Studi
  * retain the dependency-free, fail-closed transport instead of initializing a
  * client that could emit unredacted telemetry.
  */
-async function createConfiguredIMessageTransport(environment: StudioEnvironment): Promise<StudioIMessageTransport> {
+async function createConfiguredIMessageTransport(
+  environment: StudioEnvironment,
+  options?: StudioTransportOperationOptions,
+): Promise<StudioIMessageTransport> {
   if (!environment.imessageProjectId || !environment.imessageProjectSecret || !environment.imessageWebhookSecret) {
     return new UnverifiedPhotonTransport();
   }
@@ -251,6 +261,7 @@ async function createConfiguredIMessageTransport(environment: StudioEnvironment)
     projectId: environment.imessageProjectId,
     projectSecret: environment.imessageProjectSecret,
     webhookSecret: environment.imessageWebhookSecret,
+    ...(options?.deadlineAtMs === undefined ? {} : { deadlineAtMs: options.deadlineAtMs }),
   });
 }
 
@@ -261,15 +272,15 @@ async function createConfiguredIMessageTransport(environment: StudioEnvironment)
  * actually invoked.
  */
 export function createLazyIMessageTransportResolver(
-  createTransport: () => Promise<StudioIMessageTransport>,
-): () => Promise<StudioIMessageTransport> {
+  createTransport: (options?: StudioTransportOperationOptions) => Promise<StudioIMessageTransport>,
+): (options?: StudioTransportOperationOptions) => Promise<StudioIMessageTransport> {
   let resolved: StudioIMessageTransport | undefined;
   let inFlight: Promise<StudioIMessageTransport> | undefined;
 
-  return async (): Promise<StudioIMessageTransport> => {
+  return async (options?: StudioTransportOperationOptions): Promise<StudioIMessageTransport> => {
     if (resolved !== undefined) return resolved;
     if (inFlight === undefined) {
-      inFlight = createTransport()
+      inFlight = createTransport(options)
         .then((transport) => {
           resolved = transport;
           return transport;
@@ -287,7 +298,7 @@ function runtimeFromConnectedRedis(
   connection: ConnectedRedis,
   transport: StudioIMessageTransport,
   provider: StudioProviderPort,
-  getDeliveryTransport?: (() => Promise<StudioIMessageTransport>) | undefined,
+  getDeliveryTransport?: ((options?: StudioTransportOperationOptions) => Promise<StudioIMessageTransport>) | undefined,
 ): StudioRuntime {
   const cipher = createQueueCipher(environment.queueEncryptionKey as string);
   const store = new StudioStore({

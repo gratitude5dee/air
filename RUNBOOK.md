@@ -9,16 +9,29 @@ retrieval, a provider submission, or a generation command.
 
 - Source of truth: `codex/air-direct-studio`. Zap is retained only to drain or
   roll back legacy jobs that it already accepted; it is not a new-work path.
-- Live deployment: `dpl_9gttp6wLuZ4A8MeKmAPztoT6Av17`, aliased to
-  [`https://air.wzrd.tech`](https://air.wzrd.tech).
+- Live public alias: [`https://air.wzrd.tech`](https://air.wzrd.tech). Record
+  the exact deployment ID at promotion; do not reuse a stale ID from an older
+  handoff.
 - Verified public probe: `GET /healthz` returned `{"ok":true,"version":"2"}`.
+- Production webhook posture: `POST /webhooks/imessage` validates and persists
+  a signed receipt, then returns. It does not drain queues or perform provider
+  or Photon delivery work. The minute `/internal/drain-inbox` Cron is the only
+  scheduled worker that can progress stored work.
 - Vercel has encrypted `GMI_API_KEY` configuration for Preview and Production.
-  Only the environment-variable name/status was inspected; no value was read.
+  A protected production process check received an empty value. No secret was
+  printed or retained; a variable name alone does not prove a usable key. The
+  owner must correct it directly in Vercel before a protected GMI audit can be
+  accepted as readiness evidence.
 - The committed registry still has zero enabled models. The direct provider is
   therefore unprovisioned at runtime, even with the server-only key present.
+- The public Flux result example's bare storage URL—even with
+  `is_public: false`—does not prove a private/signed output contract. It is
+  insufficient for Air, so no GMI model is armed.
 - No real Photon webhook delivery or allowlisted handset `/help` response has
-  been observed for this deployment. Do not mark the iMessage path accepted
-  until that test is completed.
+  been observed for this deployment. The test is also blocked on the
+  explicitly authorized replacement of the exposed outbound Photon credential
+  described below. Do not mark the iMessage path accepted until that test is
+  completed.
 
 The existing shared `$100` cap is a hard background safety control. It does
 not add a per-request approval step, and it does not substitute for the model
@@ -28,7 +41,8 @@ and privacy gates below.
 
 1. Do not retrieve, print, commit, paste, or send any secret. Inspect Vercel
    environment variables by name/status only; never use an environment pull
-   as a shortcut.
+   as a shortcut. The only rotation exception is the explicitly authorized
+   Photon incident procedure below.
 2. Do not create a second Vercel Cron. The only scheduled job is the minute
    drain at `/internal/drain-inbox`; `/internal/provider-audit` is manually
    invoked and authenticated.
@@ -44,6 +58,10 @@ and privacy gates below.
    signed result must use the reviewed signed-URL contract; a provider-private
    result needs a dedicated authenticated retrieval implementation. Never use
    a documented publicly accessible provider upload URL for user media.
+7. Keep Photon credentials separate. `IMESSAGE_WEBHOOK_SECRET` verifies the
+   inbound raw-HMAC webhook; `IMESSAGE_PROJECT_SECRET` is an outbound project
+   API credential used only at lazy delivery. Never substitute one for the
+   other or paste either into a command transcript.
 
 ## Release verification
 
@@ -79,11 +97,41 @@ vercel env ls production --scope 5dee-studios
 Do not run `vercel env pull`, do not call a command that echoes a value, and do
 not include an environment value in a support transcript.
 
+## Photon credential incident and coordinated rotation
+
+`IMESSAGE_WEBHOOK_SECRET` is the existing inbound signing secret for the
+webhook target. `IMESSAGE_PROJECT_SECRET` is a different outbound Photon API
+credential. A Photon CLI response unexpectedly emitted the outbound credential
+in local tool output, so it must be treated as exposed.
+
+Do not rotate either credential merely to perform a smoke test. Rotation of the
+outbound credential requires explicit owner authorization because it will
+invalidate the current outbound API access. Once that authorization exists,
+perform one coordinated, secret-safe operation:
+
+1. Rotate only the outbound Photon project credential. Capture it only long
+   enough to update the encrypted Vercel environment; never print, save, or
+   paste it.
+2. Update every Vercel environment target intentionally using that credential,
+   then deploy the direct branch. Do not change `IMESSAGE_WEBHOOK_SECRET` as
+   part of this incident unless the inbound secret has a separate confirmed
+   exposure.
+3. Verify deployment and environment names/status without retrieving a value.
+   Only then run the signed allowlisted handset `/help` smoke below.
+
+Until explicit authorization and this coordinated update are complete, the
+outbound credential must not be used for a live test. This is a security stop
+condition, not a reason to ask anyone to paste a signing or API secret.
+
 ## Protected GMI catalog/schema audit
 
 The GMI key may be used only through the deployed read-only audit until a
-separate activation release is approved. From an operator-controlled terminal
-where `CRON_SECRET` is already set, run:
+separate activation release is approved. The current protected production
+process check received `GMI_API_KEY` as empty, so do not treat the listed Vercel
+variable as a working credential or run this audit as acceptance evidence yet.
+The owner must set a nonempty value directly in Vercel and deploy it without
+sharing the value. After that, from an operator-controlled terminal where
+`CRON_SECRET` is already set, run:
 
 ```sh
 curl --fail-with-body -sS \
@@ -114,9 +162,9 @@ Interpret the result conservatively:
 
 - `401` means stop and correct the operator authentication path without
   exposing the credential.
-- `503` means stop and inspect deployment configuration or provider
-  availability through the normal private operator path; do not broaden the
-  route or add logging.
+- `503` means stop and inspect deployment configuration (including the current
+  empty GMI credential) or provider availability through the normal private
+  operator path; do not broaden the route or add logging.
 - `available: false`, a mismatched model ID, or an unexpected parameter schema
   means `/imagine` stays disabled.
 - `pricing: "manual_console_required"` means obtain the exact account-specific
@@ -129,12 +177,13 @@ that the result is not publicly accessible.
 
 ## Photon webhook and handset `/help` smoke
 
-This remains the missing live acceptance test.
+This remains the missing live acceptance test and is blocked until the
+explicitly authorized outbound-credential rotation above has completed.
 
-1. In the existing Photon project, confirm the signed webhook target is
+1. After that coordinated rotation and deployment, confirm the signed webhook target is
    `https://air.wzrd.tech/webhooks/imessage` and it uses the already-matching
-   signing secret. Do not create a replacement project, rotate secrets, or
-   expose a line number while checking.
+   inbound signing secret. Do not retrieve or expose the signing secret, and
+   do not alter it as part of the outbound-credential incident.
 2. From the already allowlisted owner number, send exactly `/help` to Air. Do
    not send an attachment or a generation command during this smoke.
 3. Wait through one minute-drain interval. A first successful contact can
@@ -154,12 +203,15 @@ this result is observed, “iMessage live” remains unproven.
 Do not enable paid work in this release. A later `/imagine` activation must
 complete every gate below, in order:
 
-1. Preserve the protected audit response showing exact
+1. Confirm through a secret-safe production check that the owner has supplied a
+   nonempty `GMI_API_KEY` directly in Vercel. A variable name and the current
+   empty-value check do not pass this gate.
+2. Preserve the protected audit response showing exact
    `flux-kontext-pro` availability and its reviewed parameter schema.
-2. Record the exact account-specific GMI price and an upper bound for the
+3. Record the exact account-specific GMI price and an upper bound for the
    single-image request. Keep the already-approved shared `$100` ceiling in
    force; it is a ceiling, not a license to substitute a model.
-3. Prove the exact input and result contracts. Result retrieval must be private
+4. Prove the exact input and result contracts. Result retrieval must be private
    or signed, non-public, and pinned to a specific host plus non-root path
    prefix. A bare storage URL is insufficient even if a provider returns
    `is_public: false`; Air currently accepts only a complete GCS V4 signed URL
@@ -167,16 +219,22 @@ complete every gate below, in order:
    documentation example. The public [Flux quickstart](https://docs.gmicloud.ai/model-quickstarts/image/flux-kontext-pro)
    is specifically insufficient: its success example combines `is_public:false`
    with a bare storage URL and does not document access semantics.
-4. Commit and review a registry entry that pins the exact GMI adapter, model
+5. Commit and review a registry entry that pins the exact GMI adapter, model
    ID, request/result schema fingerprints, required payload fields, input
    policy, output contract, price quote, polling bounds, and private retrieval
    policy. Run the full release verification suite and deploy it.
-5. Complete the handset `/help` smoke above.
-6. In a separately reviewed release, advance the shared release fence with its
+6. Deploy a durable encrypted provider-result reference split, or a reviewed
+   proof that the complete observe/retrieve/validate/upload/finalize chain
+   fits the bounded Vercel worker deadline. The current bounded Cron
+   deliberately defers `executing` provider-result recovery before any
+   provider or Photon action.
+7. Complete the handset `/help` smoke above after the explicitly authorized
+   outbound-credential rotation.
+8. In a separately reviewed release, advance the shared release fence with its
    authenticated compare-and-swap and explicitly configure admission,
    provider-submit, provider-recovery, and delivery policies alongside
    positive bounded spend caps. A flag or key alone must still fail closed.
-7. Submit only the reviewed one-image `/imagine` canary and observe its direct
+9. Submit only the reviewed one-image `/imagine` canary and observe its direct
    lifecycle without copying a provider URL or media into logs.
 
 `/animate`, `/edit-image`, and `/edit-video` remain disabled after the first
@@ -189,6 +247,11 @@ public URL is not an acceptable input-media transport for this private studio.
 The direct lifecycle is intentionally conservative once a reviewed model is
 enabled:
 
+- In the bounded minute Cron, an `executing` provider result is deferred before
+  token minting, provider observation, artifact fetch, or Photon upload. This
+  preserves the worker deadline and avoids an ambiguous physical action. Only
+  already prepared `ready` and `delivering` state may be reconciled there until
+  the durable result-reference design is released.
 - It can observe only a durably known submitted request; it never resubmits an
   ambiguous request.
 - It checks the registry's private/signed result allowlist before fetching an
@@ -209,7 +272,8 @@ For a rollback or provider safety incident:
 1. Stop new admission and provider work through an explicitly reviewed higher
    release generation/fence transition before moving a Vercel alias.
 2. Preserve encrypted Redis state; do not delete records or rotate secrets
-   blindly.
+   blindly. The only exception is the exposed outbound Photon credential after
+   its explicitly authorized coordinated rotation.
 3. Reconcile only established evidence through the controlled operational path.
    Do not make a new provider or Photon request to “see whether it worked.”
 4. Use Zap only for legacy accepted-job drain/rollback support, never to accept
@@ -225,5 +289,6 @@ Record the following without secrets or personal data:
 - account price evidence reference and the private-output contract review
   status;
 - release-fence generation/phase (not its secret);
-- Photon webhook target check and handset `/help` outcome;
+- Photon webhook target check, outbound-credential incident/rotation status,
+  and handset `/help` outcome;
 - any reconciliation-required job count/state, with opaque IDs only.

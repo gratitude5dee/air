@@ -8,10 +8,16 @@ deployment.
 
 ## Live status
 
-The current direct release is Vercel deployment
-`dpl_9gttp6wLuZ4A8MeKmAPztoT6Av17` from `codex/air-direct-studio`, aliased to
-[`https://air.wzrd.tech`](https://air.wzrd.tech). Its public health endpoint
-returned `{"ok":true,"version":"2"}` after deployment.
+The public direct-runtime alias is [`https://air.wzrd.tech`](https://air.wzrd.tech)
+from `codex/air-direct-studio`. Its public health endpoint returns
+`{"ok":true,"version":"2"}`. Record the exact deployment ID only with its
+promotion handoff; do not carry a stale ID forward in this document.
+
+The public webhook is deliberately **receipt-only**. After it verifies the raw
+signature and durably stores a receipt, it returns promptly. It does not drain
+queues, send through Photon, fetch media, or call a provider. The once-per-
+minute Vercel drain is the only scheduled worker that may claim that stored
+work.
 
 This is **not** a paid-generation activation:
 
@@ -19,11 +25,16 @@ This is **not** a paid-generation activation:
   defaults. `/imagine`, `/animate`, `/edit-image`, and `/edit-video` cannot
   reserve spend or call a provider.
 - `GMI_API_KEY` is present as an encrypted, server-only Vercel environment
-  variable for Preview and Production. Its value was not retrieved. A key by
-  itself cannot provision the runtime: provider composition requires one
-  exactly reviewed, enabled registry entry.
+  variable by name for Preview and Production. A protected production process
+  check received it as an empty value; no secret value was printed or retained.
+  Treat the credential as unavailable until its owner corrects it directly in
+  Vercel. A key by itself cannot provision the runtime: provider composition
+  also requires one exactly reviewed, enabled registry entry.
 - The already-approved shared `$100` ceiling remains a background hard safety
   control. It is not a user-confirmation step and it is not a model approval.
+- The documented Flux result example combines `is_public: false` with a bare
+  storage URL. That is not a private or signed retrieval contract, so it is
+  insufficient for Air and no GMI model is armed.
 - This release rejects bare, malformed, or cross-model provider results before
   any artifact fetch and prevents an attachment from leaving after a failed
   result preamble on a restarted worker.
@@ -31,12 +42,31 @@ This is **not** a paid-generation activation:
   `/help` reply have not yet been observed on this deployment. Text delivery
   is therefore deployed but not yet accepted as a handset smoke result.
 
+## Photon credential boundary and incident
+
+`IMESSAGE_WEBHOOK_SECRET` is the inbound raw-HMAC signing secret for
+`POST /webhooks/imessage`. `IMESSAGE_PROJECT_SECRET` is a distinct outbound
+Photon project API credential that is used only when Air prepares delivery.
+They are not interchangeable, and neither is needed in chat or source control.
+
+A Photon CLI response unexpectedly exposed the outbound project credential in
+local tool output. Treat that credential as compromised. Do not paste it,
+retrieve it again, or rotate it as a routine smoke-test step. A replacement
+requires the owner's explicit authorization and a coordinated operation that
+rotates the **outbound** credential, updates every intended encrypted Vercel
+environment target, redeploys, and only then runs the signed handset `/help`
+test. The inbound webhook HMAC secret must remain separate and unchanged
+unless its own incident requires rotation.
+
 ## Privacy and ingress guarantees
 
 - Only direct messages from HMAC-hashed allowlisted senders are eligible.
 - `POST /webhooks/imessage` is the sole unauthenticated ingress. It verifies
   the raw Photon/Spectrum signature before JSON parsing, then encrypts and
-  idempotently persists the receipt before returning `200`.
+  idempotently persists the receipt before returning `200`; it never performs
+  queue draining or a physical provider/Photon action in that request.
+- The minute drain at `/internal/drain-inbox`, not the webhook handler, is the
+  only scheduled worker for inbox, job, and outbox progress.
 - Prompts, sender/thread identifiers, attachment references, settings, and
   outbox payloads are encrypted in Redis. Media bytes, API keys, raw provider
   replies, provider URLs, and raw iMessage content are not logged.
@@ -77,8 +107,11 @@ a Cron and is never reachable without its bearer check.
 
 ## Safe server-only GMI audit
 
-`GET /internal/provider-audit` is the only live use of the GMI credential in
-the current release. It is deliberately narrow:
+`GET /internal/provider-audit` is designed to be the only live use of a usable
+GMI credential in the current release. The names-only Vercel inventory and an
+empty protected process value do not establish a usable key, so this audit is
+not current provider-readiness evidence. Its implementation is deliberately
+narrow:
 
 - It accepts only `GET` with the existing `CRON_SECRET` bearer credential.
 - It makes only the fixed, read-only catalog and exact-model-detail requests
@@ -100,8 +133,9 @@ curl --fail-with-body -sS \
 ```
 
 A `401` or `503` is a stop condition, not a reason to expose a secret or
-broaden the endpoint. A successful audit is evidence for review only; it does
-not activate `/imagine`.
+broaden the endpoint. In particular, a `503` can reflect the currently empty
+GMI credential. A successful audit is evidence for review only; it does not
+activate `/imagine`.
 
 ## Dormant direct provider-result delivery path
 
@@ -127,6 +161,13 @@ and enabled, it protects the post-submit path as follows:
    automatic physical resend. A release-fence mismatch blocks stale outbox
    delivery before dispatch.
 
+The minute Vercel Cron has a bounded execution budget. Until Air has a
+durable encrypted provider-result reference split and a reviewed timing proof,
+that worker deliberately does **not** begin an `executing` provider-result
+recovery (provider observation, artifact retrieval, and Photon upload). It
+may still reconcile already prepared `ready` and `delivering` state. This is a
+fail-closed `/imagine` activation gate, not an automatic retry delay.
+
 These safeguards do not establish that a provider model is approved, private,
 priced, or live. They are failure boundaries for a later reviewed release.
 
@@ -135,24 +176,33 @@ priced, or live. They are failure boundaries for a later reviewed release.
 `/imagine` is the first proposed paid mode. It remains disabled until all of
 the following are recorded and deployed together:
 
-1. The protected audit confirms exact `flux-kontext-pro` availability and its
+1. A secret-safe production check confirms that the owner has supplied a
+   nonempty `GMI_API_KEY` directly in Vercel. A configured variable name, or
+   the prior empty-value check, fails this gate.
+2. The protected audit confirms exact `flux-kontext-pro` availability and its
    request schema, producing reviewable catalog and schema fingerprints.
-2. An operator reviews the account-specific GMI Console/Model Hub price and
+3. An operator reviews the account-specific GMI Console/Model Hub price and
    records an exact bounded quote; public documentation is not price
    authority.
-3. The output contract is proven private/signed for this exact model, including
+4. The output contract is proven private/signed for this exact model, including
    its exact result host and non-root path prefix. Generic provider examples
    are not sufficient. In particular, a bare storage URL is not evidence of
    private access even when a provider labels the response `is_public: false`.
    GMI's [Flux quickstart](https://docs.gmicloud.ai/model-quickstarts/image/flux-kontext-pro)
    currently demonstrates that exact ambiguity, so it establishes the model
    identifier—not Air's private-delivery contract.
-4. A reviewed committed registry entry pins the adapter, request/result schema
+5. A reviewed committed registry entry pins the adapter, request/result schema
    fingerprints, input policy, output policy, price quote, polling bounds, and
    one-image contract. The release must then pass typecheck, tests, and the
    Vercel build verifier.
-5. The direct Photon webhook and allowlisted handset `/help` smoke have passed.
-6. A separately reviewed release advances the shared release fence and keeps
+6. A durable encrypted provider-result reference split (or a reviewed proof
+   that the full observe/retrieve/validate/upload/finalize chain fits the
+   bounded worker deadline) is deployed. The current bounded Cron intentionally
+   defers that `executing` recovery path.
+7. The exposed outbound Photon credential has been replaced through the
+   explicitly authorized coordinated rotation, and the direct webhook plus
+   allowlisted handset `/help` smoke have passed.
+8. A separately reviewed release advances the shared release fence and keeps
    the existing `$100` hard ceiling in force. Flags alone can never enable
    spend.
 
@@ -170,6 +220,13 @@ Vercel and must be checked by name/status only, never pulled into a local file
 or printed. In particular, `GMI_API_KEY`, Photon credentials, Redis tokens,
 allowlist hashes, `CRON_SECRET`, and `AIR_RELEASE_FENCE_SECRET` stay
 server-only.
+
+Keep the two Photon credentials distinct: `IMESSAGE_WEBHOOK_SECRET` verifies
+inbound raw-HMAC webhooks, while `IMESSAGE_PROJECT_SECRET` authorizes lazy
+outbound delivery. Because the latter was exposed by a CLI response, do not
+use it for a live `/help` test. Wait for explicit owner authorization for the
+coordinated rotation and Vercel update described above; never ask an operator
+to paste either secret into chat.
 
 Paid provider work requires all of the following at runtime: an active release
 phase, explicit admission/submit policy, explicit positive per-job and daily

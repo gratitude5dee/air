@@ -1,8 +1,10 @@
+import { inflateSync } from "node:zlib";
+
 /**
  * Bounded, dependency-free media validation for Air's direct studio. These
  * helpers inspect bytes that have already passed a bounded download; they do
- * not decode pixels or media samples, and they reject anything they cannot
- * prove is within the studio contract.
+ * not render pixels or decode media samples. PNG scanlines are inflated only
+ * inside a fixed memory ceiling so the byte-level contract can be proven.
  */
 
 export const STUDIO_IMAGE_INPUT_MAX_BYTES = 10 * 1024 * 1024;
@@ -67,6 +69,19 @@ const MAX_ISO_BOXES = 4_096;
 const MAX_ISO_BOX_DEPTH = 16;
 const MAX_STTS_ENTRIES = 2_048;
 const MAX_SAMPLE_DESCRIPTIONS = 16;
+const MAX_PNG_CHUNKS = 4_096;
+/** Scanline filters add at most two rows' worth of bytes across Adam7 passes. */
+const MAX_PNG_INFLATED_BYTES = STUDIO_IMAGE_MAX_DECODED_RGBA_BYTES + STUDIO_IMAGE_MAX_DIMENSION * 2;
+const PNG_ADAM7_PASSES = Object.freeze([
+  Object.freeze({ startX: 0, startY: 0, stepX: 8, stepY: 8 }),
+  Object.freeze({ startX: 4, startY: 0, stepX: 8, stepY: 8 }),
+  Object.freeze({ startX: 0, startY: 4, stepX: 4, stepY: 8 }),
+  Object.freeze({ startX: 2, startY: 0, stepX: 4, stepY: 4 }),
+  Object.freeze({ startX: 0, startY: 2, stepX: 2, stepY: 4 }),
+  Object.freeze({ startX: 1, startY: 0, stepX: 2, stepY: 2 }),
+  Object.freeze({ startX: 0, startY: 1, stepX: 1, stepY: 2 }),
+] as const);
+const PNG_CRC_TABLE = createPngCrcTable();
 
 export type StudioImageRole = "input" | "output";
 export type StudioImageKind = "jpeg" | "png";
@@ -123,6 +138,13 @@ export interface StudioMp4Metadata {
 interface Dimensions {
   readonly width: number;
   readonly height: number;
+}
+
+interface PngHeader extends Dimensions {
+  readonly bitDepth: number;
+  readonly colorType: number;
+  readonly interlaceMethod: 0 | 1;
+  readonly bitsPerPixel: number;
 }
 
 interface IsoBox {
@@ -318,29 +340,150 @@ function parseJpegDimensions(bytes: Uint8Array): Dimensions {
 
   let cursor = 2;
   let segments = 0;
-  while (cursor < bytes.byteLength - 2) {
-    if (segments++ > 256 || bytes[cursor] !== 0xff) fail("invalid_image");
+  let dimensions: Dimensions | undefined;
+  let sawScan = false;
+  let sawEntropy = false;
+  while (cursor < bytes.byteLength) {
+    if (segments++ >= 256 || bytes[cursor] !== 0xff) fail("invalid_image");
     while (cursor < bytes.byteLength && bytes[cursor] === 0xff) cursor += 1;
     if (cursor >= bytes.byteLength) fail("invalid_image");
     const marker = bytes[cursor]!;
     cursor += 1;
 
-    if (marker === 0x00 || marker === 0xd8 || marker === 0xd9) fail("invalid_image");
-    if ((marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) continue;
-    if (marker === 0xda) fail("invalid_image");
+    if (marker === 0xd9) {
+      if (cursor !== bytes.byteLength || dimensions === undefined || !sawScan || !sawEntropy) {
+        fail("invalid_image");
+      }
+      return dimensions;
+    }
+    if (marker === 0x00 || marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7) || marker === 0x01) {
+      fail("invalid_image");
+    }
+
+    if (marker === 0xda) {
+      if (dimensions === undefined) fail("invalid_image");
+      cursor = parseJpegStartOfScan(bytes, cursor);
+      sawScan = true;
+      const scan = consumeJpegEntropy(bytes, cursor);
+      if (!scan.sawEntropy) fail("invalid_image");
+      sawEntropy = true;
+      cursor = scan.nextMarkerStart;
+      continue;
+    }
+
     if (cursor + 2 > bytes.byteLength) fail("invalid_image");
     const segmentLength = uint16(bytes, cursor);
     if (segmentLength < 2 || segmentLength > bytes.byteLength - cursor) fail("invalid_image");
     const segmentEnd = cursor + segmentLength;
     if (isJpegStartOfFrame(marker)) {
-      if (segmentLength < 8 || cursor + 7 > segmentEnd) fail("invalid_image");
-      const height = uint16(bytes, cursor + 3);
-      const width = uint16(bytes, cursor + 5);
-      return { width, height };
+      if (dimensions !== undefined) fail("invalid_image");
+      dimensions = parseJpegFrameDimensions(bytes, cursor, segmentLength, segmentEnd);
     }
     cursor = segmentEnd;
   }
   fail("invalid_image");
+}
+
+/**
+ * A JPEG cannot be accepted from a frame header alone. Real JPEGs contain at
+ * least one Start-of-Scan segment followed by entropy-coded bytes, with a
+ * terminal EOI marker. Parsing that bounded envelope fixes the former false
+ * rejection of every normal JPEG while also rejecting header-only polyglots.
+ */
+function parseJpegStartOfScan(bytes: Uint8Array, segmentStart: number): number {
+  if (segmentStart + 2 > bytes.byteLength) fail("invalid_image");
+  const segmentLength = uint16(bytes, segmentStart);
+  if (segmentLength < 8 || segmentLength > bytes.byteLength - segmentStart) fail("invalid_image");
+  const components = bytes[segmentStart + 2]!;
+  if (components < 1 || components > 4 || segmentLength !== 6 + components * 2) fail("invalid_image");
+
+  const selectorStart = segmentStart + 3;
+  const selectorEnd = selectorStart + components * 2;
+  const selectors = new Set<number>();
+  for (let cursor = selectorStart; cursor < selectorEnd; cursor += 2) {
+    const selector = bytes[cursor]!;
+    if (selector === 0 || selectors.has(selector)) fail("invalid_image");
+    selectors.add(selector);
+  }
+  const spectralStart = bytes[selectorEnd]!;
+  const spectralEnd = bytes[selectorEnd + 1]!;
+  const successiveApproximation = bytes[selectorEnd + 2]!;
+  if (spectralStart > spectralEnd || spectralEnd > 63 || (successiveApproximation >> 4) > 13 || (successiveApproximation & 0x0f) > 13) {
+    fail("invalid_image");
+  }
+  return segmentStart + segmentLength;
+}
+
+function consumeJpegEntropy(
+  bytes: Uint8Array,
+  start: number,
+): { readonly nextMarkerStart: number; readonly sawEntropy: boolean } {
+  let cursor = start;
+  let sawEntropy = false;
+  while (cursor < bytes.byteLength) {
+    const value = bytes[cursor]!;
+    cursor += 1;
+    if (value !== 0xff) {
+      sawEntropy = true;
+      continue;
+    }
+
+    const markerStart = cursor - 1;
+    while (cursor < bytes.byteLength && bytes[cursor] === 0xff) cursor += 1;
+    if (cursor >= bytes.byteLength) fail("invalid_image");
+    const marker = bytes[cursor]!;
+    if (marker === 0x00) {
+      // Byte stuffing represents a literal 0xff inside entropy-coded data.
+      sawEntropy = true;
+      cursor += 1;
+      continue;
+    }
+    if (marker >= 0xd0 && marker <= 0xd7) {
+      // Restart markers delimit entropy intervals but carry no payload.
+      cursor += 1;
+      continue;
+    }
+    return { nextMarkerStart: markerStart, sawEntropy };
+  }
+  fail("invalid_image");
+}
+
+function parseJpegFrameDimensions(
+  bytes: Uint8Array,
+  segmentStart: number,
+  segmentLength: number,
+  segmentEnd: number,
+): Dimensions {
+  if (segmentLength < 11 || segmentStart + 7 >= segmentEnd) fail("invalid_image");
+  const precision = bytes[segmentStart + 2]!;
+  const height = uint16(bytes, segmentStart + 3);
+  const width = uint16(bytes, segmentStart + 5);
+  const components = bytes[segmentStart + 7]!;
+  if (precision < 2 || precision > 16 || components < 1 || components > 4 || segmentLength !== 8 + components * 3) {
+    fail("invalid_image");
+  }
+
+  const componentIds = new Set<number>();
+  for (let cursor = segmentStart + 8; cursor < segmentEnd; cursor += 3) {
+    const componentId = bytes[cursor]!;
+    const sampling = bytes[cursor + 1]!;
+    const quantizationTable = bytes[cursor + 2]!;
+    const horizontalSampling = sampling >> 4;
+    const verticalSampling = sampling & 0x0f;
+    if (
+      componentId === 0 ||
+      componentIds.has(componentId) ||
+      horizontalSampling < 1 ||
+      horizontalSampling > 4 ||
+      verticalSampling < 1 ||
+      verticalSampling > 4 ||
+      quantizationTable > 3
+    ) {
+      fail("invalid_image");
+    }
+    componentIds.add(componentId);
+  }
+  return { width, height };
 }
 
 function isJpegStartOfFrame(marker: number): boolean {
@@ -351,50 +494,198 @@ function isJpegStartOfFrame(marker: number): boolean {
 }
 
 function parsePngDimensions(bytes: Uint8Array): Dimensions {
-  if (!hasPngMagic(bytes) || bytes.byteLength < 33 || uint32(bytes, 8) !== 13 || fourcc(bytes, 12) !== "IHDR") {
-    fail("invalid_image");
-  }
-  const width = uint32(bytes, 16);
-  const height = uint32(bytes, 20);
-  validatePngIhdr(bytes);
-
+  if (!hasPngMagic(bytes) || bytes.byteLength < 45) fail("invalid_image");
   let cursor = 8;
   let chunks = 0;
+  let header: PngHeader | undefined;
   let sawIdat = false;
+  let idatFinished = false;
+  let sawPalette = false;
+  const idatChunks: Uint8Array[] = [];
+  let idatByteLength = 0;
   while (cursor < bytes.byteLength) {
-    if (chunks++ > 4_096 || cursor + 12 > bytes.byteLength) fail("invalid_image");
+    if (chunks++ >= MAX_PNG_CHUNKS || cursor + 12 > bytes.byteLength) fail("invalid_image");
     const length = uint32(bytes, cursor);
     const type = fourcc(bytes, cursor + 4);
     if (!isPngChunkType(type) || length > bytes.byteLength - cursor - 12) fail("invalid_image");
-    const end = cursor + 12 + length;
-    if (cursor === 8 && type !== "IHDR") fail("invalid_image");
-    if (type === "IDAT") sawIdat = true;
-    if (type === "IEND") {
-      if (length !== 0 || !sawIdat || end !== bytes.byteLength) fail("invalid_image");
-      return { width, height };
+    const dataStart = cursor + 8;
+    const dataEnd = dataStart + length;
+    const end = dataEnd + 4;
+    if (pngCrc32(bytes, cursor + 4, dataEnd) !== uint32(bytes, dataEnd)) fail("invalid_image");
+
+    if (cursor === 8) {
+      if (type !== "IHDR" || length !== 13) fail("invalid_image");
+      header = parsePngHeader(bytes, dataStart);
+      // Bound dimensions before any zlib allocation. The returned metadata is
+      // discarded here and reconstructed by the caller with the true byte size.
+      imageMetadata("png", 1, header);
+      cursor = end;
+      continue;
+    }
+    if (header === undefined || type === "IHDR") fail("invalid_image");
+
+    if (type === "PLTE") {
+      if (sawPalette || sawIdat) fail("invalid_image");
+      validatePngPalette(length, header);
+      sawPalette = true;
+    } else if (type === "IDAT") {
+      if (idatFinished) fail("invalid_image");
+      sawIdat = true;
+      if (length > bytes.byteLength - idatByteLength) fail("invalid_image");
+      idatChunks.push(bytes.subarray(dataStart, dataEnd));
+      idatByteLength += length;
+    } else if (type === "IEND") {
+      if (length !== 0 || !sawIdat || end !== bytes.byteLength || (header.colorType === 3 && !sawPalette)) {
+        fail("invalid_image");
+      }
+      validatePngRaster(idatChunks, idatByteLength, header);
+      return { width: header.width, height: header.height };
+    } else {
+      if (isPngCriticalChunk(type)) fail("invalid_image");
+      if (sawIdat) idatFinished = true;
     }
     cursor = end;
   }
   fail("invalid_image");
 }
 
-function validatePngIhdr(bytes: Uint8Array): void {
-  const bitDepth = bytes[24]!;
-  const colorType = bytes[25]!;
+function parsePngHeader(bytes: Uint8Array, start: number): PngHeader {
+  if (start < 0 || start + 13 > bytes.byteLength) fail("invalid_image");
+  const width = uint32(bytes, start);
+  const height = uint32(bytes, start + 4);
+  const bitDepth = bytes[start + 8]!;
+  const colorType = bytes[start + 9]!;
   const validDepth = (colorType === 0 && [1, 2, 4, 8, 16].includes(bitDepth)) ||
     (colorType === 2 && [8, 16].includes(bitDepth)) ||
     (colorType === 3 && [1, 2, 4, 8].includes(bitDepth)) ||
     (colorType === 4 && [8, 16].includes(bitDepth)) ||
     (colorType === 6 && [8, 16].includes(bitDepth));
-  if (!validDepth || bytes[26] !== 0 || bytes[27] !== 0 || (bytes[28] !== 0 && bytes[28] !== 1)) {
+  const interlaceMethod = bytes[start + 12]!;
+  if (!validDepth || bytes[start + 10] !== 0 || bytes[start + 11] !== 0 || (interlaceMethod !== 0 && interlaceMethod !== 1)) {
     fail("invalid_image");
   }
+  const channels = pngChannels(colorType);
+  return { width, height, bitDepth, colorType, interlaceMethod, bitsPerPixel: channels * bitDepth };
 }
 
 function isPngChunkType(type: string): boolean {
   return type.length === 4 && [...type].every((character) =>
     (character >= "A" && character <= "Z") || (character >= "a" && character <= "z"),
   );
+}
+
+function validatePngPalette(length: number, header: PngHeader): void {
+  if (header.colorType === 0 || header.colorType === 4 || length < 3 || length > 768 || length % 3 !== 0) {
+    fail("invalid_image");
+  }
+  if (header.colorType === 3 && length / 3 > 2 ** header.bitDepth) fail("invalid_image");
+}
+
+function validatePngRaster(chunks: readonly Uint8Array[], compressedLength: number, header: PngHeader): void {
+  const expectedLength = pngInflatedByteLength(header);
+  const compressed = new Uint8Array(compressedLength);
+  let compressedOffset = 0;
+  for (const chunk of chunks) {
+    compressed.set(chunk, compressedOffset);
+    compressedOffset += chunk.byteLength;
+  }
+  if (compressedOffset !== compressed.byteLength) fail("invalid_image");
+
+  let inflated: Uint8Array;
+  try {
+    inflated = inflateSync(compressed, { maxOutputLength: expectedLength });
+  } catch {
+    // zlib details can include provider bytes; only the stable image failure
+    // crosses this boundary.
+    fail("invalid_image");
+  }
+  if (inflated.byteLength !== expectedLength) fail("invalid_image");
+
+  let offset = 0;
+  for (const pass of pngPassDimensions(header)) {
+    const rowBytes = pngRowByteLength(pass.width, header.bitsPerPixel);
+    for (let row = 0; row < pass.height; row += 1) {
+      if (offset >= inflated.byteLength || inflated[offset]! > 4) fail("invalid_image");
+      offset += 1 + rowBytes;
+    }
+  }
+  if (offset !== inflated.byteLength) fail("invalid_image");
+}
+
+function pngInflatedByteLength(header: PngHeader): number {
+  let total = 0;
+  for (const pass of pngPassDimensions(header)) {
+    const rowBytes = pngRowByteLength(pass.width, header.bitsPerPixel);
+    const passLength = pass.height * (rowBytes + 1);
+    if (!Number.isSafeInteger(passLength) || passLength > MAX_PNG_INFLATED_BYTES - total) {
+      // A valid PNG may use high bit depth, but Air's launch contract never
+      // allocates more than its decoded-image safety ceiling to validate one.
+      fail("invalid_image_dimensions");
+    }
+    total += passLength;
+  }
+  if (total < 1) fail("invalid_image");
+  return total;
+}
+
+function pngPassDimensions(header: PngHeader): readonly Dimensions[] {
+  if (header.interlaceMethod === 0) return [{ width: header.width, height: header.height }];
+  const passes: Dimensions[] = [];
+  for (const pass of PNG_ADAM7_PASSES) {
+    const width = pngPassLength(header.width, pass.startX, pass.stepX);
+    const height = pngPassLength(header.height, pass.startY, pass.stepY);
+    if (width > 0 && height > 0) passes.push({ width, height });
+  }
+  return passes;
+}
+
+function pngPassLength(length: number, start: number, step: number): number {
+  return length <= start ? 0 : Math.ceil((length - start) / step);
+}
+
+function pngRowByteLength(width: number, bitsPerPixel: number): number {
+  const bits = width * bitsPerPixel;
+  if (!Number.isSafeInteger(bits)) fail("invalid_image_dimensions");
+  return Math.ceil(bits / 8);
+}
+
+function pngChannels(colorType: number): number {
+  switch (colorType) {
+    case 0:
+    case 3:
+      return 1;
+    case 2:
+      return 3;
+    case 4:
+      return 2;
+    case 6:
+      return 4;
+    default:
+      fail("invalid_image");
+  }
+}
+
+function isPngCriticalChunk(type: string): boolean {
+  const first = type.charCodeAt(0);
+  return first >= 65 && first <= 90;
+}
+
+function createPngCrcTable(): Uint32Array {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < table.length; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) value = (value >>> 1) ^ ((value & 1) === 1 ? 0xedb88320 : 0);
+    table[index] = value >>> 0;
+  }
+  return table;
+}
+
+function pngCrc32(bytes: Uint8Array, start: number, end: number): number {
+  let crc = 0xffffffff;
+  for (let cursor = start; cursor < end; cursor += 1) {
+    crc = PNG_CRC_TABLE[(crc ^ bytes[cursor]!) & 0xff]! ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function validateMp4FileType(bytes: Uint8Array, box: IsoBox): void {

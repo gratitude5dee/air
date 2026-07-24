@@ -2,6 +2,7 @@ import { isStableModelSlug, validateStudioPrompt } from "./commands.js";
 import type {
   GmiJsonObject,
   GmiRequestQueueClient,
+  GmiRequestStatus,
   GmiSubmitResult,
 } from "./gmi-request-queue.js";
 import {
@@ -282,7 +283,9 @@ function mapGmiSubmitResult(result: GmiSubmitResult): StudioProviderSubmitResult
 
   switch (result.classification) {
     case "accepted":
-      return isGmiProviderRequestId(result.requestId)
+      return result.model === GMI_FLUX_KONTEXT_PRO_MODEL_ID
+        && isGmiProviderRequestId(result.requestId)
+        && isGmiRequestStatus(result.status)
         ? Object.freeze({ kind: "accepted", providerRequestId: result.requestId })
         : ambiguous();
     case "definitive_rejection":
@@ -337,6 +340,15 @@ function isCanonicalFingerprint(value: unknown): value is string {
 
 function isGmiProviderRequestId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/u.test(value);
+}
+
+function isGmiRequestStatus(value: unknown): value is GmiRequestStatus {
+  return value === "dispatched"
+    || value === "processing"
+    || value === "success"
+    || value === "failed"
+    || value === "cancelled"
+    || value === "unknown";
 }
 
 function isDefinitiveGmiRejectionStatus(value: unknown): value is number {

@@ -9,6 +9,7 @@ import {
 import {
   isStudioPreparedOutputTransport,
   type StudioIMessageTransport,
+  type StudioTransportOperationOptions,
 } from "./imessage-transport.js";
 import {
   isStudioProviderObservationPort,
@@ -31,6 +32,12 @@ import {
  */
 export type StudioProviderResultLifecycleResult =
   | { readonly kind: "disabled" }
+  /**
+   * A Vercel-bounded worker deliberately did not begin a result poll/fetch or
+   * Photon upload. Those operations cannot yet be completed as one provably
+   * bounded chain without a durable encrypted result-reference phase.
+   */
+  | { readonly kind: "deadline_deferred" }
   | { readonly kind: "missing_job" }
   | { readonly kind: "not_observable" }
   | { readonly kind: "awaiting_submission" }
@@ -48,10 +55,17 @@ export type StudioJobResultDispatchAuthorization = "allowed" | "defer" | "blocke
  * Observes a durably accepted request, validates an in-memory result, and
  * prepares a native Photon attachment exactly once. The final store call
  * atomically publishes the preamble + attachment and moves the job to ready.
+ *
+ * A deadline-bound Vercel Cron does not enter this `executing`-state lifecycle
+ * at all—not even to finalize an already-uploaded Photon GUID. It must not
+ * start a provider poll/result fetch/upload chain whose current worst case
+ * exceeds the shared worker budget. Paid activation remains blocked until the
+ * chain is split through a durable encrypted provider-result reference.
  */
 export async function advanceStudioProviderResultLifecycle(
   runtime: StudioRuntime,
   jobId: string,
+  deliveryOptions?: StudioTransportOperationOptions,
 ): Promise<StudioProviderResultLifecycleResult> {
   const job = await runtime.store.getJob(jobId);
   if (!job) return frozen({ kind: "missing_job" });
@@ -68,6 +82,16 @@ export async function advanceStudioProviderResultLifecycle(
     || !canDeliverStudioMessages(runtime.environment)
   ) return frozen({ kind: "disabled" });
 
+  // Do not start an executing-result recovery inside the bounded Vercel Cron.
+  // A complete path would serially include a provider status GET, private
+  // artifact fetch/validation, Photon token setup, native upload, and durable
+  // post-upload commits. Until that path is split through a separately
+  // encrypted result reference and backed by measured bounds, declining it
+  // before *any* content/provider/transport operation is the only dependable
+  // outcome. Ready/delivering jobs are reconciled by the caller before this
+  // function is reached and remain eligible for their non-provider path.
+  if (isDeadlineBoundDeliveryAttempt(deliveryOptions)) return frozen({ kind: "deadline_deferred" });
+
   // Private provider output must not be fetched unless a verified Photon
   // delivery binding is available to retain its opaque prepared GUID. Resolve
   // that binding only here, after durable job recovery reaches the outbound
@@ -75,7 +99,7 @@ export async function advanceStudioProviderResultLifecycle(
   // for a later recovery drain.
   let transport: StudioIMessageTransport;
   try {
-    transport = await getStudioDeliveryTransport(runtime);
+    transport = await getStudioDeliveryTransport(runtime, deliveryOptions);
   } catch {
     return frozen({ kind: "disabled" });
   }
@@ -206,11 +230,19 @@ export async function advanceStudioProviderResultLifecycle(
           artifacts: providerResult.artifacts,
           subrun,
           observationLeaseToken: observationLease.token,
+          deliveryOptions,
         });
     }
   } finally {
     await observationLease.release();
   }
+}
+
+function isDeadlineBoundDeliveryAttempt(options?: StudioTransportOperationOptions): boolean {
+  // Malformed caller options must fail closed the same way as a real absolute
+  // deadline. The only route that may start this combined chain today is the
+  // explicit unbounded review/test path, which omits options entirely.
+  return options?.deadlineAtMs !== undefined;
 }
 
 /**
@@ -330,8 +362,9 @@ async function prepareReadyProviderResult(input: {
   }[];
   readonly subrun: StudioProviderSubrunRecord;
   readonly observationLeaseToken: string;
+  readonly deliveryOptions?: StudioTransportOperationOptions | undefined;
 }): Promise<StudioProviderResultLifecycleResult> {
-  const { runtime, transport, job, snapshot, thread, artifacts, subrun, observationLeaseToken } = input;
+  const { runtime, transport, job, snapshot, thread, artifacts, subrun, observationLeaseToken, deliveryOptions } = input;
   if (!isStudioPreparedOutputTransport(transport)) return frozen({ kind: "disabled" });
   // The first enabled adapter is intentionally fixed to Flux's one-image
   // contract. Future multi-output modes need their own atomic multi-output
@@ -408,7 +441,7 @@ async function prepareReadyProviderResult(input: {
 
     let prepared;
     try {
-      prepared = await transport.prepareValidatedProviderArtifact(thread, artifact);
+      prepared = await transport.prepareValidatedProviderArtifact(thread, artifact, deliveryOptions);
     } catch {
       prepared = frozen({ kind: "send_unknown" as const, code: "prepared_output_upload_unknown" });
     }

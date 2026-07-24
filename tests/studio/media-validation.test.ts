@@ -1,3 +1,5 @@
+import { deflateSync } from "node:zlib";
+
 import { describe, expect, it } from "vitest";
 import {
   STUDIO_IMAGE_INPUT_MAX_BYTES,
@@ -42,10 +44,27 @@ function descriptor(tag: number, payload: Uint8Array): Buffer {
 function jpeg(width: number, height: number): Buffer {
   return Buffer.from([
     0xff, 0xd8,
-    0xff, 0xc0, 0x00, 0x08, 0x08,
+    0xff, 0xc0, 0x00, 0x0b, 0x08,
     (height >>> 8) & 0xff, height & 0xff,
     (width >>> 8) & 0xff, width & 0xff,
     0x01,
+    0x01, 0x11, 0x00,
+    0xff, 0xda, 0x00, 0x08,
+    0x01, 0x01, 0x00,
+    0x00, 0x3f, 0x00,
+    0x00,
+    0xff, 0xd9,
+  ]);
+}
+
+function jpegHeaderOnly(width: number, height: number): Buffer {
+  return Buffer.from([
+    0xff, 0xd8,
+    0xff, 0xc0, 0x00, 0x0b, 0x08,
+    (height >>> 8) & 0xff, height & 0xff,
+    (width >>> 8) & 0xff, width & 0xff,
+    0x01,
+    0x01, 0x11, 0x00,
     0xff, 0xd9,
   ]);
 }
@@ -60,8 +79,8 @@ function paddedJpeg(byteLength: number): Buffer {
 }
 
 function pngChunk(type: string, data: Uint8Array): Buffer {
-  // CRC is not material to this bounded metadata validator.
-  return Buffer.concat([uint32(data.byteLength), ascii(type), data, Buffer.alloc(4)]);
+  const typeBytes = ascii(type);
+  return Buffer.concat([uint32(data.byteLength), typeBytes, data, uint32(pngCrc32(Buffer.concat([typeBytes, data])))]);
 }
 
 function png(width: number, height: number): Buffer {
@@ -70,12 +89,36 @@ function png(width: number, height: number): Buffer {
   ihdr.writeUInt32BE(height, 4);
   ihdr[8] = 8;
   ihdr[9] = 6;
+  const raster = Buffer.alloc(height * (1 + width * 4));
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", deflateSync(raster)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function invalidCompressedPng(): Buffer {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(1, 0);
+  ihdr.writeUInt32BE(1, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     pngChunk("IHDR", ihdr),
     pngChunk("IDAT", Buffer.from([0])),
     pngChunk("IEND", Buffer.alloc(0)),
   ]);
+}
+
+function pngCrc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) === 1 ? 0xedb88320 : 0);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function heicFileType(): Buffer {
@@ -233,10 +276,11 @@ function failureCode(action: () => unknown): StudioMediaValidationCode {
 
 describe("studio image metadata validation", () => {
   it("accepts JPEG and PNG magic bytes only after dimensions are bounded", () => {
+    const ceilingJpeg = jpeg(4_096, 4_096);
     expect(validateStudioImageMetadata(jpeg(4_096, 4_096), { mimeType: "image/jpeg" })).toEqual({
       kind: "jpeg",
       mimeType: "image/jpeg",
-      byteLength: 14,
+      byteLength: ceilingJpeg.byteLength,
       width: 4_096,
       height: 4_096,
       pixels: 16_777_216,
@@ -255,6 +299,40 @@ describe("studio image metadata validation", () => {
     expect(failureCode(() => validateStudioImageMetadata(png(1, 4_097)))).toBe("invalid_image_dimensions");
     expect(failureCode(() => validateStudioImageMetadata(jpeg(1, 1), { mimeType: "image/png" }))).toBe("invalid_image");
     expect(failureCode(() => validateStudioImageMetadata(Buffer.from([0xff, 0xd8, 0xff])))).toBe("invalid_image");
+  });
+
+  it("requires a terminal JPEG scan instead of accepting a frame header as media", () => {
+    expect(failureCode(() => validateStudioImageMetadata(jpegHeaderOnly(1, 1)))).toBe("invalid_image");
+
+    // This ordinary JFIF sample exercises DQT/DHT segments, a real SOS
+    // envelope, byte-stuffed entropy data, and terminal EOI.
+    const jfif = Buffer.from(
+      "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9k=",
+      "base64",
+    );
+    expect(validateStudioImageMetadata(jfif)).toMatchObject({
+      kind: "jpeg",
+      width: 1,
+      height: 1,
+    });
+  });
+
+  it("requires checksum-valid, bounded PNG scanlines instead of trusting an IHDR", () => {
+    const canonicalPng = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
+    expect(validateStudioImageMetadata(canonicalPng)).toMatchObject({
+      kind: "png",
+      width: 1,
+      height: 1,
+    });
+
+    const badCrc = png(1, 1);
+    const lastByte = badCrc.byteLength - 1;
+    badCrc[lastByte] = (badCrc[lastByte] ?? 0) ^ 0x01;
+    expect(failureCode(() => validateStudioImageMetadata(badCrc))).toBe("invalid_image");
+    expect(failureCode(() => validateStudioImageMetadata(invalidCompressedPng()))).toBe("invalid_image");
   });
 
   it("uses separate input and output ceilings and explicitly blocks HEIC/HEIF", () => {

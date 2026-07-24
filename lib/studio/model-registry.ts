@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+
 import { z } from "zod";
 
 import {
@@ -110,6 +112,60 @@ const providerPayloadFieldSchema = z
   })
   .strict();
 
+/**
+ * Registry locations are consumed by provider adapters as SSRF allowlists.
+ * Keep the committed form at least as narrow as the runtime fetch boundary so
+ * a reviewed registry cannot name a location that would later be normalized
+ * differently by an adapter.
+ */
+function isCanonicalDnsHost(value: string): boolean {
+  if (value.length < 4 || value.length > 253 || value.endsWith(".") || !HOSTNAME_PATTERN.test(value)) {
+    return false;
+  }
+
+  try {
+    const hostname = new URL(`https://${value}`).hostname;
+    // WHATWG URL normalizes legacy numeric IPv4 spellings such as `127.1`.
+    // A registry hostname must remain an exact DNS name after parsing and can
+    // never be an IP literal, including link-local/private IPv4 addresses.
+    return hostname === value && isIP(hostname) === 0;
+  } catch {
+    return false;
+  }
+}
+
+const canonicalDnsHostSchema = z
+  .string()
+  .max(253)
+  .refine(isCanonicalDnsHost, "must be a canonical lowercase DNS hostname, not an IP address");
+
+const canonicalObjectPathPrefixSchema = z
+  .string()
+  .min(3)
+  .max(512)
+  .refine(
+    (value) => {
+      if (
+        !value.startsWith("/") ||
+        !value.endsWith("/") ||
+        value === "/" ||
+        value.includes("//") ||
+        value.includes("\\") ||
+        value.includes("?") ||
+        value.includes("#") ||
+        value.includes("%") ||
+        CONTROL_CHARACTER_PATTERN.test(value)
+      ) {
+        return false;
+      }
+      const segments = value.slice(1, -1).split("/");
+      return segments.length > 0 && segments.every((segment) =>
+        /^[A-Za-z0-9._~-]+$/.test(segment) && segment !== "." && segment !== ".."
+      );
+    },
+    "must be a non-root slash-terminated canonical object path prefix",
+  );
+
 const dataUriInputHostingSchema = z
   .object({
     mode: z.literal("data-uri"),
@@ -119,25 +175,12 @@ const dataUriInputHostingSchema = z
 const hostedPublicInputHostingSchema = z
   .object({
     mode: z.literal("hosted-public"),
-    host: z.string().max(253).regex(HOSTNAME_PATTERN, "must be a hostname"),
+    host: canonicalDnsHostSchema,
     /**
      * A path prefix must be more specific than `/`, so a compromised URL
      * cannot broaden an allowlist to every object on a shared host.
      */
-    pathPrefix: z
-      .string()
-      .min(2)
-      .max(512)
-      .refine(
-        (value) =>
-          value.startsWith("/") &&
-          !value.includes("?") &&
-          !value.includes("#") &&
-          !value.includes("\\") &&
-          !value.includes("..") &&
-          !CONTROL_CHARACTER_PATTERN.test(value),
-        "must be a safe absolute path prefix",
-      ),
+    pathPrefix: canonicalObjectPathPrefixSchema,
   })
   .strict();
 
@@ -153,21 +196,8 @@ const inputHostingSchema = z.union([dataUriInputHostingSchema, hostedPublicInput
  */
 const outputRetrievalSchema = z
   .object({
-    host: z.string().max(253).regex(HOSTNAME_PATTERN, "must be a hostname"),
-    pathPrefix: z
-      .string()
-      .min(2)
-      .max(512)
-      .refine(
-        (value) =>
-          value.startsWith("/") &&
-          !value.includes("?") &&
-          !value.includes("#") &&
-          !value.includes("\\") &&
-          !value.includes("..") &&
-          !CONTROL_CHARACTER_PATTERN.test(value),
-        "must be a safe absolute path prefix",
-      ),
+    host: canonicalDnsHostSchema,
+    pathPrefix: canonicalObjectPathPrefixSchema,
     /** Only a reviewed private or signed retrieval contract may be enabled. */
     access: z.enum(["provider-private", "signed-url"]),
     publiclyAccessible: z.literal(false),
@@ -413,6 +443,19 @@ function collectSemanticIssues(registry: AirModelRegistry): readonly ModelRegist
       }
     }
 
+    // Every ledger in the direct runtime is denominated in integer US cents.
+    // A non-USD enabled model would make the configured dollar caps ambiguous,
+    // while a zero reservation would bypass every cap if price evidence were
+    // stale or mis-entered. Keep discoveries representable, but require an
+    // explicit future conversion/free-model design before either can go live.
+    if (model.status === "enabled" && model.pricing.currency !== "USD") {
+      addIssue(
+        issues,
+        [...path, "pricing", "currency"],
+        "enabled models require USD pricing because Air spend caps are USD cents",
+      );
+    }
+
     if (model.polling.deadlineMs < model.polling.requestTimeoutMs) {
       addIssue(issues, [...path, "polling", "deadlineMs"], "deadline must cover one request timeout");
     }
@@ -458,6 +501,13 @@ function collectSemanticIssues(registry: AirModelRegistry): readonly ModelRegist
           issues,
           [...path, "pricing", "quotes", quoteIndex, "durationSeconds"],
           "video quote duration is not supported by this model",
+        );
+      }
+      if (model.status === "enabled" && quote.maximumQuotedCostCents < 1) {
+        addIssue(
+          issues,
+          [...path, "pricing", "quotes", quoteIndex, "maximumQuotedCostCents"],
+          "enabled models require a positive worst-case USD-cent reservation",
         );
       }
     }

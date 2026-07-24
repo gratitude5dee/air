@@ -1253,6 +1253,63 @@ describe("Air v2 studio durable store", () => {
     await scheduled?.lease.release();
   });
 
+  it("returns only a sender-owned most recent terminal job and never lets a retry rewrite it", async () => {
+    const { redis, store, cipher, prefix, now } = fixture();
+    const { senderHash, threadHash } = identities();
+    const first = job(cipher, senderHash, threadHash, "recent-terminal-first", now());
+    const notifications = initialNotifications({ tapback: true });
+    const limits = {
+      activeJobLimit: 1,
+      dailyUserJobLimit: 3,
+      perJobCapCents: 50,
+      dailySpendCapCents: 100,
+    } as const;
+
+    await expect(store.admitJobWithInitialNotifications({
+      job: first,
+      ...limits,
+      ...notifications,
+    })).resolves.toMatchObject({ admitted: true });
+    // An active admission is intentionally not returned through the terminal
+    // status lookup; `/status` reads the active pointer first.
+    await expect(store.getMostRecentTerminalJob(senderHash)).resolves.toBeNull();
+
+    await expect(store.transitionJob(first.jobId, "admitted", "failed"))
+      .resolves.toMatchObject({ state: "failed" });
+    await expect(store.getMostRecentTerminalJob(senderHash))
+      .resolves.toMatchObject({ jobId: first.jobId, senderHash, state: "failed" });
+    expect(await redis.get(`${prefix}:recent-job:${senderHash}`)).toBe(first.jobId);
+
+    const later = job(cipher, senderHash, threadHash, "recent-terminal-later", now());
+    await expect(store.admitJob({ job: later, ...limits })).resolves.toMatchObject({ admitted: true });
+    await expect(store.transitionJob(later.jobId, "admitted", "executing"))
+      .resolves.toMatchObject({ state: "executing" });
+    await expect(store.transitionJob(later.jobId, "executing", "ready"))
+      .resolves.toMatchObject({ state: "ready" });
+    await expect(store.transitionJob(later.jobId, "ready", "delivering"))
+      .resolves.toMatchObject({ state: "delivering" });
+    await expect(store.transitionJob(later.jobId, "delivering", "delivered"))
+      .resolves.toMatchObject({ state: "delivered" });
+    await expect(store.getMostRecentTerminalJob(senderHash))
+      .resolves.toMatchObject({ jobId: later.jobId, senderHash, state: "delivered" });
+
+    // A delayed duplicate for the earlier receipt must recover its original
+    // admission without changing which request is most recent.
+    await expect(store.admitJobWithInitialNotifications({
+      job: first,
+      ...limits,
+      ...notifications,
+    })).resolves.toMatchObject({ admitted: true, job: { jobId: first.jobId } });
+    await expect(store.getMostRecentTerminalJob(senderHash))
+      .resolves.toMatchObject({ jobId: later.jobId, state: "delivered" });
+
+    const otherSender = hashSenderIdentifier(identitySecret, "+14155550200");
+    // Even a corrupt cross-sender opaque pointer cannot disclose another
+    // caller's terminal metadata because the record owner is rechecked.
+    await redis.set(`${prefix}:recent-job:${otherSender}`, later.jobId);
+    await expect(store.getMostRecentTerminalJob(otherSender)).resolves.toBeNull();
+  });
+
   it("atomically cancels an admitted job with one same-thread notification and no schedulable work", async () => {
     const { redis, store, cipher, prefix, now } = fixture();
     const { senderHash, threadHash } = identities();
@@ -2381,10 +2438,61 @@ describe("Air v2 studio durable store", () => {
     expect(await store.claimNextOutbox()).toBeNull();
   });
 
+  it("does not spend the physical-send budget on deadline-only pre-Photon claim deferrals", async () => {
+    const { store, advance } = fixture();
+    const { senderHash } = identities();
+    await store.createOutbox({
+      outboxId: "outbox-deadline-only-deferral",
+      senderHash,
+      lane: "job-result",
+      sequence: 1,
+      payload: {
+        kind: "text",
+        text: "A shared Cron deadline must not exhaust this delivery.",
+        thread: { chatGuid: "chat", sendingLine: "line" },
+      },
+    });
+
+    // More than the normal three-Cron retry limit: every claim is returned
+    // before any Photon RPC, so each next Cron still starts at attempt one.
+    for (let cron = 0; cron <= STUDIO_MAX_OUTBOX_SEND_ATTEMPTS; cron += 1) {
+      const claim = await store.claimNextOutbox();
+      if (!claim) throw new Error(`expected deadline deferral claim ${String(cron)}`);
+      expect(claim.record).toMatchObject({ state: "sending", attempts: 1 });
+      expect(await store.deferOutboxBeforePhoton(claim.record.outboxId, claim.leaseToken)).toBe(true);
+      await expect(store.getOutbox(claim.record.outboxId)).resolves.toMatchObject({
+        state: "intent",
+        attempts: 0,
+      });
+    }
+
+    // A real, known pre-send transport failure still consumes an attempt and
+    // retains its normal retryable state/backoff.
+    const physicalFailure = await store.claimNextOutbox();
+    if (!physicalFailure) throw new Error("expected a claim after deadline deferrals");
+    expect(await store.finishOutbox(physicalFailure.record.outboxId, physicalFailure.leaseToken, "retryable_failure"))
+      .toBe(true);
+    await expect(store.getOutbox(physicalFailure.record.outboxId)).resolves.toMatchObject({
+      state: "retryable_failure",
+      attempts: 1,
+    });
+
+    advance(30_000);
+    const deferredRetry = await store.claimNextOutbox();
+    if (!deferredRetry) throw new Error("expected retryable claim after its normal backoff");
+    expect(deferredRetry.record).toMatchObject({ state: "sending", attempts: 2 });
+    expect(await store.deferOutboxBeforePhoton(deferredRetry.record.outboxId, deferredRetry.leaseToken)).toBe(true);
+    await expect(store.getOutbox(deferredRetry.record.outboxId)).resolves.toMatchObject({
+      state: "retryable_failure",
+      attempts: 1,
+    });
+  });
+
   it("exposes only legal state edges", () => {
     expect(canTransitionJob("admitted", "ready")).toBe(false);
     expect(canTransitionJob("executing", "reconciliation_required")).toBe(true);
     expect(canTransitionJob("ready", "reconciliation_required")).toBe(true);
+    expect(canTransitionOutbox("sending", "intent")).toBe(true);
     expect(canTransitionOutbox("sending", "send_unknown")).toBe(true);
     expect(canTransitionOutbox("send_unknown", "intent")).toBe(false);
   });

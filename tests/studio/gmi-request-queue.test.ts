@@ -81,11 +81,15 @@ describe("GMI request-queue client", () => {
     expect(request?.method).toBe("GET");
   });
 
-  it("submits the documented { model, payload } shape and accepts only a valid request id", async () => {
+  it("submits the documented { model, payload } shape and accepts only an exact model-bound request id/status", async () => {
     let request: Request | undefined;
     const service = client(async (input, init) => {
       request = new Request(input, init);
-      return json({ request_id: "gmi-request-123", status: "dispatched" }, 202);
+      return json({
+        model: "Kling-Text2Video-V2.1-Master",
+        request_id: "gmi-request-123",
+        status: "dispatched",
+      }, 202);
     });
 
     await expect(service.submitRequest({
@@ -93,6 +97,7 @@ describe("GMI request-queue client", () => {
       payload: { prompt: "A private fixture prompt", durationSeconds: "5" },
     })).resolves.toEqual({
       classification: "accepted",
+      model: "Kling-Text2Video-V2.1-Master",
       requestId: "gmi-request-123",
       status: "dispatched",
     });
@@ -103,6 +108,22 @@ describe("GMI request-queue client", () => {
       model: "Kling-Text2Video-V2.1-Master",
       payload: { prompt: "A private fixture prompt", durationSeconds: "5" },
     });
+  });
+
+  it("keeps 2xx submissions ambiguous when the response omits or mismatches the requested model", async () => {
+    const input = { model: "flux-kontext-pro", payload: { prompt: "fixture" } } as const;
+    const responses = [
+      { request_id: "gmi-request-123", status: "dispatched" },
+      { model: "other-model", request_id: "gmi-request-123", status: "dispatched" },
+    ] as const;
+
+    for (const response of responses) {
+      const service = client(async () => json(response, 202));
+      await expect(service.submit(input)).resolves.toEqual({
+        classification: "ambiguous",
+        reason: "malformed_response",
+      });
+    }
   });
 
   it("requires both an active release phase and the provider recovery switch before provider work", async () => {

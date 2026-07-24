@@ -137,6 +137,8 @@ export interface GmiRequestObservation {
 
 export interface GmiAcceptedSubmission {
   readonly classification: "accepted";
+  /** Exact model echoed by GMI; required to bind this request ID to the submit intent. */
+  readonly model: string;
   readonly requestId: string;
   readonly status: GmiRequestStatus;
 }
@@ -257,10 +259,11 @@ export class GmiRequestQueueClient {
     if (response.status >= 200 && response.status < 300) {
       try {
         const body = await readBoundedJson(response, this.maxResponseBytes);
-        return parseAcceptedSubmission(body);
+        return parseAcceptedSubmission(body, input.model);
       } catch {
-        // A 2xx response without a valid request_id cannot prove that GMI did
-        // not create a paid job, so it must remain operator-reconciled.
+        // A 2xx response without an exact model binding, valid request_id, or
+        // valid status cannot prove which paid job GMI created, so it must
+        // remain operator-reconciled.
         return ambiguousSubmission("malformed_response");
       }
     }
@@ -690,11 +693,12 @@ async function readBoundedJson(response: Response, maxBytes: number): Promise<Gm
   }
 }
 
-function parseAcceptedSubmission(value: GmiJsonValue): GmiAcceptedSubmission {
+function parseAcceptedSubmission(value: GmiJsonValue, expectedModel: string): GmiAcceptedSubmission {
   const object = requiredJsonObject(value);
+  const model = requiredExactProviderModel(object.model, expectedModel);
   const requestId = requiredProviderRequestId(object.request_id);
   const status = normalizeProviderStatus(object.status);
-  return Object.freeze({ classification: "accepted", requestId, status });
+  return Object.freeze({ classification: "accepted", model, requestId, status });
 }
 
 function parseRequestObservation(value: GmiJsonValue, expectedRequestId: string): GmiRequestObservation {
@@ -724,6 +728,13 @@ function requiredJsonObject(value: GmiJsonValue): GmiJsonObject {
 
 function requiredProviderRequestId(value: GmiJsonValue | undefined): string {
   if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/.test(value)) {
+    throw new GmiRequestQueueError("invalid_response", false);
+  }
+  return value;
+}
+
+function requiredExactProviderModel(value: GmiJsonValue | undefined, expectedModel: string): string {
+  if (typeof value !== "string" || value !== expectedModel) {
     throw new GmiRequestQueueError("invalid_response", false);
   }
   return value;

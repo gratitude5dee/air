@@ -1378,6 +1378,7 @@ export class StudioStore {
         this.readyJobKey(),
         this.releaseFenceKey(),
         canaryBudget.key,
+        this.recentJobKey(input.job.senderHash),
       ],
       arguments: [
         input.job.jobId,
@@ -1517,6 +1518,7 @@ export class StudioStore {
         tapback === undefined ? this.unusedInitialAdmissionOutboxPayloadKey() : this.outboxPayloadKey(tapback.outboxId),
         tapback === undefined ? this.unusedInitialAdmissionOutboxLaneKey() : this.outboxLaneKey(tapback),
         canaryBudget.key,
+        this.recentJobKey(job.senderHash),
       ],
       arguments: [
         job.jobId,
@@ -1593,6 +1595,24 @@ export class StudioStore {
     if (!isSafeRecordString(jobId, 160)) return null;
     const job = await this.getJob(jobId);
     if (!job || job.senderHash !== senderHash || isTerminalJobState(job.state)) return null;
+    return job;
+  }
+
+  /**
+   * Returns the caller-owned most recently admitted job only after it reaches
+   * a terminal state. The pointer contains an opaque job ID and is committed
+   * in the same transaction as a new admission; it is never trusted without
+   * re-checking both the record owner and terminal state.
+   *
+   * A retry of an older inbound receipt intentionally does not rewrite this
+   * pointer, so a delayed duplicate can never make an older job appear newer
+   * than a later completed request.
+   */
+  public async getMostRecentTerminalJob(senderHash: SenderHash): Promise<StudioJobRecord | null> {
+    const jobId = await this.redis.get(this.recentJobKey(senderHash));
+    if (!isSafeRecordString(jobId, 160)) return null;
+    const job = await this.getJob(jobId);
+    if (!job || job.senderHash !== senderHash || !isTerminalJobState(job.state)) return null;
     return job;
   }
 
@@ -3136,6 +3156,25 @@ export class StudioStore {
   }
 
   /**
+   * Returns a claimed intent to the durable queue when this worker knows that
+   * its shared invocation budget expired before it started any Photon RPC.
+   *
+   * Claiming deliberately increments the attempt counter so a crashed worker
+   * cannot replay a possibly-started send. That accounting must be undone
+   * only on this narrow, fenced pre-Photon path; ordinary retryable transport
+   * failures continue through `finishOutbox` and consume their retry budget.
+   */
+  public async deferOutboxBeforePhoton(outboxId: string, leaseToken: string): Promise<boolean> {
+    const record = await this.getOutbox(outboxId);
+    if (!record) return false;
+    const result = await this.redis.eval(DEFER_OUTBOX_BEFORE_PHOTON_LUA, {
+      keys: [this.outboxKey(outboxId), this.outboxLeaseKey(outboxId), this.readyOutboxKey(), this.outboxLaneKey(record)],
+      arguments: [leaseToken, String(this.now()), outboxId],
+    });
+    return typeof result === "string";
+  }
+
+  /**
    * Resolves a physical iMessage attempt only after an operator has confirmed
    * its outcome.  No send occurs here; a confirmed absence merely makes an
    * explicit later requeue possible.
@@ -3402,6 +3441,8 @@ export class StudioStore {
   /** Never written; keeps guarded-outbox Lua key arity fixed without a wildcard. */
   private unusedInboxScopeSequenceKey(): string { return `${this.prefix}:inbox:scope-sequence:unused`; }
   private activeJobKey(senderHash: SenderHash): string { return `${this.prefix}:active:${senderHash}`; }
+  /** Opaque sender-scoped pointer only; never stores a prompt, route, or media reference. */
+  private recentJobKey(senderHash: SenderHash): string { return `${this.prefix}:recent-job:${senderHash}`; }
   private userDailyKey(senderHash: SenderHash, day: string): string { return `${this.prefix}:rate:${day}:${senderHash}`; }
   private dailySpendKey(day: string): string { return `${this.prefix}:spend:${day}`; }
   private jobKey(jobId: string): string { return `${this.prefix}:job:${jobId}`; }
@@ -3537,7 +3578,9 @@ const JOB_TRANSITIONS: Readonly<Record<StudioJobState, readonly StudioJobState[]
 
 const OUTBOX_TRANSITIONS: Readonly<Record<StudioOutboxState, readonly StudioOutboxState[]>> = Object.freeze({
   intent: ["sending", "canceled"],
-  sending: ["sent", "retryable_failure", "failed", "canceled", "send_unknown"],
+  // A bounded worker can return a claim to intent only after proving that no
+  // Photon RPC began; every other interrupted sending lease stays unknown.
+  sending: ["intent", "sent", "retryable_failure", "failed", "canceled", "send_unknown"],
   retryable_failure: ["sending", "failed", "canceled"],
   send_unknown: ["sent", "confirmed_absent"],
   // A verified absence can spawn one separately audited replacement. The
@@ -3683,7 +3726,7 @@ const ADMIT_JOB_LUA = `
 -- AIR_STUDIO_ADMIT_JOB_V5
 -- KEYS: active sender fence, daily user count, daily spend, job metadata,
 --       encrypted job payload, durable job-ready index, release fence,
---       opaque non-expiring canary budget reservation
+--       opaque non-expiring canary budget reservation, sender recent-job pointer
 -- ARGV: job id, metadata, payload, daily ttl, payload ttl, user limit,
 --       spend cap, reserved cents, now, release generation, release phase,
 --       canary policy enabled, total cap, fal subcap
@@ -3733,6 +3776,7 @@ if fenceRaw then
 elseif ARGV[11] ~= 'dark' then
   return {'release_blocked'}
 end
+if not isStringOrMissing(KEYS[9]) then return {'storage_error'} end
 
 -- The canary record is shared by every sender/mode/provider for this opaque
 -- approved budget. It is touched only after the live release fence accepts
@@ -3785,6 +3829,7 @@ redis.call('SET', KEYS[3], tostring(spend + cost), 'EX', ARGV[4])
 -- refreshed beyond its hard 24-hour privacy deadline.
 redis.call('SET', KEYS[4], ARGV[2])
 redis.call('SET', KEYS[5], ARGV[3], 'EX', ARGV[5])
+redis.call('SET', KEYS[9], ARGV[1])
 redis.call('ZADD', KEYS[6], tonumber(ARGV[9]), ARGV[1])
 if canaryBudget then redis.call('SET', KEYS[8], cjson.encode(canaryBudget)) end
 return {'admitted'}
@@ -3795,7 +3840,8 @@ const ADMIT_JOB_WITH_INITIAL_NOTIFICATIONS_LUA = `
 -- KEYS: active sender fence, daily user count, daily spend, job metadata,
 --       encrypted job payload, durable job-ready index, release fence,
 --       outbox-ready index, acknowledgement metadata/payload/lane,
---       optional tapback metadata/payload/lane, opaque canary budget
+--       optional tapback metadata/payload/lane, opaque canary budget,
+--       sender recent-job pointer
 -- ARGV: job id, metadata, payload, daily ttl, job payload ttl, user limit,
 --       daily spend cap, reserved cents, now, release generation/phase,
 --       per-job cap, acknowledgement metadata/payload/id/sequence/due,
@@ -3964,6 +4010,7 @@ if not isStringOrMissing(KEYS[1]) or not isStringOrMissing(KEYS[2])
   or not isZsetOrMissing(KEYS[8]) or not isStringOrMissing(KEYS[9])
   or not isStringOrMissing(KEYS[10]) or not isZsetOrMissing(KEYS[11])
   or (ARGV[11] == 'canary' and not isStringOrMissing(KEYS[15]))
+  or not isStringOrMissing(KEYS[16])
   or (hasTapback and (
     not isStringOrMissing(KEYS[12]) or not isStringOrMissing(KEYS[13]) or not isZsetOrMissing(KEYS[14])
   )) then return {'storage_error'} end
@@ -4074,6 +4121,7 @@ redis.call('SET', KEYS[2], tostring(userCount + 1), 'EX', dailyTtl)
 redis.call('SET', KEYS[3], tostring(spend + reservedCents), 'EX', dailyTtl)
 redis.call('SET', KEYS[4], ARGV[2])
 redis.call('SET', KEYS[5], ARGV[3], 'EX', jobPayloadTtl)
+redis.call('SET', KEYS[16], jobId)
 redis.call('SET', KEYS[9], ARGV[13])
 redis.call('SET', KEYS[10], ARGV[14], 'EX', outboxPayloadTtl)
 redis.call('ZADD', KEYS[8], acknowledgementDueAt, acknowledgementId)
@@ -4905,6 +4953,33 @@ else
     redis.call('ZREM', KEYS[5], ARGV[5])
   end
 end
+return cjson.encode(record)
+`;
+
+const DEFER_OUTBOX_BEFORE_PHOTON_LUA = `
+-- AIR_STUDIO_DEFER_OUTBOX_BEFORE_PHOTON_V1
+-- This is intentionally narrower than a retryable delivery failure. The
+-- caller has established that no Photon RPC has begun, so restore the exact
+-- prior retry accounting instead of allowing a short Cron deadline to spend
+-- the durable physical-send budget.
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return false end
+local raw = redis.call('GET', KEYS[1])
+if not raw then return false end
+local record = cjson.decode(raw)
+if record.state ~= 'sending' then return false end
+if not redis.call('ZSCORE', KEYS[4], ARGV[3]) then return false end
+local attempts = tonumber(record.attempts)
+if attempts == nil or attempts < 1 or attempts ~= math.floor(attempts) then return false end
+attempts = attempts - 1
+record.attempts = attempts
+-- A fresh intent has no prior physical retry. Any nonzero count came from a
+-- real earlier retryable failure, which this worker must preserve.
+record.state = attempts == 0 and 'intent' or 'retryable_failure'
+record.stateVersion = record.stateVersion + 1
+record.updatedAtMs = tonumber(ARGV[2])
+redis.call('SET', KEYS[1], cjson.encode(record))
+redis.call('DEL', KEYS[2])
+redis.call('ZADD', KEYS[3], tonumber(ARGV[2]), ARGV[3])
 return cjson.encode(record)
 `;
 

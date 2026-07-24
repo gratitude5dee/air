@@ -14,6 +14,7 @@ import {
   type StudioPreparedOutputTransport,
   type StudioPrepareOutputOutcome,
   type StudioIMessageTransport,
+  type StudioTransportOperationOptions,
   type TransportOutcome,
 } from "./imessage-transport.js";
 import { assertNoPhotonTelemetryExporters } from "./photon-telemetry.js";
@@ -27,7 +28,14 @@ const TOKEN_EXPIRY_SAFETY_WINDOW_MS = 30_000;
  * it only prevents a stalled SDK call from holding the worker indefinitely.
  */
 const PHOTON_UNARY_RPC_TIMEOUT_MS = 20_000;
+/** Token minting is a pre-send prerequisite and must never consume a Cron. */
+export const PHOTON_TOKEN_ISSUE_TIMEOUT_MS = 10_000;
+/** Typing is cosmetic, so its own RPC never gets a full message-send window. */
+const PHOTON_TYPING_RPC_TIMEOUT_MS = 2_000;
 const PHOTON_LIKE_TAPBACK = Object.freeze({ kind: "like" as const });
+
+type PhotonTokenData = Awaited<ReturnType<typeof cloud.issueImessageTokens>>;
+export type PhotonTokenIssuer = (projectId: string, projectSecret: string) => Promise<PhotonTokenData>;
 
 interface PhotonReplyOptions {
   /** Native iMessage reply target, carried only from a validated inbound GUID. */
@@ -90,7 +98,7 @@ export interface PhotonIMessagePort {
    * Cloud tokens intentionally collapse that value to their one pooled client;
    * dedicated tokens retain the exact per-line lookup.
    */
-  getClient(sendingLine: string): Promise<PhotonIMessageClient>;
+  getClient(sendingLine: string, options?: StudioTransportOperationOptions): Promise<PhotonIMessageClient>;
 }
 
 export interface PhotonIMessageTransportOptions {
@@ -107,6 +115,12 @@ export interface CreatePhotonIMessageTransportOptions {
   readonly projectSecret: string;
   readonly webhookSecret: string;
   readonly port?: PhotonIMessagePort | undefined;
+  /** Limits first-use token minting to the current Cron invocation. */
+  readonly deadlineAtMs?: number | undefined;
+  /** Test-only injection; production uses Spectrum Cloud's reviewed binding. */
+  readonly issueImessageTokens?: PhotonTokenIssuer | undefined;
+  /** Test-only narrower bound; production uses `PHOTON_TOKEN_ISSUE_TIMEOUT_MS`. */
+  readonly tokenIssueTimeoutMs?: number | undefined;
 }
 
 /**
@@ -122,7 +136,11 @@ export async function createPhotonIMessageTransport(
   assertRequiredCredential(options.projectSecret, "IMESSAGE_PROJECT_SECRET");
   assertRequiredCredential(options.webhookSecret, "IMESSAGE_WEBHOOK_SECRET");
   assertNoPhotonTelemetryExporters();
-  const port = options.port ?? await CloudIMessagePort.create(options.projectId, options.projectSecret);
+  const port = options.port ?? await CloudIMessagePort.create(options.projectId, options.projectSecret, {
+    ...(options.deadlineAtMs === undefined ? {} : { deadlineAtMs: options.deadlineAtMs }),
+    ...(options.issueImessageTokens === undefined ? {} : { issueImessageTokens: options.issueImessageTokens }),
+    ...(options.tokenIssueTimeoutMs === undefined ? {} : { tokenIssueTimeoutMs: options.tokenIssueTimeoutMs }),
+  });
   return new PhotonIMessageTransport({
     projectId: options.projectId,
     projectSecret: options.projectSecret,
@@ -149,20 +167,31 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
     this.port = options.port;
   }
 
-  public async showTyping(thread: IMessageThreadReference): Promise<void> {
-    const client = await this.clientFor(thread);
-    await client.chats.setTyping(thread.chatGuid, true);
+  public async showTyping(thread: IMessageThreadReference, options?: StudioTransportOperationOptions): Promise<void> {
+    const client = await this.clientFor(thread, options);
+    await runPhotonOperation(
+      () => client.chats.setTyping(thread.chatGuid, true),
+      PHOTON_TYPING_RPC_TIMEOUT_MS,
+      options,
+      true,
+    );
   }
 
-  public async stopTyping(thread: IMessageThreadReference): Promise<void> {
-    const client = await this.clientFor(thread);
-    await client.chats.setTyping(thread.chatGuid, false);
+  public async stopTyping(thread: IMessageThreadReference, options?: StudioTransportOperationOptions): Promise<void> {
+    const client = await this.clientFor(thread, options);
+    await runPhotonOperation(
+      () => client.chats.setTyping(thread.chatGuid, false),
+      PHOTON_TYPING_RPC_TIMEOUT_MS,
+      options,
+      true,
+    );
   }
 
   public async sendText(
     thread: IMessageThreadReference,
     text: string,
     idempotencyKey: string,
+    options?: StudioTransportOperationOptions,
   ): Promise<TransportOutcome> {
     if (!isSafeTransportText(text)) {
       return Object.freeze({ kind: "failed", code: "invalid_text_payload" });
@@ -176,7 +205,7 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
 
     let client: PhotonIMessageClient;
     try {
-      client = await this.port.getClient(thread.sendingLine);
+      client = await clientForPort(this.port, thread.sendingLine, options);
     } catch {
       // Client resolution/token minting happens before a physical message RPC,
       // so this is safely retryable by the durable outbox.
@@ -184,16 +213,24 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
     }
 
     try {
-      await client.messages.sendText(thread.chatGuid, text, {
-        clientMessageId: idempotencyKey,
-        // Text-only onboarding/help must not trigger link previews or
-        // data-detector enrichment outside the signed Air boundary.
-        enableDataDetection: false,
-        enableLinkPreview: false,
-        ...replyOptionsFor(thread),
-      });
+      await runPhotonOperation(
+        () => client.messages.sendText(thread.chatGuid, text, {
+          clientMessageId: idempotencyKey,
+          // Text-only onboarding/help must not trigger link previews or
+          // data-detector enrichment outside the signed Air boundary.
+          enableDataDetection: false,
+          enableLinkPreview: false,
+          ...replyOptionsFor(thread),
+        }),
+        PHOTON_UNARY_RPC_TIMEOUT_MS,
+        options,
+        true,
+      );
       return Object.freeze({ kind: "sent" });
-    } catch {
+    } catch (error) {
+      if (error instanceof PhotonPreflightDeadlineExceeded) {
+        return Object.freeze({ kind: "retryable_failure", code: "photon_send_deadline_exhausted" });
+      }
       // The RPC may have reached Photon. Air deliberately does not replay it
       // automatically; the persisted clientMessageId is retained for a
       // reviewed reconciliation path if an operator later needs one.
@@ -213,6 +250,7 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
     thread: IMessageThreadReference,
     attachment: StudioAttachmentReference | StudioValidatedProviderArtifact,
     idempotencyKey: string,
+    options?: StudioTransportOperationOptions,
   ): Promise<TransportOutcome> {
     if (!isSafeThreadReference(thread)) {
       return Object.freeze({ kind: "failed", code: "invalid_thread_reference" });
@@ -224,10 +262,10 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
       return Object.freeze({ kind: "failed", code: "invalid_outbound_artifact" });
     }
 
-    const prepared = await this.prepareValidatedProviderArtifact(thread, attachment);
+    const prepared = await this.prepareValidatedProviderArtifact(thread, attachment, options);
     if (prepared.kind !== "prepared") return prepared;
 
-    const sent = await this.sendPreparedOutput(thread, prepared.output, idempotencyKey);
+    const sent = await this.sendPreparedOutput(thread, prepared.output, idempotencyKey, options);
     if (sent.kind !== "retryable_failure") return sent;
 
     // The legacy method has nowhere durable to keep the newly uploaded GUID.
@@ -246,6 +284,7 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
   public async prepareValidatedProviderArtifact(
     thread: IMessageThreadReference,
     attachment: StudioValidatedProviderArtifact,
+    options?: StudioTransportOperationOptions,
   ): Promise<StudioPrepareOutputOutcome> {
     if (!isSafeThreadReference(thread)) {
       return Object.freeze({ kind: "failed", code: "invalid_thread_reference" });
@@ -266,19 +305,27 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
 
     let client: PhotonIMessageClient;
     try {
-      client = await this.port.getClient(thread.sendingLine);
+      client = await clientForPort(this.port, thread.sendingLine, options);
     } catch {
       return Object.freeze({ kind: "retryable_failure", code: "photon_client_unavailable" });
     }
 
     let attachmentGuid: string;
     try {
-      const uploaded = await client.attachments.upload({
-        data: uploadArtifact.bytes,
-        fileName: uploadArtifact.filename,
-      });
+      const uploaded = await runPhotonOperation(
+        () => client.attachments.upload({
+          data: uploadArtifact.bytes,
+          fileName: uploadArtifact.filename,
+        }),
+        PHOTON_UNARY_RPC_TIMEOUT_MS,
+        options,
+        true,
+      );
       attachmentGuid = uploaded.attachment.guid;
-    } catch {
+    } catch (error) {
+      if (error instanceof PhotonPreflightDeadlineExceeded) {
+        return Object.freeze({ kind: "retryable_failure", code: "photon_upload_deadline_exhausted" });
+      }
       // The Photon upload API has no clientMessageId option. It may have
       // persisted bytes even when the caller observes an error, so retries
       // would create a second remote artifact and are never automatic.
@@ -306,6 +353,7 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
     thread: IMessageThreadReference,
     output: StudioPreparedOutput,
     idempotencyKey: string,
+    options?: StudioTransportOperationOptions,
   ): Promise<TransportOutcome> {
     if (!isSafeThreadReference(thread)) {
       return Object.freeze({ kind: "failed", code: "invalid_thread_reference" });
@@ -319,18 +367,26 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
 
     let client: PhotonIMessageClient;
     try {
-      client = await this.port.getClient(thread.sendingLine);
+      client = await clientForPort(this.port, thread.sendingLine, options);
     } catch {
       return Object.freeze({ kind: "retryable_failure", code: "photon_client_unavailable" });
     }
 
     try {
-      await client.messages.sendAttachment(thread.chatGuid, output.attachmentGuid, {
-        clientMessageId: idempotencyKey,
-        ...replyOptionsFor(thread),
-      });
+      await runPhotonOperation(
+        () => client.messages.sendAttachment(thread.chatGuid, output.attachmentGuid, {
+          clientMessageId: idempotencyKey,
+          ...replyOptionsFor(thread),
+        }),
+        PHOTON_UNARY_RPC_TIMEOUT_MS,
+        options,
+        true,
+      );
       return Object.freeze({ kind: "sent" });
-    } catch {
+    } catch (error) {
+      if (error instanceof PhotonPreflightDeadlineExceeded) {
+        return Object.freeze({ kind: "retryable_failure", code: "photon_send_deadline_exhausted" });
+      }
       // This send may have reached Photon. Keep the durable clientMessageId
       // for explicit reconciliation instead of re-uploading or replaying.
       return Object.freeze({ kind: "send_unknown", code: "photon_attachment_send_unknown" });
@@ -342,6 +398,7 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
     thread: IMessageThreadReference,
     messageId: string,
     idempotencyKey: string,
+    options?: StudioTransportOperationOptions,
   ): Promise<TransportOutcome> {
     if (!isSafeThreadReference(thread)) {
       return Object.freeze({ kind: "failed", code: "invalid_thread_reference" });
@@ -355,21 +412,29 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
 
     let client: PhotonIMessageClient;
     try {
-      client = await this.port.getClient(thread.sendingLine);
+      client = await clientForPort(this.port, thread.sendingLine, options);
     } catch {
       return Object.freeze({ kind: "retryable_failure", code: "photon_client_unavailable" });
     }
 
     try {
-      await client.messages.setReaction(
-        thread.chatGuid,
-        messageId,
-        PHOTON_LIKE_TAPBACK,
+      await runPhotonOperation(
+        () => client.messages.setReaction(
+          thread.chatGuid,
+          messageId,
+          PHOTON_LIKE_TAPBACK,
+          true,
+          { clientMessageId: idempotencyKey },
+        ),
+        PHOTON_UNARY_RPC_TIMEOUT_MS,
+        options,
         true,
-        { clientMessageId: idempotencyKey },
       );
       return Object.freeze({ kind: "sent" });
-    } catch {
+    } catch (error) {
+      if (error instanceof PhotonPreflightDeadlineExceeded) {
+        return Object.freeze({ kind: "retryable_failure", code: "photon_tapback_deadline_exhausted" });
+      }
       return Object.freeze({ kind: "send_unknown", code: "photon_like_tapback_unknown" });
     }
   }
@@ -379,9 +444,12 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
     throw new Error("attachment_transport_not_enabled");
   }
 
-  private async clientFor(thread: IMessageThreadReference): Promise<PhotonIMessageClient> {
+  private async clientFor(
+    thread: IMessageThreadReference,
+    options?: StudioTransportOperationOptions,
+  ): Promise<PhotonIMessageClient> {
     if (!isSafeThreadReference(thread)) throw new Error("invalid_thread_reference");
-    return this.port.getClient(thread.sendingLine);
+    return await clientForPort(this.port, thread.sendingLine, options);
   }
 }
 
@@ -391,7 +459,7 @@ export class PhotonIMessageTransport implements StudioIMessageTransport, StudioP
  * still uses Photon-issued credentials; all automatic RPC retry is disabled.
  */
 class CloudIMessagePort implements PhotonIMessagePort {
-  private tokenData: Awaited<ReturnType<typeof cloud.issueImessageTokens>>;
+  private tokenData: PhotonTokenData;
   private expiresAtMs: number;
   private readonly clientsByInstance = new Map<string, PhotonIMessageClient>();
   private clientsByLine = new Map<string, PhotonIMessageClient>();
@@ -400,20 +468,46 @@ class CloudIMessagePort implements PhotonIMessagePort {
   private constructor(
     private readonly projectId: string,
     private readonly projectSecret: string,
-    tokenData: Awaited<ReturnType<typeof cloud.issueImessageTokens>>,
+    private readonly issueImessageTokens: PhotonTokenIssuer,
+    private readonly tokenIssueTimeoutMs: number,
+    tokenData: PhotonTokenData,
   ) {
     this.tokenData = tokenData;
     this.expiresAtMs = expiryFromToken(tokenData);
     this.syncClients(tokenData);
   }
 
-  public static async create(projectId: string, projectSecret: string): Promise<CloudIMessagePort> {
-    const tokenData = await cloud.issueImessageTokens(projectId, projectSecret);
-    return new CloudIMessagePort(projectId, projectSecret, tokenData);
+  public static async create(
+    projectId: string,
+    projectSecret: string,
+    options: {
+      readonly deadlineAtMs?: number | undefined;
+      readonly issueImessageTokens?: PhotonTokenIssuer | undefined;
+      readonly tokenIssueTimeoutMs?: number | undefined;
+    } = {},
+  ): Promise<CloudIMessagePort> {
+    const issueImessageTokens = options.issueImessageTokens ?? cloud.issueImessageTokens;
+    const tokenIssueTimeoutMs = normalizeTokenIssueTimeout(options.tokenIssueTimeoutMs);
+    const tokenData = await issuePhotonTokens(
+      issueImessageTokens,
+      projectId,
+      projectSecret,
+      tokenIssueTimeoutMs,
+      options,
+    );
+    return new CloudIMessagePort(projectId, projectSecret, issueImessageTokens, tokenIssueTimeoutMs, tokenData);
   }
 
-  public async getClient(sendingLine: string): Promise<PhotonIMessageClient> {
-    await this.refreshIfNeeded();
+  public async getClient(
+    sendingLine: string,
+    options?: StudioTransportOperationOptions,
+  ): Promise<PhotonIMessageClient> {
+    // Refresh and validate token lifetime before the SDK is handed a client.
+    // The SDK invokes its token callback after its outbound RPC has been
+    // admitted, so that callback must remain a read-only lookup: a late token
+    // mint there would outlive the caller's durable deadline and make the
+    // physical-send boundary ambiguous.
+    await this.ensureFreshTokenForOutboundRpc(options);
     // A shared Cloud project has no dedicated sending-line token. The signed
     // webhook still gives Air the real line for encrypted scope/audit data,
     // but every shared inbound line must use the single pooled client. A
@@ -425,7 +519,9 @@ class CloudIMessagePort implements PhotonIMessagePort {
   }
 
   private async tokenFor(instanceId: string): Promise<string> {
-    await this.refreshIfNeeded();
+    // This callback runs inside the SDK's outbound-RPC path. It must never
+    // initiate network work: getClient has already minted a sufficiently
+    // fresh token under the caller-owned deadline before that RPC is admitted.
     const current = this.tokenData;
     if (instanceId === PHOTON_SHARED_LINE) {
       if (current.type !== "shared") throw new Error("photon_client_mode_changed");
@@ -437,24 +533,42 @@ class CloudIMessagePort implements PhotonIMessagePort {
     return token;
   }
 
-  private async refreshIfNeeded(): Promise<void> {
-    if (Date.now() < this.expiresAtMs - TOKEN_EXPIRY_SAFETY_WINDOW_MS) return;
+  private async ensureFreshTokenForOutboundRpc(options?: StudioTransportOperationOptions): Promise<void> {
+    await this.refreshIfNeeded(options);
+    // A provider response with an unexpectedly short TTL must not be deferred
+    // to the SDK callback. Reject it before a message/upload RPC begins so the
+    // durable caller can retry safely with its own deadline.
+    if (!this.hasSufficientTokenLifetime()) throw new Error("photon_token_ttl_too_short");
+  }
+
+  private async refreshIfNeeded(options?: StudioTransportOperationOptions): Promise<void> {
+    if (this.hasSufficientTokenLifetime()) return;
     if (!this.refreshInFlight) {
-      this.refreshInFlight = this.refresh().finally(() => {
+      this.refreshInFlight = this.refresh(options).finally(() => {
         this.refreshInFlight = undefined;
       });
     }
     await this.refreshInFlight;
   }
 
-  private async refresh(): Promise<void> {
-    const tokenData = await cloud.issueImessageTokens(this.projectId, this.projectSecret);
+  private hasSufficientTokenLifetime(): boolean {
+    return Date.now() < this.expiresAtMs - TOKEN_EXPIRY_SAFETY_WINDOW_MS;
+  }
+
+  private async refresh(options?: StudioTransportOperationOptions): Promise<void> {
+    const tokenData = await issuePhotonTokens(
+      this.issueImessageTokens,
+      this.projectId,
+      this.projectSecret,
+      this.tokenIssueTimeoutMs,
+      options,
+    );
     this.tokenData = tokenData;
     this.expiresAtMs = expiryFromToken(tokenData);
     this.syncClients(tokenData);
   }
 
-  private syncClients(tokenData: Awaited<ReturnType<typeof cloud.issueImessageTokens>>): void {
+  private syncClients(tokenData: PhotonTokenData): void {
     const nextByLine = new Map<string, PhotonIMessageClient>();
     if (tokenData.type === "shared") {
       nextByLine.set(PHOTON_SHARED_LINE, this.clientForInstance(PHOTON_SHARED_LINE, PHOTON_SHARED_ADDRESS));
@@ -489,7 +603,106 @@ class CloudIMessagePort implements PhotonIMessagePort {
   }
 }
 
-function expiryFromToken(tokenData: Awaited<ReturnType<typeof cloud.issueImessageTokens>>): number {
+/**
+ * Resolving a client is a pre-send boundary.  When the remaining invocation
+ * window expires here, no iMessage RPC has begun and the durable outbox can
+ * safely retry it on the next Cron.
+ */
+async function clientForPort(
+  port: PhotonIMessagePort,
+  sendingLine: string,
+  options?: StudioTransportOperationOptions,
+): Promise<PhotonIMessageClient> {
+  return options === undefined
+    ? await port.getClient(sendingLine)
+    : await port.getClient(sendingLine, options);
+}
+
+/** A timeout after the supplied operation starts is intentionally ambiguous. */
+async function runPhotonOperation<T>(
+  operation: () => Promise<T>,
+  maximumTimeoutMs: number,
+  options?: StudioTransportOperationOptions,
+  requirePhysicalActionMargin = false,
+): Promise<T> {
+  const timeoutMs = boundedOperationTimeout(maximumTimeoutMs, options, requirePhysicalActionMargin);
+  if (timeoutMs === null) throw new PhotonPreflightDeadlineExceeded();
+
+  return await new Promise<T>((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new PhotonOperationDeadlineExceeded()), timeoutMs);
+    let operationPromise: Promise<T>;
+    try {
+      operationPromise = Promise.resolve().then(operation);
+    } catch (error) {
+      clearTimeout(timeout);
+      reject(error);
+      return;
+    }
+    void operationPromise.then(
+      (value) => {
+        clearTimeout(timeout);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function issuePhotonTokens(
+  issueImessageTokens: PhotonTokenIssuer,
+  projectId: string,
+  projectSecret: string,
+  tokenIssueTimeoutMs: number,
+  options?: StudioTransportOperationOptions,
+): Promise<PhotonTokenData> {
+  return await runPhotonOperation(
+    () => issueImessageTokens(projectId, projectSecret),
+    tokenIssueTimeoutMs,
+    options,
+  );
+}
+
+function boundedOperationTimeout(
+  maximumTimeoutMs: number,
+  options?: StudioTransportOperationOptions,
+  requirePhysicalActionMargin = false,
+): number | null {
+  if (!Number.isSafeInteger(maximumTimeoutMs) || maximumTimeoutMs < 1) return null;
+  if (options?.deadlineAtMs === undefined) return maximumTimeoutMs;
+  if (!Number.isSafeInteger(options.deadlineAtMs)) return null;
+  const remaining = options.deadlineAtMs - Date.now();
+  if (!Number.isSafeInteger(remaining) || remaining < 1) return null;
+  if (requirePhysicalActionMargin) {
+    const minimum = options.minimumPhysicalActionRemainingMs;
+    if (minimum !== undefined && (!Number.isSafeInteger(minimum) || minimum < 1 || remaining < minimum)) return null;
+  }
+  return Math.min(maximumTimeoutMs, remaining);
+}
+
+function normalizeTokenIssueTimeout(value: number | undefined): number {
+  if (value === undefined) return PHOTON_TOKEN_ISSUE_TIMEOUT_MS;
+  if (!Number.isSafeInteger(value) || value < 1 || value > PHOTON_TOKEN_ISSUE_TIMEOUT_MS) {
+    throw new Error("invalid_photon_token_issue_timeout");
+  }
+  return value;
+}
+
+class PhotonPreflightDeadlineExceeded extends Error {
+  public constructor() {
+    super("photon_preflight_deadline_exceeded");
+  }
+}
+
+class PhotonOperationDeadlineExceeded extends Error {
+  public constructor() {
+    super("photon_operation_deadline_exceeded");
+  }
+}
+
+function expiryFromToken(tokenData: PhotonTokenData): number {
   if (!Number.isFinite(tokenData.expiresIn) || tokenData.expiresIn <= 0 || tokenData.expiresIn > 86_400) {
     throw new Error("photon_token_expiry_invalid");
   }

@@ -122,6 +122,7 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
   it("uses an injected queue client for the exact prompt-only Flux request", async () => {
     const queue = queueClient({
       classification: "accepted",
+      model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
       requestId: "gmi-flux-request-001",
       status: "dispatched",
     });
@@ -146,6 +147,7 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
   it("rejects any provider, model, adapter, mode, or output binding mismatch without a provider call", async () => {
     const queue = queueClient({
       classification: "accepted",
+      model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
       requestId: "must-not-be-called",
       status: "dispatched",
     });
@@ -170,6 +172,7 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
   it("rejects attachment-bearing, empty, and invalid durable-intent requests before the queue boundary", async () => {
     const queue = queueClient({
       classification: "accepted",
+      model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
       requestId: "must-not-be-called",
       status: "dispatched",
     });
@@ -207,7 +210,19 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
     }));
     const malformedAccepted = new GmiFluxKontextProStudioProvider(queueClient({
       classification: "accepted",
+      model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
       requestId: "invalid request id with spaces",
+      status: "dispatched",
+    }));
+    const missingModelAccepted = new GmiFluxKontextProStudioProvider(queueClient({
+      classification: "accepted",
+      requestId: "gmi-flux-request-001",
+      status: "dispatched",
+    } as unknown as GmiSubmitResult));
+    const mismatchedModelAccepted = new GmiFluxKontextProStudioProvider(queueClient({
+      classification: "accepted",
+      model: "other-model",
+      requestId: "gmi-flux-request-001",
       status: "dispatched",
     }));
     const clientThrows = new GmiFluxKontextProStudioProvider({
@@ -219,6 +234,8 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
     await expect(rejected.submit(submitInput())).resolves.toEqual({ kind: "definitive_rejection" });
     await expect(ambiguousResult.submit(submitInput())).resolves.toEqual({ kind: "ambiguous" });
     await expect(malformedAccepted.submit(submitInput())).resolves.toEqual({ kind: "ambiguous" });
+    await expect(missingModelAccepted.submit(submitInput())).resolves.toEqual({ kind: "ambiguous" });
+    await expect(mismatchedModelAccepted.submit(submitInput())).resolves.toEqual({ kind: "ambiguous" });
     await expect(clientThrows.submit(submitInput())).resolves.toEqual({ kind: "ambiguous" });
   });
 
@@ -234,6 +251,7 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
     }));
     const submitRequest = vi.fn(async () => ({
       classification: "accepted" as const,
+      model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
       requestId: "not-used",
       status: "dispatched" as const,
     }));

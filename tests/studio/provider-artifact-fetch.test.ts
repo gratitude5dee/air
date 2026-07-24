@@ -111,6 +111,8 @@ describe("provider artifact fetch boundary", () => {
     const invalidPolicies = [
       { host: "storage.googleapis.com:443", pathPrefix: "/gmi-generated-assets/air/", access: "signed-url" },
       { host: "STORAGE.googleapis.com", pathPrefix: "/gmi-generated-assets/air/", access: "signed-url" },
+      { host: "169.254.169.254", pathPrefix: "/gmi-generated-assets/air/", access: "signed-url" },
+      { host: "127.1", pathPrefix: "/gmi-generated-assets/air/", access: "signed-url" },
       { host: "storage.googleapis.com", pathPrefix: "/", access: "signed-url" },
       { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets/%2f/", access: "signed-url" },
       { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets/../air/", access: "signed-url" },
@@ -118,15 +120,21 @@ describe("provider artifact fetch boundary", () => {
       { host: "storage.googleapis.com", pathPrefix: "/gmi-generated-assets/air/", access: "unauthenticated" },
     ] as const;
 
+    let calls = 0;
+
     for (const invalidPolicy of invalidPolicies) {
       await expect(fetchStudioProviderArtifact({
         url: allowedUrl,
         // The runtime boundary receives registry-derived data, but this test
         // intentionally supplies an untrusted invalid literal.
         policy: invalidPolicy as unknown as typeof policy,
-        fetch: async () => new Response("must not be reached"),
+        fetch: async () => {
+          calls += 1;
+          return new Response("must not be reached");
+        },
       })).rejects.toSatisfy((error: unknown) => fetchErrorCode(error) === "invalid_policy");
     }
+    expect(calls).toBe(0);
   });
 
   it("requires a complete GCS V4 signed URL before an allowed result is fetched", async () => {

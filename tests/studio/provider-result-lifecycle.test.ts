@@ -45,7 +45,7 @@ const PREPARED_OUTPUT: StudioPreparedOutput = Object.freeze({
   attachmentGuid: "private-photon-guid-lifecycle-001",
 });
 const ONE_PIXEL_PNG = Uint8Array.from(Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl54P8AAAAASUVORK5CYII=",
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
 ));
 
@@ -356,6 +356,27 @@ function expectProviderSecretsAbsent(setup: Awaited<ReturnType<typeof fixture>>)
 }
 
 describe("private provider result lifecycle", () => {
+  it("defers a deadline-bound executing recovery before provider or Photon work", async () => {
+    const setup = await fixture({ observations: [readyPrivateImage()] });
+    const job = await submitAccepted(setup, "deadline-bound-result-recovery");
+    const getDeliveryTransport = vi.fn(async () => setup.transport);
+    Object.assign(setup.runtime, { getDeliveryTransport });
+
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId, {
+      deadlineAtMs: Date.now() + 50_000,
+      minimumDeliveryPreparationRemainingMs: 36_000,
+      minimumPhysicalActionRemainingMs: 22_000,
+    })).resolves.toEqual({ kind: "deadline_deferred" });
+
+    expect(getDeliveryTransport).not.toHaveBeenCalled();
+    expect(setup.provider.observe).not.toHaveBeenCalled();
+    expect(setup.transport.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "executing" });
+    const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
+    if (!subrun) throw new Error("expected submitted subrun");
+    await expect(setup.store.getProviderObservation(subrun.subrunId)).resolves.toBeNull();
+  });
+
   it("never resubmits an accepted request across bounded poll retries", async () => {
     const setup = await fixture({
       observations: [
@@ -387,10 +408,9 @@ describe("private provider result lifecycle", () => {
       .resolves.toMatchObject({ state: "scheduled", pollAttempts: 2 });
   });
 
-  it("passes an observation's exact due time to the scheduler even when the job timestamp is stale", async () => {
+  it("persists an observation's exact due time even when the job timestamp is stale", async () => {
     const setup = await fixture();
-    const created = setup.job("scheduler-uses-observation-due-time");
-    await setup.admit(created);
+    const job = await submitAccepted(setup, "scheduler-uses-observation-due-time");
     setup.provider.observe.mockImplementationOnce(async () => {
       // The provider GET consumed time after the executing job was written.
       // Deriving a delay from that stale job timestamp would make the next
@@ -399,20 +419,15 @@ describe("private provider result lifecycle", () => {
       setup.advance(7_000);
       return frozen({ kind: "pending" as const });
     });
-    const rescheduleAt = vi.spyOn(setup.store, "rescheduleClaimedJobAt");
 
-    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId))
+      .resolves.toMatchObject({ kind: "pending" });
 
-    const subrun = await setup.store.getProviderSubrunForJob(created.jobId);
+    const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
     if (!subrun) throw new Error("expected submitted subrun");
     const observation = await setup.store.getProviderObservation(subrun.subrunId);
     if (!observation) throw new Error("expected pending observation");
     expect(observation.nextDueAtMs).toBe(setup.now() + 1_000);
-    expect(rescheduleAt).toHaveBeenCalledWith(
-      expect.objectContaining({ jobId: created.jobId }),
-      expect.any(String),
-      observation.nextDueAtMs,
-    );
     expect(setup.provider.submit).toHaveBeenCalledTimes(1);
     expect(setup.provider.observe).toHaveBeenCalledTimes(1);
   });
@@ -617,7 +632,7 @@ describe("private provider result lifecycle", () => {
     await expect(setup.store.getProviderObservation(subrun.subrunId)).resolves.toMatchObject({ state: "observing" });
   });
 
-  it("drainStudio finalizes a committed GUID during submit rollback without another observe, fetch, or upload", async () => {
+  it("keeps a committed GUID durable instead of finalizing it in a bounded Cron", async () => {
     const setup = await fixture({ observations: [readyPrivateImage()] });
     const job = await submitAccepted(setup, "drain-recovery-prepared-guid");
     await seedPreparedOutput(setup, job);
@@ -634,22 +649,23 @@ describe("private provider result lifecycle", () => {
     });
     await expect(drainStudio(recoveryRuntime)).resolves.toBeUndefined();
 
+    // A bounded Cron must not enter the executing provider-result lifecycle,
+    // even when the upload itself happened before the worker crash. It leaves
+    // the encrypted GUID and job intact for the future reviewed durable split.
+    await expect(drainStudio(recoveryRuntime)).resolves.toBeUndefined();
+
     expect(setup.provider.submit).toHaveBeenCalledTimes(1);
     expect(setup.provider.observe).not.toHaveBeenCalled();
     expect(setup.transport.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
-    expect(setup.transport.events).toEqual([
-      `text:${STUDIO_RESULT_PREAMBLE_TEXT}`,
-      `attachment:${PREPARED_OUTPUT.attachmentGuid}`,
-    ]);
-    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "delivered" });
+    expect(setup.transport.events).toEqual([]);
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "executing" });
 
     const [preamble, cursor] = await Promise.all([
       setup.store.getJobResultPreamble(job.jobId),
       setup.store.getJobResultCursor(job.jobId),
     ]);
-    if (!preamble || !cursor) throw new Error("expected durable recovered result");
-    const attachment = await setup.store.getOutbox(cursor.outputs[0]!.outboxId);
-    if (!attachment) throw new Error("expected recovered attachment outbox");
+    expect(preamble).toBeNull();
+    expect(cursor).toBeNull();
     expectProviderSecretsAbsent(setup);
   });
 
@@ -686,5 +702,16 @@ describe("private provider result lifecycle", () => {
 
     await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "executing" });
     await expect(setup.store.getJobResultCursor(job.jobId)).resolves.toBeNull();
+  });
+
+  it("does not enter native Photon preparation from the shared Cron", async () => {
+    const setup = await fixture({ observations: [readyPrivateImage()] });
+    const job = await submitAccepted(setup, "shared-deadline-native-preparation");
+
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+
+    expect(setup.provider.observe).not.toHaveBeenCalled();
+    expect(setup.transport.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "executing" });
   });
 });

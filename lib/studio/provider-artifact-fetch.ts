@@ -1,3 +1,5 @@
+import { isIP } from "node:net";
+
 import { STUDIO_PROVIDER_ARTIFACT_MAX_BYTES } from "./artifact-validation.js";
 
 /**
@@ -273,6 +275,14 @@ function normalizePolicy(value: StudioProviderArtifactFetchPolicy): NormalizedPo
 
 function isCanonicalDnsHost(host: string): boolean {
   if (host.length < 4 || host.length > 253 || !host.includes(".") || host.endsWith(".")) return false;
+  try {
+    const normalizedHost = new URL(`https://${host}`).hostname;
+    // Reject both ordinary IPv4 literals and legacy numeric forms that URL
+    // normalizes to one before an allowlisted artifact fetch is attempted.
+    if (normalizedHost !== host || isIP(normalizedHost) !== 0) return false;
+  } catch {
+    return false;
+  }
   const labels = host.split(".");
   return labels.every((label) => (
     label.length > 0 &&
