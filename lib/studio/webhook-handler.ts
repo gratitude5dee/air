@@ -11,7 +11,7 @@ import {
   verifySpectrumSignature,
 } from "../spectrum-webhook.js";
 import { loadStudioEnvironment } from "./config.js";
-import { getStudioRuntime, type StudioRuntime } from "./runtime.js";
+import type { StudioRuntime } from "./runtime.js";
 import type { StudioInboundEnvelope } from "./store.js";
 
 export interface WebhookHandlerOptions {
@@ -115,7 +115,7 @@ export async function handleStudioIMessageWebhook(
 
   let runtime: StudioRuntime;
   try {
-    runtime = await (options.getRuntime ?? getStudioRuntime)();
+    runtime = await resolveStudioRuntime(options);
   } catch {
     return new Response(null, { status: 503 });
   }
@@ -145,6 +145,18 @@ export async function handleStudioIMessageWebhook(
     return new Response(null, { status: 503 });
   }
   return new Response(null, { status: 200 });
+}
+
+/**
+ * Keep the Redis/runtime graph out of the public webhook's cold path. Invalid
+ * signatures, non-actionable events, and non-allowlisted senders need only
+ * the lightweight raw-HMAC boundary; they must not wait on serverless module
+ * initialization intended for durable receipt persistence.
+ */
+async function resolveStudioRuntime(options: WebhookHandlerOptions): Promise<StudioRuntime> {
+  if (options.getRuntime !== undefined) return await options.getRuntime();
+  const { getStudioRuntime } = await import("./runtime.js");
+  return await getStudioRuntime();
 }
 
 export function authorizeStudioDrain(request: Request, expectedSecret: string | undefined): boolean {
