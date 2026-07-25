@@ -14,7 +14,7 @@ vi.mock("../../lib/studio/webhook-handler.js", () => ({
   handleStudioIMessageWebhook: mocks.handleStudioIMessageWebhook,
 }));
 
-import handler from "../../api/webhooks/imessage.js";
+import handler, { config } from "../../api/webhooks/imessage.js";
 
 function nodeRequest(): IncomingMessage {
   const stream = Readable.from([]);
@@ -50,5 +50,9 @@ describe("Vercel iMessage webhook bridge", () => {
     expect(mocks.drainStudio).not.toHaveBeenCalled();
     expect(mocks.waitUntil).not.toHaveBeenCalled();
     expect(response.statusCode).toBe(200);
+  });
+
+  it("disables Vercel's body parser so raw signed bytes reach the verifier", () => {
+    expect(config).toEqual({ api: { bodyParser: false } });
   });
 });
