@@ -22,6 +22,7 @@
     "@spectrum-ts/core": "10.0.0",
     "@upstash/redis": "1.38.0",
     "@vercel/functions": "3.7.5",
+    "raw-body": "^4.0.0",
     "redis": "5.11.0",
     "zod": "4.4.3"
   },

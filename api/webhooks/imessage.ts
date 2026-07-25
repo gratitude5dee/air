@@ -1,4 +1,5 @@
-import { asNodeHandler } from "../../lib/studio/node-handler.js";
+import { MAX_WEBHOOK_BODY_BYTES } from "../../lib/spectrum-webhook.js";
+import { asRawBodyNodeHandler } from "../../lib/studio/node-handler.js";
 import { handleStudioIMessageWebhook } from "../../lib/studio/webhook-handler.js";
 
 /**
@@ -20,4 +21,7 @@ export const config = {
  * activity, so a stalled downstream dependency cannot extend or time out an
  * inbound Photon webhook invocation.
  */
-export default asNodeHandler((request) => handleStudioIMessageWebhook(request));
+export default asRawBodyNodeHandler(
+  (request) => handleStudioIMessageWebhook(request),
+  { maxBodyBytes: MAX_WEBHOOK_BODY_BYTES },
+);
