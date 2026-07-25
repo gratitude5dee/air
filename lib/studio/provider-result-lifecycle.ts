@@ -13,7 +13,9 @@ import {
 } from "./imessage-transport.js";
 import {
   isStudioProviderObservationPort,
+  isStudioProviderResultReferencePort,
   type StudioProviderObservationResult,
+  type StudioProviderResultReferencePort,
 } from "./provider-port.js";
 import { getStudioDeliveryTransport, type StudioRuntime } from "./runtime.js";
 import {
@@ -42,7 +44,12 @@ export type StudioProviderResultLifecycleResult =
   | { readonly kind: "not_observable" }
   | { readonly kind: "awaiting_submission" }
   | { readonly kind: "busy" }
-  | { readonly kind: "pending"; readonly nextDueAtMs: number }
+  | {
+      readonly kind: "pending";
+      readonly nextDueAtMs: number;
+      /** Stop this job loop so an immediately-due sealed result waits for the next Cron. */
+      readonly deferToNextDrain?: boolean | undefined;
+    }
   /** Outbox owns its exact retry score; job recovery receives a bounded revisit. */
   | { readonly kind: "delivery_pending" }
   | { readonly kind: "ready" }
@@ -52,15 +59,30 @@ export type StudioProviderResultLifecycleResult =
 export type StudioJobResultDispatchAuthorization = "allowed" | "defer" | "blocked";
 
 /**
+ * A single bounded Cron has 50 seconds before Vercel's 60-second hard stop.
+ * The reviewed GMI artifact read has a 12-second maximum. Before first-use
+ * Photon token minting, the transport keeps its 36-second delivery reserve;
+ * once that token is ready, the upload path needs its 22-second physical-RPC
+ * reserve. A worker only starts the private artifact read when the applicable
+ * later phases still fit, leaving a small persistence margin.
+ */
+const DURABLE_RESULT_MATERIALIZATION_START_RESERVE_MS = 48_000;
+const DURABLE_RESULT_PRIVATE_READ_RESERVE_MS = 12_000;
+const DURABLE_RESULT_PHYSICAL_UPLOAD_RESERVE_MS = 22_000;
+/** Leaves a small wall-clock margin between stage admission and its re-check. */
+const DURABLE_RESULT_MATERIALIZATION_RECHECK_MARGIN_MS = 250;
+
+/**
  * Observes a durably accepted request, validates an in-memory result, and
  * prepares a native Photon attachment exactly once. The final store call
  * atomically publishes the preamble + attachment and moves the job to ready.
  *
- * A deadline-bound Vercel Cron does not enter this `executing`-state lifecycle
- * at all—not even to finalize an already-uploaded Photon GUID. It must not
- * start a provider poll/result fetch/upload chain whose current worst case
- * exceeds the shared worker budget. Paid activation remains blocked until the
- * chain is split through a durable encrypted provider-result reference.
+ * A deadline-bound Vercel Cron may advance this lifecycle only through a
+ * reviewed split provider: it persists a sealed result capability in one
+ * invocation before private bytes. It then starts materialization only when
+ * the current or a later worker still reserves the full Photon preparation
+ * window. Legacy combined poll/fetch/upload adapters remain unavailable to
+ * the bounded worker.
  */
 export async function advanceStudioProviderResultLifecycle(
   runtime: StudioRuntime,
@@ -72,15 +94,24 @@ export async function advanceStudioProviderResultLifecycle(
   if (job.state === "reconciliation_required") return frozen({ kind: "reconciliation_required" });
   if (job.state !== "executing") return frozen({ kind: "not_observable" });
 
-  // Observation currently includes a private result fetch. Do not consume
-  // provider output unless a reviewed native delivery path can retain the
-  // resulting GUID and send it without exposing provider URLs or bytes.
-  if (
-    !canRecoverPaidStudioProvider(runtime.environment)
-    || !runtime.provider.verified
-    || !isStudioProviderObservationPort(runtime.provider)
-    || !canDeliverStudioMessages(runtime.environment)
-  ) return frozen({ kind: "disabled" });
+  if (!canRecoverPaidStudioProvider(runtime.environment) || !runtime.provider.verified) {
+    return frozen({ kind: "disabled" });
+  }
+
+  // A reviewed split-capability provider is the only path that may advance
+  // inside the bounded Cron. Its status GET persists an encrypted retrieval
+  // capability first; a later invocation downloads/validates/uploads through
+  // the existing native Photon preparation fence.
+  if (isStudioProviderResultReferencePort(runtime.provider)) {
+    return await advanceDurableProviderResultLifecycle(runtime, job, deliveryOptions);
+  }
+
+  // Legacy adapters combine a status poll and private artifact materialization
+  // in one call. Retain their unbounded review/test behavior, but keep them
+  // fail-closed for the production Cron until they implement the durable split.
+  if (!isStudioProviderObservationPort(runtime.provider) || !canDeliverStudioMessages(runtime.environment)) {
+    return frozen({ kind: "disabled" });
+  }
 
   // Do not start an executing-result recovery inside the bounded Vercel Cron.
   // A complete path would serially include a provider status GET, private
@@ -246,6 +277,425 @@ function isDeadlineBoundDeliveryAttempt(options?: StudioTransportOperationOption
 }
 
 /**
+ * The durable path deliberately persists the no-bytes status result before
+ * the private download/upload phase. The second phase requires the full
+ * reviewed time reservation; if the current invocation still has it, the
+ * already-committed capability may proceed immediately, otherwise it is left
+ * untouched for the next Cron.
+ */
+async function advanceDurableProviderResultLifecycle(
+  runtime: StudioRuntime,
+  job: StudioJobRecord,
+  deliveryOptions?: StudioTransportOperationOptions,
+): Promise<StudioProviderResultLifecycleResult> {
+  const provider = runtime.provider;
+  if (!isStudioProviderResultReferencePort(provider)) return frozen({ kind: "disabled" });
+
+  let payload: ReturnType<StudioRuntime["store"]["decryptJobPayload"]>;
+  try {
+    payload = runtime.store.decryptJobPayload(job);
+  } catch {
+    await transitionToReconciliation(runtime, job.jobId);
+    return frozen({ kind: "reconciliation_required" });
+  }
+  if (!payload.execution) {
+    await transitionToReconciliation(runtime, job.jobId);
+    return frozen({ kind: "reconciliation_required" });
+  }
+
+  const subrun = await runtime.store.getProviderSubrunForJob(job.jobId);
+  if (!subrun) return frozen({ kind: "awaiting_submission" });
+  if (subrun.state === "definitive_rejection") {
+    await transitionToFailed(runtime, job.jobId);
+    return frozen({ kind: "failed" });
+  }
+  if (subrun.state !== "submitted") {
+    if (subrun.state === "submission_unknown") await transitionToReconciliation(runtime, job.jobId);
+    return subrun.state === "submission_unknown"
+      ? frozen({ kind: "reconciliation_required" })
+      : frozen({ kind: "awaiting_submission" });
+  }
+
+  const observation = await runtime.store.ensureProviderObservation(subrun, payload.execution);
+  if (!observation) {
+    await transitionToReconciliation(runtime, job.jobId);
+    return frozen({ kind: "reconciliation_required" });
+  }
+  const terminal = await resolveTerminalObservation(runtime, job, observation);
+  if (terminal !== null) return terminal;
+
+  const observationLease = await runtime.store.acquireProviderObservationLease(subrun.subrunId);
+  if (!observationLease) return frozen({ kind: "busy" });
+  try {
+    // A previously committed Photon GUID is always stronger than a provider
+    // read or media fetch. The finalizer is a pure durable state transition.
+    const preparation = await runtime.store.getJobResultPreparation(job.jobId, 1);
+    if (preparation?.state === "prepared") {
+      return await finalizePreparedResult(runtime, job.jobId, subrun.subrunId, observationLease.token);
+    }
+    if (preparation?.state === "upload_unknown") {
+      await transitionToReconciliation(runtime, job.jobId);
+      return frozen({ kind: "reconciliation_required" });
+    }
+    if (preparation?.state === "uploading") {
+      return await recoverExpiredUploadingPreparation(
+        runtime,
+        job.jobId,
+        subrun.subrunId,
+        observationLease.token,
+      );
+    }
+    if (preparation?.state === "failed" || preparation?.state === "canceled") {
+      return await finishObservedFailure(runtime, job.jobId, subrun.subrunId, observationLease.token, "failed");
+    }
+
+    const begin = await runtime.store.beginProviderObservation(subrun.subrunId, observationLease.token);
+    if (begin.kind === "result_ready") {
+      if (!hasDurableMaterializationStartWindow(deliveryOptions, begin.observation.deadlineAtMs)) {
+        return deferSealedProviderResultToNextDrain(begin.observation.nextDueAtMs);
+      }
+      return await materializeDurableProviderResult({
+        runtime,
+        provider,
+        job,
+        snapshot: payload.execution,
+        subrun,
+        observationLeaseToken: observationLease.token,
+        observationDeadlineAtMs: begin.observation.deadlineAtMs,
+        observationNextDueAtMs: begin.observation.nextDueAtMs,
+        deliveryOptions,
+      });
+    }
+    if (begin.kind !== "ready") return await mapObservationBegin(runtime, job, begin);
+
+    const requestReference = await runtime.store.getProviderSubrunReference(subrun.subrunId);
+    if (!requestReference) {
+      return await finishObservedFailure(
+        runtime,
+        job.jobId,
+        subrun.subrunId,
+        observationLease.token,
+        "reconciliation_required",
+      );
+    }
+
+    let polled: Awaited<ReturnType<StudioProviderResultReferencePort["pollResult"]>>;
+    try {
+      polled = await provider.pollResult({
+        job: providerJobView(job),
+        snapshot: payload.execution,
+        providerRequestId: requestReference.providerRequestId,
+      });
+    } catch {
+      polled = frozen({ kind: "retryable_failure" });
+    }
+
+    switch (polled.kind) {
+      case "pending":
+      case "retryable_failure":
+        return await persistPendingObservation(runtime, subrun.subrunId, observationLease.token);
+      case "definitive_failure":
+        return await finishObservedFailure(runtime, job.jobId, subrun.subrunId, observationLease.token, "failed");
+      case "reconciliation_required":
+        return await finishObservedFailure(
+          runtime,
+          job.jobId,
+          subrun.subrunId,
+          observationLease.token,
+          "reconciliation_required",
+        );
+      case "ready": {
+        const committed = await runtime.store.commitProviderResultReference(
+          subrun.subrunId,
+          observationLease.token,
+          polled.reference,
+        );
+        switch (committed.kind) {
+          case "result_ready":
+          case "existing":
+            // The result reference is now durable before any private bytes
+            // leave the provider. A status response arriving late in its own
+            // long polling window should not be forced to wait a minute and
+            // miss an otherwise safe current Cron materialization window.
+            if (
+              isDeadlineBoundDeliveryAttempt(deliveryOptions)
+              && hasDurableMaterializationStartWindow(deliveryOptions, committed.observation.deadlineAtMs)
+            ) {
+              return await materializeDurableProviderResult({
+                runtime,
+                provider,
+                job,
+                snapshot: payload.execution,
+                subrun,
+                observationLeaseToken: observationLease.token,
+                observationDeadlineAtMs: committed.observation.deadlineAtMs,
+                observationNextDueAtMs: committed.observation.nextDueAtMs,
+                deliveryOptions,
+              });
+            }
+            return frozen({
+              kind: "pending",
+              nextDueAtMs: committed.observation?.nextDueAtMs ?? Date.now() + 60_000,
+              deferToNextDrain: true,
+            });
+          case "lease_lost":
+            return frozen({ kind: "busy" });
+          case "payload_expiring":
+          case "unavailable":
+            return await finishObservedFailure(
+              runtime,
+              job.jobId,
+              subrun.subrunId,
+              observationLease.token,
+              "reconciliation_required",
+            );
+        }
+      }
+    }
+  } finally {
+    await observationLease.release();
+  }
+}
+
+async function materializeDurableProviderResult(input: {
+  readonly runtime: StudioRuntime;
+  readonly provider: StudioProviderResultReferencePort;
+  readonly job: StudioJobRecord;
+  readonly snapshot: StudioExecutionSnapshot;
+  readonly subrun: StudioProviderSubrunRecord;
+  readonly observationLeaseToken: string;
+  readonly observationDeadlineAtMs: number;
+  readonly observationNextDueAtMs: number;
+  readonly deliveryOptions?: StudioTransportOperationOptions | undefined;
+}): Promise<StudioProviderResultLifecycleResult> {
+  const {
+    runtime,
+    provider,
+    job,
+    snapshot,
+    subrun,
+    observationLeaseToken,
+    observationDeadlineAtMs,
+    observationNextDueAtMs,
+    deliveryOptions,
+  } = input;
+  if (!canDeliverStudioMessages(runtime.environment)) return frozen({ kind: "disabled" });
+  if (!hasDurableMaterializationStartWindow(deliveryOptions, observationDeadlineAtMs)) {
+    return deferSealedProviderResultToNextDrain(observationNextDueAtMs);
+  }
+
+  const reference = await runtime.store.getProviderResultReference(subrun.subrunId);
+  if (!reference) {
+    return await finishObservedFailure(
+      runtime,
+      job.jobId,
+      subrun.subrunId,
+      observationLeaseToken,
+      "reconciliation_required",
+    );
+  }
+
+  // Mint the Photon capability before consuming private provider bytes. A
+  // rejected token leaves the sealed provider result alone for later bounded
+  // recovery instead of forcing a result refetch or an ambiguous upload.
+  let transport: StudioIMessageTransport;
+  try {
+    transport = await getStudioDeliveryTransport(runtime, deliveryOptions);
+  } catch {
+    return frozen({ kind: "disabled" });
+  }
+  if (!transport.verified || !isStudioPreparedOutputTransport(transport)) {
+    return frozen({ kind: "disabled" });
+  }
+  if (!hasDurablePostTokenMaterializationWindow(deliveryOptions, observationDeadlineAtMs)) {
+    return deferSealedProviderResultToNextDrain(observationNextDueAtMs);
+  }
+
+  // Count only the work that can now reach the provider's private artifact
+  // endpoint. Credential/token or preflight failures above leave the sealed
+  // capability retryable without consuming the finite materialization budget.
+  const materializationStart = await runtime.store.beginProviderObservation(
+    subrun.subrunId,
+    observationLeaseToken,
+    { startResultMaterialization: true },
+  );
+  if (materializationStart.kind !== "result_ready") {
+    if (materializationStart.kind === "ready") {
+      await transitionToReconciliation(runtime, job.jobId);
+      return frozen({ kind: "reconciliation_required" });
+    }
+    return await mapObservationBegin(runtime, job, materializationStart);
+  }
+
+  let materialized: StudioProviderObservationResult;
+  try {
+    materialized = await provider.materializeResult({
+      job: providerJobView(job),
+      snapshot,
+      reference,
+    });
+  } catch {
+    materialized = frozen({ kind: "retryable_failure" });
+  }
+
+  switch (materialized.kind) {
+    case "pending":
+    case "retryable_failure": {
+      const pending = await persistPendingObservation(runtime, subrun.subrunId, observationLeaseToken);
+      return pending.kind === "pending"
+        ? deferSealedProviderResultToNextDrain(pending.nextDueAtMs)
+        : pending;
+    }
+    case "definitive_failure":
+      return await finishObservedFailure(runtime, job.jobId, subrun.subrunId, observationLeaseToken, "failed");
+    case "reconciliation_required":
+      return await finishObservedFailure(
+        runtime,
+        job.jobId,
+        subrun.subrunId,
+        observationLeaseToken,
+        "reconciliation_required",
+      );
+    case "ready":
+      // Validation and the sole physical Photon upload retain the existing
+      // preparation lease/finalizer semantics. Re-check after result fetch so
+      // a slow private read can never start an upload in a stale worker.
+      if (!hasDurableDeliveryPreparationWindow(deliveryOptions, observationDeadlineAtMs)) {
+        discardUnconsumedProviderArtifacts(materialized.artifacts);
+        return deferSealedProviderResultToNextDrain(observationNextDueAtMs);
+      }
+      let payload: ReturnType<StudioRuntime["store"]["decryptJobPayload"]>;
+      try {
+        payload = runtime.store.decryptJobPayload(job);
+      } catch {
+        discardUnconsumedProviderArtifacts(materialized.artifacts);
+        return await finishObservedFailure(
+          runtime,
+          job.jobId,
+          subrun.subrunId,
+          observationLeaseToken,
+          "reconciliation_required",
+        );
+      }
+      return await prepareReadyProviderResult({
+        runtime,
+        transport,
+        job,
+        snapshot,
+        thread: Object.freeze({
+          chatGuid: payload.chatGuid,
+          sendingLine: payload.sendingLine,
+          ...(payload.replyTargetId === undefined ? {} : { replyTargetId: payload.replyTargetId }),
+        }),
+        artifacts: materialized.artifacts,
+        subrun,
+        observationLeaseToken,
+        deliveryOptions,
+      });
+  }
+}
+
+/**
+ * A sealed result is already due; a fixed one-minute retry can fall between
+ * Vercel's minute Cron ticks and let a short-lived signed capability expire.
+ * Leave its queue score immediately due, but stop this worker so a fresh
+ * invocation receives the whole private-read/Photon budget.
+ */
+function deferSealedProviderResultToNextDrain(nextDueAtMs: number): StudioProviderResultLifecycleResult {
+  return frozen({
+    kind: "pending" as const,
+    nextDueAtMs: Number.isSafeInteger(nextDueAtMs) && nextDueAtMs >= 0 ? nextDueAtMs : Date.now(),
+    deferToNextDrain: true,
+  });
+}
+
+function hasDurableMaterializationStartWindow(
+  options?: StudioTransportOperationOptions,
+  observationDeadlineAtMs?: number,
+): boolean {
+  return hasDurableResultWindow(
+    options,
+    observationDeadlineAtMs,
+    Math.max(
+      DURABLE_RESULT_MATERIALIZATION_START_RESERVE_MS,
+      options?.minimumDeliveryPreparationRemainingMs ?? 0,
+    ),
+  );
+}
+
+/**
+ * A fresh private read starts only after Photon token minting has completed.
+ * The remaining chain is the 12-second bounded read plus the physical upload
+ * reserve; the token-mint reserve was already consumed before this check.
+ */
+function hasDurablePostTokenMaterializationWindow(
+  options?: StudioTransportOperationOptions,
+  observationDeadlineAtMs?: number,
+): boolean {
+  return hasDurableResultWindow(
+    options,
+    observationDeadlineAtMs,
+    DURABLE_RESULT_PRIVATE_READ_RESERVE_MS + physicalUploadReserve(options),
+  );
+}
+
+/**
+ * Once the private provider read has completed, retain only the independently
+ * reviewed physical-upload/persistence reserve before validating bytes and
+ * opening the non-idempotent Photon upload boundary.
+ */
+function hasDurableDeliveryPreparationWindow(
+  options?: StudioTransportOperationOptions,
+  observationDeadlineAtMs?: number,
+): boolean {
+  return hasDurableResultWindow(options, observationDeadlineAtMs, physicalUploadReserve(options));
+}
+
+function physicalUploadReserve(options?: StudioTransportOperationOptions): number {
+  return Math.max(
+    DURABLE_RESULT_PHYSICAL_UPLOAD_RESERVE_MS,
+    options?.minimumPhysicalActionRemainingMs ?? 0,
+  );
+}
+
+function hasDurableResultWindow(
+  options: StudioTransportOperationOptions | undefined,
+  observationDeadlineAtMs: number | undefined,
+  reserveMs: number,
+): boolean {
+  if (options?.deadlineAtMs === undefined) return true;
+  const required = Math.max(reserveMs, DURABLE_RESULT_PHYSICAL_UPLOAD_RESERVE_MS)
+    + DURABLE_RESULT_MATERIALIZATION_RECHECK_MARGIN_MS;
+  const now = Date.now();
+  if (!Number.isSafeInteger(options.deadlineAtMs) || options.deadlineAtMs - now < required) return false;
+  return observationDeadlineAtMs === undefined
+    || (Number.isSafeInteger(observationDeadlineAtMs) && observationDeadlineAtMs - now >= required);
+}
+
+/**
+ * A late worker must not leave an unread fetch body active after it declines
+ * to begin Photon preparation. Async iterables have no universal cancellation
+ * protocol; close WHATWG streams best-effort without retaining their bytes or
+ * provider-owned errors.
+ */
+function discardUnconsumedProviderArtifacts(
+  artifacts: readonly { readonly stream: unknown }[],
+): void {
+  for (const artifact of artifacts) {
+    const stream = artifact.stream;
+    if (typeof stream !== "object" || stream === null || !("cancel" in stream)) continue;
+    const cancel = (stream as { readonly cancel?: unknown }).cancel;
+    if (typeof cancel !== "function") continue;
+    try {
+      void Promise.resolve(cancel.call(stream)).catch(() => undefined);
+    } catch {
+      // Resource cleanup must not leak provider details or alter the durable
+      // reconciliation decision.
+    }
+  }
+}
+
+/**
  * Gates job-result intents before their physical iMessage action. Preamble
  * text can leave only after the atomic finalizer made the result ready; the
  * attachment advances the state to `delivering` before Photon is contacted.
@@ -365,7 +815,10 @@ async function prepareReadyProviderResult(input: {
   readonly deliveryOptions?: StudioTransportOperationOptions | undefined;
 }): Promise<StudioProviderResultLifecycleResult> {
   const { runtime, transport, job, snapshot, thread, artifacts, subrun, observationLeaseToken, deliveryOptions } = input;
-  if (!isStudioPreparedOutputTransport(transport)) return frozen({ kind: "disabled" });
+  if (!isStudioPreparedOutputTransport(transport)) {
+    discardUnconsumedProviderArtifacts(artifacts);
+    return frozen({ kind: "disabled" });
+  }
   // The first enabled adapter is intentionally fixed to Flux's one-image
   // contract. Future multi-output modes need their own atomic multi-output
   // finalizer rather than treating an array as independently retryable.
@@ -375,7 +828,10 @@ async function prepareReadyProviderResult(input: {
     || artifacts.length !== 1
     || artifacts[0]?.outputIndex !== 1
     || artifacts[0].mediaType !== snapshot.output.type
-  ) return await failObservationForReconciliation(runtime, job.jobId, subrun.subrunId, observationLeaseToken);
+  ) {
+    discardUnconsumedProviderArtifacts(artifacts);
+    return await failObservationForReconciliation(runtime, job.jobId, subrun.subrunId, observationLeaseToken);
+  }
 
   let artifact: StudioValidatedProviderArtifact;
   try {
@@ -557,6 +1013,7 @@ async function persistPendingObservation(
       return frozen({ kind: "pending", nextDueAtMs: completed.observation.nextDueAtMs });
     case "deadline_exceeded":
     case "attempts_exhausted":
+    case "reference_expired":
       await transitionToReconciliation(runtime, completed.observation.jobId);
       return frozen({ kind: "reconciliation_required" });
     case "failed":
@@ -578,6 +1035,12 @@ async function mapObservationBegin(
   switch (begin.kind) {
     case "not_due":
       return frozen({ kind: "pending", nextDueAtMs: begin.observation.nextDueAtMs });
+    case "result_ready":
+      // Only the split-provider branch may consume a sealed result reference.
+      // If an adapter changed between invocations, preserve the record for an
+      // explicit reconciliation rather than letting a legacy observer poll it.
+      await transitionToReconciliation(runtime, job.jobId);
+      return frozen({ kind: "reconciliation_required" });
     case "failed":
       return await mapFailedObservation(runtime, begin.observation);
     case "deadline_exceeded":
@@ -606,6 +1069,7 @@ async function resolveTerminalObservation(
   switch (observation.state) {
     case "scheduled":
     case "observing":
+    case "result_ready":
       return null;
     case "failed":
       return await mapFailedObservation(runtime, observation);
@@ -675,6 +1139,7 @@ async function finishObservedFailure(
       return await mapFailedObservation(runtime, completed.observation);
     case "deadline_exceeded":
     case "attempts_exhausted":
+    case "reference_expired":
       await transitionToReconciliation(runtime, completed.observation.jobId);
       return frozen({ kind: "reconciliation_required" });
     case "pending":

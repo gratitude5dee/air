@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   STUDIO_PROVIDER_ARTIFACT_FETCH_MAX_BYTES,
   StudioProviderArtifactFetchError,
   fetchStudioProviderArtifact,
+  validateStudioProviderArtifactReferenceLifetime,
 } from "../../lib/studio/provider-artifact-fetch.js";
 
 const policy = {
@@ -12,17 +13,38 @@ const policy = {
   access: "signed-url",
 } as const;
 
-const signedQuery = [
-  "X-Goog-Algorithm=GOOG4-RSA-SHA256",
-  "X-Goog-Credential=air%2F20260723%2Fauto%2Fstorage%2Fgoog4_request",
-  "X-Goog-Date=20260723T000000Z",
-  "X-Goog-Expires=900",
-  "X-Goog-SignedHeaders=host",
-  `X-Goog-Signature=${"a".repeat(64)}`,
-].join("&");
+const DEFAULT_SIGNED_AT_MS = Math.floor(Date.now() / 1_000) * 1_000 - 60_000;
+const DEFAULT_EXPIRES_SECONDS = 604_800;
 
-function signedUrl(path = "output-1.png"): string {
-  return `https://storage.googleapis.com/gmi-generated-assets/air/${path}?${signedQuery}`;
+function gcsSigningDate(timeMs: number): string {
+  const date = new Date(timeMs);
+  const component = (value: number, width: number): string => String(value).padStart(width, "0");
+  return `${component(date.getUTCFullYear(), 4)}${component(date.getUTCMonth() + 1, 2)}${component(date.getUTCDate(), 2)}`
+    + `T${component(date.getUTCHours(), 2)}${component(date.getUTCMinutes(), 2)}${component(date.getUTCSeconds(), 2)}Z`;
+}
+
+function signedQueryFor(
+  signedAtMs = DEFAULT_SIGNED_AT_MS,
+  expiresSeconds: number | string = DEFAULT_EXPIRES_SECONDS,
+): string {
+  return [
+    "X-Goog-Algorithm=GOOG4-RSA-SHA256",
+    "X-Goog-Credential=air%2F20260723%2Fauto%2Fstorage%2Fgoog4_request",
+    `X-Goog-Date=${gcsSigningDate(signedAtMs)}`,
+    `X-Goog-Expires=${expiresSeconds}`,
+    "X-Goog-SignedHeaders=host",
+    `X-Goog-Signature=${"a".repeat(64)}`,
+  ].join("&");
+}
+
+const signedQuery = signedQueryFor();
+
+function signedUrl(
+  path = "output-1.png",
+  signedAtMs = DEFAULT_SIGNED_AT_MS,
+  expiresSeconds: number | string = DEFAULT_EXPIRES_SECONDS,
+): string {
+  return `https://storage.googleapis.com/gmi-generated-assets/air/${path}?${signedQueryFor(signedAtMs, expiresSeconds)}`;
 }
 
 const allowedUrl = signedUrl();
@@ -147,7 +169,10 @@ describe("provider artifact fetch boundary", () => {
       "https://storage.googleapis.com/gmi-generated-assets/air/bare-output.png",
       "https://storage.googleapis.com/gmi-generated-assets/air/partial-output.png?X-Goog-Signature=private",
       signedUrl("bad-algorithm.png").replace("GOOG4-RSA-SHA256", "not-a-signature"),
-      signedUrl("bad-expiry.png").replace("X-Goog-Expires=900", "X-Goog-Expires=0"),
+      signedUrl("bad-expiry.png").replace(
+        `X-Goog-Expires=${DEFAULT_EXPIRES_SECONDS}`,
+        "X-Goog-Expires=0",
+      ),
       `${signedUrl("duplicate-signature.png")}&X-Goog-Signature=${"b".repeat(64)}`,
     ];
 
@@ -156,6 +181,144 @@ describe("provider artifact fetch boundary", () => {
         (error: unknown) => fetchErrorCode(error) === "invalid_signed_url",
       );
     }
+    expect(calls).toBe(0);
+  });
+
+  it("calculates an exact GCS V4 expiry and exposes only safe timing metadata for a conservative persistence gate", () => {
+    const signedAtMs = Date.UTC(2026, 6, 25, 12, 0, 0);
+    const url = signedUrl("bounded-lifetime.png", signedAtMs, 120);
+
+    const lifetime = validateStudioProviderArtifactReferenceLifetime({
+      url,
+      policy,
+      nowMs: signedAtMs + 45_000,
+      minimumRemainingMs: 75_000,
+    });
+
+    expect(lifetime).toEqual({
+      expiresAtMs: signedAtMs + 120_000,
+      remainingMs: 75_000,
+    });
+    expect(JSON.stringify(lifetime)).not.toContain(url);
+    expect(JSON.stringify(lifetime)).not.toContain("X-Goog-Signature");
+
+    let thrown: unknown;
+    try {
+      validateStudioProviderArtifactReferenceLifetime({
+        url,
+        policy,
+        nowMs: signedAtMs + 45_000,
+        minimumRemainingMs: 75_001,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(fetchErrorCode(thrown)).toBe("signed_url_insufficient_lifetime");
+    expect(String(thrown)).not.toContain(url);
+  });
+
+  it("accepts bounded even-length GCS RSA signatures while retaining a strict HMAC digest shape", () => {
+    const signedAtMs = Date.UTC(2026, 6, 25, 12, 0, 0);
+    const originalSignature = `X-Goog-Signature=${"a".repeat(64)}`;
+    const rsaSignature = `X-Goog-Signature=${"b".repeat(512)}`;
+    const rsaUrl = signedUrl("rsa-signature.png", signedAtMs, 120).replace(originalSignature, rsaSignature);
+
+    expect(validateStudioProviderArtifactReferenceLifetime({
+      url: rsaUrl,
+      policy,
+      nowMs: signedAtMs,
+      minimumRemainingMs: 1,
+    })).toEqual({ expiresAtMs: signedAtMs + 120_000, remainingMs: 120_000 });
+
+    const rejectedUrls = [
+      rsaUrl.replace("GOOG4-RSA-SHA256", "GOOG4-HMAC-SHA256"),
+      rsaUrl.replace(rsaSignature, `X-Goog-Signature=${"b".repeat(511)}`),
+      rsaUrl.replace(rsaSignature, `X-Goog-Signature=${"b".repeat(1_026)}`),
+    ];
+    for (const url of rejectedUrls) {
+      let thrown: unknown;
+      try {
+        validateStudioProviderArtifactReferenceLifetime({
+          url,
+          policy,
+          nowMs: signedAtMs,
+          minimumRemainingMs: 1,
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect(fetchErrorCode(thrown)).toBe("invalid_signed_url");
+      expect(String(thrown)).not.toContain(url);
+    }
+  });
+
+  it("permits GCS's documented fifteen-minute pre-active window but rejects a farther-future capability", () => {
+    const nowMs = Date.UTC(2026, 6, 25, 12, 0, 0);
+    const earlyUsableUrl = signedUrl("early-usable.png", nowMs + 15 * 60_000, 120);
+
+    expect(validateStudioProviderArtifactReferenceLifetime({
+      url: earlyUsableUrl,
+      policy,
+      nowMs,
+      minimumRemainingMs: 1,
+    })).toEqual({
+      expiresAtMs: nowMs + 17 * 60_000,
+      remainingMs: 17 * 60_000,
+    });
+
+    const notYetUsableUrl = signedUrl("not-yet-usable.png", nowMs + 15 * 60_000 + 1_000, 120);
+    let thrown: unknown;
+    try {
+      validateStudioProviderArtifactReferenceLifetime({
+        url: notYetUsableUrl,
+        policy,
+        nowMs,
+        minimumRemainingMs: 1,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(fetchErrorCode(thrown)).toBe("signed_url_not_yet_valid");
+    expect(String(thrown)).not.toContain(notYetUsableUrl);
+  });
+
+  it("rejects malformed calendar timestamps and expired signed URLs before fetch", async () => {
+    const signedAtMs = Date.UTC(2026, 6, 25, 12, 0, 0);
+    const expiredUrl = signedUrl("expired.png", signedAtMs, 60);
+    const malformedCalendarUrl = signedUrl("invalid-calendar.png", signedAtMs, 60)
+      .replace("X-Goog-Date=20260725T120000Z", "X-Goog-Date=20260229T120000Z");
+
+    expect(() => validateStudioProviderArtifactReferenceLifetime({
+      url: malformedCalendarUrl,
+      policy,
+      nowMs: signedAtMs,
+      minimumRemainingMs: 1,
+    })).toThrowError(StudioProviderArtifactFetchError);
+    try {
+      validateStudioProviderArtifactReferenceLifetime({
+        url: malformedCalendarUrl,
+        policy,
+        nowMs: signedAtMs,
+        minimumRemainingMs: 1,
+      });
+    } catch (error) {
+      expect(fetchErrorCode(error)).toBe("invalid_signed_url");
+      expect(String(error)).not.toContain(malformedCalendarUrl);
+    }
+
+    let calls = 0;
+    vi.spyOn(Date, "now").mockReturnValue(signedAtMs + 60_000);
+    await expect(fetchStudioProviderArtifact({
+      url: expiredUrl,
+      policy,
+      fetch: async () => {
+        calls += 1;
+        return new Response("must not be fetched");
+      },
+    })).rejects.toSatisfy((error: unknown) => {
+      expect(String(error)).not.toContain(expiredUrl);
+      return fetchErrorCode(error) === "signed_url_expired";
+    });
     expect(calls).toBe(0);
   });
 

@@ -17,21 +17,19 @@ retrieval, a provider submission, or a generation command.
   a signed receipt, then returns. It does not drain queues or perform provider
   or Photon delivery work. The minute `/internal/drain-inbox` Cron is the only
   scheduled worker that can progress stored work.
-- Vercel has encrypted `GMI_API_KEY` configuration for Preview and Production.
-  A protected production process check received an empty value. No secret was
-  printed or retained; a variable name alone does not prove a usable key. The
-  owner must correct it directly in Vercel before a protected GMI audit can be
-  accepted as readiness evidence.
+- Vercel has encrypted `GMI_API_KEY` configuration for Production. Its value
+  is never retrieved or printed; its presence is not readiness evidence. A
+  protected, secret-safe GMI audit must pass before a registry review may use
+  it as a provider-contract input.
 - The committed registry still has zero enabled models. The direct provider is
   therefore unprovisioned at runtime, even with the server-only key present.
 - The public Flux result example's bare storage URL—even with
   `is_public: false`—does not prove a private/signed output contract. It is
   insufficient for Air, so no GMI model is armed.
-- No real Photon webhook delivery or allowlisted handset `/help` response has
-  been observed for this deployment. The test is also blocked on the
-  explicitly authorized replacement of the exposed outbound Photon credential
-  described below. Do not mark the iMessage path accepted until that test is
-  completed.
+- The outbound Photon credential was rotated and updated in Vercel through an
+  explicitly authorized coordinated operation. No real signed webhook delivery
+  or allowlisted handset `/help` response has yet been recorded for this
+  deployment. Do not mark the iMessage path accepted until that test completes.
 
 The existing shared `$100` cap is a hard background safety control. It does
 not add a per-request approval step, and it does not substitute for the model
@@ -203,41 +201,25 @@ state, and escalate through the normal reconciliation path. A one-way safety
 gate is not an incident-recovery shortcut, and no endpoint can be used to
 skip a predecessor.
 
-## Photon credential incident and coordinated rotation
+## Photon credential incident and completed rotation
 
 `IMESSAGE_WEBHOOK_SECRET` is the existing inbound signing secret for the
 webhook target. `IMESSAGE_PROJECT_SECRET` is a different outbound Photon API
 credential. A Photon CLI response unexpectedly emitted the outbound credential
 in local tool output, so it must be treated as exposed.
 
-Do not rotate either credential merely to perform a smoke test. Rotation of the
-outbound credential requires explicit owner authorization because it will
-invalidate the current outbound API access. Once that authorization exists,
-perform one coordinated, secret-safe operation:
-
-1. Rotate only the outbound Photon project credential. Capture it only long
-   enough to update the encrypted Vercel environment; never print, save, or
-   paste it.
-2. Update every Vercel environment target intentionally using that credential,
-   then deploy the direct branch. Do not change `IMESSAGE_WEBHOOK_SECRET` as
-   part of this incident unless the inbound secret has a separate confirmed
-   exposure.
-3. Verify deployment and environment names/status without retrieving a value.
-   Only then run the signed allowlisted handset `/help` smoke below.
-
-Until explicit authorization and this coordinated update are complete, the
-outbound credential must not be used for a live test. This is a security stop
-condition, not a reason to ask anyone to paste a signing or API secret.
+The owner explicitly authorized rotation of the outbound credential, and the
+replacement was sent directly to encrypted Vercel configuration without being
+printed, saved, or pasted. `IMESSAGE_WEBHOOK_SECRET` was not changed. Do not
+rotate either credential merely to perform a smoke test; only verify deployed
+names/status and use the signed handset `/help` procedure below.
 
 ## Protected GMI catalog/schema audit
 
 The GMI key may be used only through the deployed read-only audit until a
-separate activation release is approved. The current protected production
-process check received `GMI_API_KEY` as empty, so do not treat the listed Vercel
-variable as a working credential or run this audit as acceptance evidence yet.
-The owner must set a nonempty value directly in Vercel and deploy it without
-sharing the value. After that, from an operator-controlled terminal where
-`CRON_SECRET` is already set, run:
+separate activation release is approved. Its value is server-only and must not
+be retrieved, printed, or inferred from a variable listing. From an
+operator-controlled terminal where `CRON_SECRET` is already set, run:
 
 ```sh
 curl --fail-with-body -sS \
@@ -268,9 +250,9 @@ Interpret the result conservatively:
 
 - `401` means stop and correct the operator authentication path without
   exposing the credential.
-- `503` means stop and inspect deployment configuration (including the current
-  empty GMI credential) or provider availability through the normal private
-  operator path; do not broaden the route or add logging.
+- `503` means stop and inspect deployment configuration or provider
+  availability through the normal private operator path; do not broaden the
+  route or add logging.
 - `available: false`, a mismatched model ID, or an unexpected parameter schema
   means `/imagine` stays disabled.
 - `pricing: "manual_console_required"` means obtain the exact account-specific
@@ -283,8 +265,9 @@ that the result is not publicly accessible.
 
 ## Photon webhook and handset `/help` smoke
 
-This remains the missing live acceptance test and is blocked until the
-explicitly authorized outbound-credential rotation above has completed.
+This remains the missing live acceptance test. The explicitly authorized
+outbound-credential rotation is complete; do not retrieve or rotate a secret
+to diagnose this smoke.
 
 1. After that coordinated rotation and deployment, confirm the signed webhook target is
    `https://air.wzrd.tech/webhooks/imessage` and it uses the already-matching
@@ -329,11 +312,10 @@ complete every gate below, in order:
    ID, request/result schema fingerprints, required payload fields, input
    policy, output contract, price quote, polling bounds, and private retrieval
    policy. Run the full release verification suite and deploy it.
-6. Deploy a durable encrypted provider-result reference split, or a reviewed
-   proof that the complete observe/retrieve/validate/upload/finalize chain
-   fits the bounded Vercel worker deadline. The current bounded Cron
-   deliberately defers `executing` provider-result recovery before any
-   provider or Photon action.
+6. Verify the deployed durable encrypted provider-result reference split for
+   the exact adapter. A status-only poll must persist the sealed capability
+   before any byte read; its signed URL needs sufficient retained lifetime,
+   and a later bounded drain must reserve the full private-read/Photon window.
 7. Complete the handset `/help` smoke above after the explicitly authorized
    outbound-credential rotation.
 8. In a separately reviewed release, advance the shared release fence with its
@@ -353,11 +335,11 @@ public URL is not an acceptable input-media transport for this private studio.
 The direct lifecycle is intentionally conservative once a reviewed model is
 enabled:
 
-- In the bounded minute Cron, an `executing` provider result is deferred before
-  token minting, provider observation, artifact fetch, or Photon upload. This
-  preserves the worker deadline and avoids an ambiguous physical action. Only
-  already prepared `ready` and `delivering` state may be reconciled there until
-  the durable result-reference design is released.
+- In the bounded minute Cron, a reviewed split adapter may make a status-only
+  poll and atomically persist an encrypted, binding-checked result capability.
+  Private bytes and Photon preparation begin only after that commit and only
+  when the current or a later invocation has the full 48-second reserve. A
+  legacy combined adapter is deferred before any provider or Photon action.
 - It can observe only a durably known submitted request; it never resubmits an
   ambiguous request.
 - It checks the registry's private/signed result allowlist before fetching an

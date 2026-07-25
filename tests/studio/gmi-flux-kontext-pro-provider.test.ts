@@ -106,11 +106,20 @@ const outputPolicy = Object.freeze({
   access: "signed-url" as const,
 });
 
+const GCS_V4_SIGNED_AT_MS = Math.floor(Date.now() / 1_000) * 1_000 - 60_000;
+
+function gcsSigningDate(timeMs: number): string {
+  const date = new Date(timeMs);
+  const component = (value: number, width: number): string => String(value).padStart(width, "0");
+  return `${component(date.getUTCFullYear(), 4)}${component(date.getUTCMonth() + 1, 2)}${component(date.getUTCDate(), 2)}`
+    + `T${component(date.getUTCHours(), 2)}${component(date.getUTCMinutes(), 2)}${component(date.getUTCSeconds(), 2)}Z`;
+}
+
 const gcsV4SignedQuery = [
   "X-Goog-Algorithm=GOOG4-RSA-SHA256",
   "X-Goog-Credential=air%2F20260723%2Fauto%2Fstorage%2Fgoog4_request",
-  "X-Goog-Date=20260723T000000Z",
-  "X-Goog-Expires=900",
+  `X-Goog-Date=${gcsSigningDate(GCS_V4_SIGNED_AT_MS)}`,
+  "X-Goog-Expires=604800",
   "X-Goog-SignedHeaders=host",
   `X-Goog-Signature=${"a".repeat(64)}`,
 ].join("&");
@@ -314,6 +323,35 @@ describe("GMI Flux Kontext Pro StudioProvider", () => {
     expect(materialized.kind).toBe("ready");
     expect(getRequestStatus).toHaveBeenCalledTimes(1);
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses an artifact-read timeout beyond the reviewed Cron reservation", async () => {
+    const getRequestStatus = vi.fn(async () => ({
+      requestId: "gmi-flux-observation-001",
+      status: "success" as const,
+      response: {
+        request_id: "gmi-flux-observation-001",
+        model: GMI_FLUX_KONTEXT_PRO_MODEL_ID,
+        status: "success",
+        is_public: false,
+        outcome: { media_urls: [{ id: "0", url: signedFluxOutputUrl("timeout-bounded.jpg") }] },
+      },
+    }));
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("must not fetch"));
+    const provider = new GmiFluxKontextProStudioProvider(
+      { submitRequest: async () => ({ classification: "definitive_rejection", httpStatus: 422 }), getRequestStatus },
+      { outputPolicy, fetch, artifactFetchTimeoutMs: 12_001 },
+    );
+    const input = observationInput();
+    const polled = await provider.pollResult(input);
+    if (polled.kind !== "ready") throw new Error("expected sealed result reference");
+
+    await expect(provider.materializeResult({
+      job: input.job,
+      snapshot: input.snapshot,
+      reference: polled.reference,
+    })).resolves.toEqual({ kind: "reconciliation_required" });
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("rejects a copied result reference before any artifact fetch", async () => {

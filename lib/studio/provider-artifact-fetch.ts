@@ -14,6 +14,17 @@ const MIN_TIMEOUT_MS = 250;
 const MAX_TIMEOUT_MS = 60_000;
 const MAX_ARTIFACT_URL_CHARS = 8_192;
 const MAX_CONTENT_TYPE_CHARS = 256;
+// GCS V4 permits a signed URL to become usable up to fifteen minutes before
+// its active datetime. Accept that documented clock-skew window, but never
+// mistake a later capability for one that can be used or persisted now.
+const GCS_V4_EARLY_USE_WINDOW_MS = 15 * 60 * 1_000;
+const GCS_V4_HMAC_SIGNATURE_HEX_CHARS = 64;
+// RSA signatures are encoded as the full signature byte sequence in hex. The
+// documented GCS example is far longer than an HMAC digest; accept reviewed
+// common RSA key sizes without turning this URL parser into an unbounded
+// carrier for provider-controlled query data.
+const GCS_V4_RSA_SIGNATURE_MIN_HEX_CHARS = 64;
+const GCS_V4_RSA_SIGNATURE_MAX_HEX_CHARS = 1_024;
 
 /**
  * An immutable, registry-owned allowlist for one provider output location.
@@ -32,6 +43,35 @@ export interface StudioProviderArtifactFetchPolicy {
   readonly pathPrefix: string;
   /** The committed model contract for this exact provider output location. */
   readonly access: "signed-url" | "provider-private";
+}
+
+/**
+ * Timing metadata derived from a GCS V4 signed-query capability. It omits the
+ * capability itself, credential, object path, and all provider response data
+ * so callers can safely use it as a persistence/materialization gate.
+ */
+export interface StudioProviderArtifactReferenceLifetime {
+  /** Absolute UTC expiry computed from X-Goog-Date plus X-Goog-Expires. */
+  readonly expiresAtMs: number;
+  /** Remaining lifetime at the caller-supplied (or current) wall clock. */
+  readonly remainingMs: number;
+}
+
+/**
+ * Performs the same exact policy and signed-query validation used by the
+ * fetch boundary, while returning only non-secret timing metadata. A durable
+ * lifecycle can require a full bounded read/upload window before it persists
+ * or consumes a provider capability.
+ */
+export interface ValidateStudioProviderArtifactReferenceLifetimeInput {
+  /** Provider-returned capability. It is never included in output or errors. */
+  readonly url: string;
+  /** Model-registry-owned exact output host and object path namespace. */
+  readonly policy: StudioProviderArtifactFetchPolicy;
+  /** A fail-closed lower bound for usable time after this validation. */
+  readonly minimumRemainingMs: number;
+  /** Test-only clock injection; production uses the current wall clock. */
+  readonly nowMs?: number | undefined;
 }
 
 export interface FetchStudioProviderArtifactInput {
@@ -78,11 +118,36 @@ export function normalizeStudioProviderArtifactReference(input: {
   }
 }
 
+/**
+ * Validates a signed provider artifact capability without exposing its URL.
+ * The capability must already be live and retain at least the requested
+ * conservative window. This is intentionally separate from fetching so a
+ * store/lifecycle can fail closed before encrypted persistence or material
+ * download starts.
+ */
+export function validateStudioProviderArtifactReferenceLifetime(
+  input: ValidateStudioProviderArtifactReferenceLifetimeInput,
+): StudioProviderArtifactReferenceLifetime {
+  try {
+    if (!input || typeof input !== "object" || Array.isArray(input)) fail("invalid_configuration");
+    const policy = normalizePolicy(input.policy);
+    const nowMs = normalizeWallClock(input.nowMs);
+    const minimumRemainingMs = normalizeMinimumRemainingLifetime(input.minimumRemainingMs);
+    return inspectArtifactReference(input.url, policy, nowMs, minimumRemainingMs).lifetime;
+  } catch (error) {
+    if (error instanceof StudioProviderArtifactFetchError) throw error;
+    fail("invalid_configuration");
+  }
+}
+
 export type StudioProviderArtifactFetchErrorCode =
   | "invalid_configuration"
   | "invalid_policy"
   | "invalid_url"
   | "invalid_signed_url"
+  | "signed_url_not_yet_valid"
+  | "signed_url_expired"
+  | "signed_url_insufficient_lifetime"
   | "provider_private_transport_required"
   | "request_timeout"
   | "transport_failure"
@@ -118,6 +183,13 @@ interface NormalizedInput {
   readonly policy: NormalizedPolicy;
   readonly timeoutMs: number;
   readonly maxBytes: number;
+}
+
+interface InspectedArtifactReference {
+  /** Internal-only normalized capability. It must never leave this module. */
+  readonly normalizedUrl: string;
+  /** Deliberately URL-free timing metadata available to callers. */
+  readonly lifetime: StudioProviderArtifactReferenceLifetime;
 }
 
 interface ArtifactFetchDeadline {
@@ -310,6 +382,19 @@ function isCanonicalDnsHost(host: string): boolean {
 }
 
 function normalizeArtifactUrl(value: string, policy: NormalizedPolicy): string {
+  return inspectArtifactReference(value, policy, normalizeWallClock(undefined)).normalizedUrl;
+}
+
+/**
+ * Parses and validates one capability at the policy boundary. The normalized
+ * URL stays internal even when the caller only needs its safe timing facts.
+ */
+function inspectArtifactReference(
+  value: string,
+  policy: NormalizedPolicy,
+  nowMs: number,
+  minimumRemainingMs?: number,
+): InspectedArtifactReference {
   // A provider-private result must be fetched by a dedicated provider adapter
   // that can prove its authentication contract. Never fall back to a generic
   // unauthenticated GET merely because an exact host/path was reviewed.
@@ -346,8 +431,9 @@ function normalizeArtifactUrl(value: string, policy: NormalizedPolicy): string {
   ) {
     fail("invalid_url");
   }
-  if (!hasCompleteGoogleCloudStorageV4Signature(url)) fail("invalid_signed_url");
-  return url.toString();
+  const lifetime = inspectGoogleCloudStorageV4Signature(url, nowMs, minimumRemainingMs);
+  if (lifetime === null) fail("invalid_signed_url");
+  return Object.freeze({ normalizedUrl: url.toString(), lifetime });
 }
 
 /**
@@ -356,7 +442,11 @@ function normalizeArtifactUrl(value: string, policy: NormalizedPolicy): string {
  * object is private. The storage service validates the actual signature; this
  * boundary ensures Air only attempts that authenticated retrieval shape.
  */
-function hasCompleteGoogleCloudStorageV4Signature(url: URL): boolean {
+function inspectGoogleCloudStorageV4Signature(
+  url: URL,
+  nowMs: number,
+  minimumRemainingMs: number | undefined,
+): StudioProviderArtifactReferenceLifetime | null {
   const parameters = url.searchParams;
   const algorithm = exactlyOneQueryParameter(parameters, "X-Goog-Algorithm");
   const credential = exactlyOneQueryParameter(parameters, "X-Goog-Credential");
@@ -373,17 +463,84 @@ function hasCompleteGoogleCloudStorageV4Signature(url: URL): boolean {
     signedHeaders === null ||
     signature === null
   ) {
-    return false;
+    return null;
   }
 
-  if (!isGoogleCloudStorageV4Credential(credential)) return false;
-  if (!/^\d{8}T\d{6}Z$/u.test(date)) return false;
-  if (!/^[1-9]\d{0,5}$/u.test(expires)) return false;
+  if (!isGoogleCloudStorageV4Credential(credential)) return null;
+  if (!/^\d{8}T\d{6}Z$/u.test(date)) return null;
+  if (!/^[1-9]\d{0,5}$/u.test(expires)) return null;
   const expiresSeconds = Number(expires);
   // GCS V4 signed URLs can be valid for no more than seven days.
-  if (!Number.isSafeInteger(expiresSeconds) || expiresSeconds > 604_800) return false;
-  if (!hasCanonicalSignedHeaders(signedHeaders)) return false;
-  return /^[a-f0-9]{64}$/u.test(signature);
+  if (!Number.isSafeInteger(expiresSeconds) || expiresSeconds > 604_800) return null;
+  if (!hasCanonicalSignedHeaders(signedHeaders) || !hasGoogleCloudStorageV4Signature(algorithm, signature)) {
+    return null;
+  }
+
+  const signedAtMs = parseGoogleCloudStorageV4SigningTime(date);
+  if (signedAtMs === null) return null;
+  const expiresAtMs = signedAtMs + expiresSeconds * 1_000;
+  if (!Number.isSafeInteger(expiresAtMs)) return null;
+
+  // GCS V4 allows up to fifteen minutes of early use for ordinary signing
+  // clock skew. Beyond that documented window, this worker cannot consume or
+  // durably retain the capability yet.
+  if (signedAtMs - nowMs > GCS_V4_EARLY_USE_WINDOW_MS) fail("signed_url_not_yet_valid");
+  if (expiresAtMs <= nowMs) fail("signed_url_expired");
+
+  const remainingMs = expiresAtMs - nowMs;
+  if (!Number.isSafeInteger(remainingMs) || remainingMs < 1) fail("signed_url_expired");
+  if (minimumRemainingMs !== undefined && remainingMs < minimumRemainingMs) {
+    fail("signed_url_insufficient_lifetime");
+  }
+  return Object.freeze({ expiresAtMs, remainingMs });
+}
+
+/**
+ * `Date.parse` accepts several non-canonical forms and normalizes invalid
+ * calendar dates. GCS signs the compact UTC form, so reconstruct and compare
+ * every component before using it in an authorization lifetime calculation.
+ */
+function parseGoogleCloudStorageV4SigningTime(value: string): number | null {
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/u.exec(value);
+  if (match === null) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  if (
+    !Number.isSafeInteger(year) || year < 1 ||
+    !Number.isSafeInteger(month) || month < 1 || month > 12 ||
+    !Number.isSafeInteger(day) || day < 1 || day > 31 ||
+    !Number.isSafeInteger(hour) || hour > 23 ||
+    !Number.isSafeInteger(minute) || minute > 59 ||
+    !Number.isSafeInteger(second) || second > 59
+  ) {
+    return null;
+  }
+
+  // Start from epoch and use setUTCFullYear so years 0001-0099 do not receive
+  // Date.UTC's legacy 1900 offset. The component comparison rejects leap-day
+  // and month-end normalizations such as 20260229 or 20260431.
+  const signedAt = new Date(0);
+  signedAt.setUTCFullYear(year, month - 1, day);
+  signedAt.setUTCHours(hour, minute, second, 0);
+  const signedAtMs = signedAt.getTime();
+  if (
+    !Number.isSafeInteger(signedAtMs) ||
+    signedAt.getUTCFullYear() !== year ||
+    signedAt.getUTCMonth() !== month - 1 ||
+    signedAt.getUTCDate() !== day ||
+    signedAt.getUTCHours() !== hour ||
+    signedAt.getUTCMinutes() !== minute ||
+    signedAt.getUTCSeconds() !== second ||
+    signedAt.getUTCMilliseconds() !== 0
+  ) {
+    return null;
+  }
+  return signedAtMs;
 }
 
 function exactlyOneQueryParameter(parameters: URLSearchParams, name: string): string | null {
@@ -395,6 +552,17 @@ function isGoogleCloudStorageV4Credential(value: string): boolean {
   // `<access-key>/<yyyymmdd>/<region>/storage/goog4_request` after URL
   // decoding. Keep every part bounded and printable before accepting it.
   return /^[A-Za-z0-9._-]{1,256}\/\d{8}\/[A-Za-z0-9-]{1,64}\/storage\/goog4_request$/u.test(value);
+}
+
+function hasGoogleCloudStorageV4Signature(algorithm: string, signature: string): boolean {
+  if (algorithm === "GOOG4-HMAC-SHA256") {
+    return new RegExp(`^[a-f0-9]{${GCS_V4_HMAC_SIGNATURE_HEX_CHARS}}$`, "u").test(signature);
+  }
+  return algorithm === "GOOG4-RSA-SHA256"
+    && signature.length >= GCS_V4_RSA_SIGNATURE_MIN_HEX_CHARS
+    && signature.length <= GCS_V4_RSA_SIGNATURE_MAX_HEX_CHARS
+    && signature.length % 2 === 0
+    && /^[a-f0-9]+$/u.test(signature);
 }
 
 function hasCanonicalSignedHeaders(value: string): boolean {
@@ -426,6 +594,17 @@ function normalizeTimeout(value: number | undefined): number {
     fail("invalid_configuration");
   }
   return timeoutMs;
+}
+
+function normalizeWallClock(value: number | undefined): number {
+  const nowMs = value ?? Date.now();
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) fail("invalid_configuration");
+  return nowMs;
+}
+
+function normalizeMinimumRemainingLifetime(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) fail("invalid_configuration");
+  return value;
 }
 
 function normalizeMaxBytes(value: number | undefined): number {

@@ -45,6 +45,7 @@ import type {
 } from "./store.js";
 import { createStudioJob, isJobQueueEligibleState } from "./store.js";
 import {
+  advanceStudioProviderResultLifecycle,
   authorizeStudioJobResultDispatch,
   reconcileStudioJobResultDelivery,
   type StudioProviderResultLifecycleResult,
@@ -181,9 +182,12 @@ export function createStudioDrainBudget(options: StudioDrainBudgetOptions = {}):
  * run more than once because receipts and outbox IDs are stable.
  */
 export async function drainStudio(runtime: StudioRuntime, budget = createStudioDrainBudget()): Promise<void> {
+  // A sealed provider result has already incurred the paid provider work and
+  // needs a full private-read/Photon window before its signed capability or
+  // immutable observation deadline expires. Give job recovery first use of a
+  // fresh Cron budget; inbox/outbox remain durable for the next minute.
+  if (budget.canStart(JOB_START_RESERVE_MS)) await drainStudioJobs(runtime, budget);
   await drainStudioWithStats(runtime, budget);
-  if (!budget.canStart(JOB_START_RESERVE_MS)) return;
-  await drainStudioJobs(runtime, budget);
 }
 
 export async function drainStudioWithStats(
@@ -251,8 +255,12 @@ export async function drainStudioJobs(
     advanced += 1;
 
     try {
-      const lifecycle = await advanceClaimedStudioJob(runtime, claim.record, maySubmit, mayRecover);
+      const lifecycle = await advanceClaimedStudioJob(runtime, claim.record, maySubmit, mayRecover, budget);
       await rescheduleCurrentJob(runtime, claim.record, claim.lease.token, lifecycle);
+      // A just-persisted result reference is immediately due so the next
+      // minute Cron can start its full materialization window. Do not let this
+      // same bounded loop reclaim it before the current invocation returns.
+      if (lifecycle?.kind === "pending" && lifecycle.deferToNextDrain === true) break;
     } catch {
       // An internal fault before a physical provider-call outcome is not a
       // reason to terminalize paid work. Leave the durable queue entry in
@@ -301,6 +309,7 @@ async function advanceClaimedStudioJob(
   claimed: StudioJobRecord,
   maySubmit: boolean,
   mayRecover: boolean,
+  budget: StudioDrainBudget,
 ): Promise<StudioProviderResultLifecycleResult | undefined> {
   if (claimed.state === "ready" || claimed.state === "delivering") {
     return await reconcileStudioJobResultDelivery(runtime, claimed.jobId);
@@ -321,13 +330,11 @@ async function advanceClaimedStudioJob(
     return await reconcileStudioJobResultDelivery(runtime, current.jobId);
   }
   if (current.state !== "executing" || !mayRecover) return undefined;
-  // A fresh provider-result observation may serially perform a status GET,
-  // private artifact read/validation, Photon token mint, upload, and Redis
-  // finalization. That does not fit a proven Vercel Cron deadline yet. Leave
-  // the executing job durably scheduled rather than starting any part of that
-  // chain; `advanceStudioProviderResultLifecycle` carries the same defensive
-  // no-side-effect rule if it is ever called with deadline options directly.
-  return undefined;
+  // A reviewed split-capability adapter persists the private retrieval
+  // capability before attempting media/Photon work. The lifecycle itself
+  // reserves the full materialization window and defers cleanly when this
+  // shared Cron cannot provide it.
+  return await advanceStudioProviderResultLifecycle(runtime, current.jobId, budget.transportOptions());
 }
 
 /**

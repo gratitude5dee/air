@@ -246,35 +246,34 @@ export class GmiRequestQueueClient {
   public async submitRequest(input: GmiSubmitRequestInput): Promise<GmiSubmitResult> {
     this.requireProviderSubmission();
     validateSubmitInput(input);
-    let response: Response;
     try {
-      response = await this.request("/requests", {
+      return await this.request("/requests", {
         method: "POST",
         body: encodeBoundedJson({ model: input.model, payload: input.payload }),
+      }, async (response, signal) => {
+        if (response.status >= 200 && response.status < 300) {
+          try {
+            const body = await readBoundedJson(response, this.maxResponseBytes, signal);
+            return parseAcceptedSubmission(body, input.model);
+          } catch (error) {
+            // A timed-out body is as ambiguous as a timed-out submit request,
+            // while malformed 2xx evidence remains operator-reconciled.
+            if (error instanceof GmiRequestQueueError && error.code === "request_timeout") throw error;
+            return ambiguousSubmission("malformed_response");
+          }
+        }
+
+        discardResponseBody(response);
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+          return Object.freeze({ classification: "definitive_rejection", httpStatus: response.status });
+        }
+        if (response.status === 429) return ambiguousSubmission("rate_limited", response.status);
+        if (response.status >= 500) return ambiguousSubmission("server_error", response.status);
+        return ambiguousSubmission("unexpected_status", response.status);
       });
     } catch (error) {
       return classifySubmitError(error);
     }
-
-    if (response.status >= 200 && response.status < 300) {
-      try {
-        const body = await readBoundedJson(response, this.maxResponseBytes);
-        return parseAcceptedSubmission(body, input.model);
-      } catch {
-        // A 2xx response without an exact model binding, valid request_id, or
-        // valid status cannot prove which paid job GMI created, so it must
-        // remain operator-reconciled.
-        return ambiguousSubmission("malformed_response");
-      }
-    }
-
-    discardResponseBody(response);
-    if (response.status >= 400 && response.status < 500 && response.status !== 429) {
-      return Object.freeze({ classification: "definitive_rejection", httpStatus: response.status });
-    }
-    if (response.status === 429) return ambiguousSubmission("rate_limited", response.status);
-    if (response.status >= 500) return ambiguousSubmission("server_error", response.status);
-    return ambiguousSubmission("unexpected_status", response.status);
   }
 
   /** Alias for consumers whose provider port calls the operation `submit`. */
@@ -342,29 +341,38 @@ export class GmiRequestQueueClient {
       readonly body?: string | undefined;
     },
   ): Promise<JsonResponse> {
-    const response = await this.request(path, options);
-    if (!options.expectedStatuses.includes(response.status)) {
-      discardResponseBody(response);
-      throw new GmiRequestQueueError(
-        "unexpected_status",
-        response.status === 429 || response.status >= 500,
-        response.status,
-      );
-    }
-    return Object.freeze({
-      status: response.status,
-      body: await readBoundedJson(response, this.maxResponseBytes),
+    return this.request(path, options, async (response, signal) => {
+      if (!options.expectedStatuses.includes(response.status)) {
+        discardResponseBody(response);
+        throw new GmiRequestQueueError(
+          "unexpected_status",
+          response.status === 429 || response.status >= 500,
+          response.status,
+        );
+      }
+      return Object.freeze({
+        status: response.status,
+        body: await readBoundedJson(response, this.maxResponseBytes, signal),
+      });
     });
   }
 
-  private async request(
+  private async request<T>(
     path: string,
     options: { readonly method: "GET" | "POST"; readonly body?: string | undefined },
-  ): Promise<Response> {
+    consume: (response: Response, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
+    let response: Response | undefined;
+    const timeout = setTimeout(() => {
+      controller.abort();
+      // A fetch implementation can expose a stream that does not react to its
+      // abort signal after headers.  Start cancellation here; body readers use
+      // the same signal to cancel their locked reader and reject immediately.
+      if (response) discardResponseBody(response);
+    }, this.timeoutMs);
     try {
-      const response = await this.fetch(new URL(`${GMI_REQUEST_QUEUE_PATH}${path}`, GMI_REQUEST_QUEUE_ORIGIN), {
+      response = await this.fetch(new URL(`${GMI_REQUEST_QUEUE_PATH}${path}`, GMI_REQUEST_QUEUE_ORIGIN), {
         method: options.method,
         headers: {
           accept: "application/json",
@@ -381,10 +389,14 @@ export class GmiRequestQueueClient {
       if (!isResponseLike(response)) {
         throw new GmiRequestQueueError("invalid_response", false);
       }
-      return response;
+      if (controller.signal.aborted) {
+        discardResponseBody(response);
+        throw new GmiRequestQueueError("request_timeout", true);
+      }
+      return await consume(response, controller.signal);
     } catch (error) {
-      if (error instanceof GmiRequestQueueError) throw error;
       if (controller.signal.aborted) throw new GmiRequestQueueError("request_timeout", true);
+      if (error instanceof GmiRequestQueueError) throw error;
       // Do not retain or rethrow a native fetch error: it can contain a URL or
       // provider diagnostic body in some runtimes.
       throw new GmiRequestQueueError("transport_failure", true);
@@ -641,16 +653,20 @@ function isResponseLike(value: unknown): value is Response {
   );
 }
 
-async function readBoundedJson(response: Response, maxBytes: number): Promise<GmiJsonValue> {
+async function readBoundedJson(
+  response: Response,
+  maxBytes: number,
+  signal: AbortSignal,
+): Promise<GmiJsonValue> {
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
   if (!contentType.includes("application/json")) {
-    await cancelResponseBody(response);
+    discardResponseBody(response);
     throw new GmiRequestQueueError("invalid_response", false, response.status);
   }
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
     if (!/^\d+$/.test(contentLength) || Number(contentLength) > maxBytes) {
-      await cancelResponseBody(response);
+      discardResponseBody(response);
       throw new GmiRequestQueueError("invalid_response", false, response.status);
     }
   }
@@ -661,16 +677,17 @@ async function readBoundedJson(response: Response, maxBytes: number): Promise<Gm
   let size = 0;
   try {
     for (;;) {
-      const chunk = await reader.read();
+      const chunk = await readResponseChunk(reader, signal);
       if (chunk.done) break;
       size += chunk.value.byteLength;
       if (size > maxBytes) {
-        await reader.cancel().catch(() => undefined);
+        discardResponseReader(reader);
         throw new GmiRequestQueueError("invalid_response", false, response.status);
       }
       chunks.push(chunk.value);
     }
   } catch (error) {
+    if (signal.aborted) throw new GmiRequestQueueError("request_timeout", true);
     if (error instanceof GmiRequestQueueError) throw error;
     throw new GmiRequestQueueError("invalid_response", false, response.status);
   } finally {
@@ -691,6 +708,44 @@ async function readBoundedJson(response: Response, maxBytes: number): Promise<Gm
     if (error instanceof GmiRequestQueueError) throw error;
     throw new GmiRequestQueueError("invalid_response", false, response.status);
   }
+}
+
+/**
+ * Some fetch implementations only apply AbortSignal to receiving headers.  A
+ * bounded response read must therefore race its locked reader against the
+ * same request signal and cancel the reader itself when the budget expires.
+ */
+async function readResponseChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  if (signal.aborted) {
+    void reader.cancel().catch(() => undefined);
+    throw new GmiRequestQueueError("request_timeout", true);
+  }
+
+  return new Promise<ReadableStreamReadResult<Uint8Array>>((resolve, reject) => {
+    let settled = false;
+    const settle = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = (): void => {
+      // Never await this cancellation: an uncooperative source must not keep
+      // the request alive after the deadline. The original read remains
+      // observed below, so a late rejection cannot become unhandled.
+      void reader.cancel().catch(() => undefined);
+      settle(() => reject(new GmiRequestQueueError("request_timeout", true)));
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    void reader.read().then(
+      (chunk) => settle(() => resolve(chunk)),
+      (error: unknown) => settle(() => reject(error)),
+    );
+  });
 }
 
 function parseAcceptedSubmission(value: GmiJsonValue, expectedModel: string): GmiAcceptedSubmission {
@@ -795,11 +850,20 @@ function freezeJson<T extends GmiJsonValue>(value: T): T {
 }
 
 function discardResponseBody(response: Response): void {
-  void cancelResponseBody(response);
+  try {
+    void Promise.resolve(response.body?.cancel()).catch(() => undefined);
+  } catch {
+    // A provider-owned cleanup failure must never keep a bounded request
+    // alive or disclose response details.
+  }
 }
 
-async function cancelResponseBody(response: Response): Promise<void> {
-  await response.body?.cancel().catch(() => undefined);
+function discardResponseReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    void Promise.resolve(reader.cancel()).catch(() => undefined);
+  } catch {
+    // As above, cleanup is deliberately best-effort.
+  }
 }
 
 function invalidRequest(): never {

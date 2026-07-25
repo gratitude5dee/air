@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   createGmiRequestQueueClient,
   createGmiRequestQueueClientFromEnv,
@@ -272,6 +272,100 @@ describe("GMI request-queue client", () => {
       classification: "ambiguous",
       reason: "timeout",
     });
+  });
+
+  it("keeps the request budget through a trickling JSON body and cancels it without exposing provider data", async () => {
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      let beginReading!: () => void;
+      const reading = new Promise<void>((resolve) => {
+        beginReading = resolve;
+      });
+      let cancelled = false;
+      let cancellationReason: unknown;
+      const privateProviderFragment = "private-provider-fragment-must-not-leak";
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(encoder.encode('{"models":['));
+          beginReading();
+          setTimeout(() => {
+            controller.enqueue(encoder.encode(`"${privateProviderFragment}",`));
+          }, 50);
+          // The source never closes. Its slow continuation must be bounded by
+          // the request timer rather than holding the worker indefinitely.
+          return new Promise<void>(() => undefined);
+        },
+        cancel(reason) {
+          cancelled = true;
+          cancellationReason = reason;
+        },
+      }, { highWaterMark: 0 });
+      const service = client(async () => new Response(body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }), { timeoutMs: 250 });
+
+      const pending = service.listModels();
+      const timeout = expect(pending).rejects.toMatchObject({
+        name: "GmiRequestQueueError",
+        code: "request_timeout",
+        retryable: true,
+      });
+      await reading;
+      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(150);
+
+      await timeout;
+      expect(cancelled).toBe(true);
+      expect(String(cancellationReason)).not.toContain(privateProviderFragment);
+
+      try {
+        await pending;
+      } catch (error) {
+        expect((error as Error).message).toBe("gmi_request_queue_request_timeout");
+        expect((error as Error).message).not.toContain(privateProviderFragment);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not wait for an uncooperative provider body cleanup on early rejection", async () => {
+    const neverSettlingBody = (chunk?: Uint8Array): ReadableStream<Uint8Array> => new ReadableStream<Uint8Array>({
+      start(controller) {
+        if (chunk) controller.enqueue(chunk);
+      },
+      cancel() {
+        return new Promise<void>(() => undefined);
+      },
+    });
+    const encoder = new TextEncoder();
+    const unexpectedStatus = client(async () => new Response(neverSettlingBody(), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    }));
+    const invalidContentType = client(async () => new Response(neverSettlingBody(), {
+      status: 200,
+      headers: { "content-type": "text/plain" },
+    }));
+    const invalidContentLength = client(async () => new Response(neverSettlingBody(), {
+      status: 200,
+      headers: { "content-type": "application/json", "content-length": "2048" },
+    }), { maxResponseBytes: 1_024 });
+    const oversizedBody = client(async () => new Response(neverSettlingBody(encoder.encode("x".repeat(1_025))), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }), { maxResponseBytes: 1_024 });
+
+    await expect(unexpectedStatus.listModels()).rejects.toMatchObject({
+      code: "unexpected_status",
+      retryable: true,
+      httpStatus: 503,
+    });
+    await expect(invalidContentType.listModels()).rejects.toMatchObject({ code: "invalid_response" });
+    await expect(invalidContentLength.listModels()).rejects.toMatchObject({ code: "invalid_response" });
+    await expect(oversizedBody.listModels()).rejects.toMatchObject({ code: "invalid_response" });
   });
 
   it("treats an oversized JSON response as malformed without preserving its body", async () => {

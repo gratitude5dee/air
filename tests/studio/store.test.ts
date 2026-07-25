@@ -4,6 +4,11 @@ import { createQueueCipher, type QueueCipher } from "../../lib/crypto.js";
 import { MemoryRedis } from "../../lib/redis.js";
 import { deriveOpaqueId, hashSenderIdentifier, hashThreadIdentifier, type SenderHash, type ThreadHash } from "../../lib/security.js";
 import {
+  createStudioProviderResultReference,
+  isStudioProviderResultReference,
+  openStudioProviderResultReference,
+} from "../../lib/studio/provider-result-reference.js";
+import {
   STUDIO_MAX_OUTBOX_SEND_ATTEMPTS,
   STUDIO_CRON_FRESHNESS_MS,
   STUDIO_REDIS_PREFIX,
@@ -268,6 +273,22 @@ async function submittedProviderSubrun(
   });
   if (!submitted || submitted.state !== "submitted") throw new Error("expected submitted provider subrun");
   return Object.freeze({ created, executing, snapshot: payload.execution, subrun: submitted });
+}
+
+function sealedProviderResultReference(
+  jobId: string,
+  snapshot: StudioExecutionSnapshot,
+  url = "https://private.example.test/result?token=private-result-token",
+) {
+  return createStudioProviderResultReference({
+    jobId,
+    provider: snapshot.model.provider,
+    adapterKey: snapshot.model.adapterKey,
+    providerModelId: snapshot.model.providerModelId,
+    resultSchemaFingerprint: snapshot.model.resultSchemaFingerprint,
+    outputs: [{ outputIndex: 1, mediaType: snapshot.output.type }],
+    material: { kind: "signed-url", url },
+  });
 }
 
 function resultAttachmentPayload(outputIndex: number) {
@@ -2464,6 +2485,202 @@ describe("Air v2 studio durable store", () => {
     expect(raw ?? "").not.toContain("a private prompt");
     expect(raw ?? "").not.toContain("providerRequestId");
     await expect(store.getProviderObservation(subrun.subrunId)).resolves.toEqual(first);
+  });
+
+  it("atomically seals a provider result reference under the observation lease and restores only its bound capability", async () => {
+    const setup = await activeCanaryFixture();
+    const { store, redis, prefix, cipher } = setup;
+    const { snapshot, subrun } = await submittedProviderSubrun(setup, "sealed-provider-result-reference");
+    const observation = await store.ensureProviderObservation(subrun, snapshot);
+    if (!observation) throw new Error("expected provider observation");
+    const lease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!lease) throw new Error("expected observation lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, lease.token))
+      .resolves.toMatchObject({ kind: "ready", observation: { state: "observing" } });
+
+    const privateUrl = "https://private.example.test/result?token=private-result-token";
+    const sealed = sealedProviderResultReference(subrun.jobId, snapshot, privateUrl);
+    await expect(store.commitProviderResultReference(subrun.subrunId, lease.token, sealed))
+      .resolves.toMatchObject({ kind: "result_ready", observation: { state: "result_ready" } });
+
+    const observationRaw = await redis.get(`${prefix}:provider-observation:${observation.observationId}`);
+    const referenceRaw = await redis.get(`${prefix}:provider-observation:result-reference:${observation.observationId}`);
+    for (const raw of [observationRaw ?? "", referenceRaw ?? ""]) {
+      expect(raw).not.toContain(privateUrl);
+      expect(raw).not.toContain("private-result-token");
+      expect(raw).not.toContain(`private-provider-request-${subrun.jobId}`);
+      expect(raw).not.toContain("providerRequestId");
+    }
+    expect(await redis.pttl(`${prefix}:provider-observation:result-reference:${observation.observationId}`))
+      .toBe(await redis.pttl(`${prefix}:job:payload:${subrun.jobId}`));
+    await expect(store.getProviderSubrunReference(subrun.subrunId)).resolves.toBeNull();
+
+    const restored = await store.getProviderResultReference(subrun.subrunId);
+    expect(isStudioProviderResultReference(restored)).toBe(true);
+    expect(openStudioProviderResultReference(restored)).toEqual({ kind: "signed-url", url: privateUrl });
+    // The idempotent result boundary must not overwrite a first sealed
+    // capability, even while its original observer still owns the lease.
+    await expect(store.commitProviderResultReference(subrun.subrunId, lease.token, sealed))
+      .resolves.toMatchObject({ kind: "existing", observation: { state: "result_ready" } });
+    // `ensure` must remain readable after the request-ID reference was
+    // intentionally discarded by the result-reference commit.
+    await expect(store.ensureProviderObservation(subrun, snapshot))
+      .resolves.toMatchObject({ state: "result_ready" });
+
+    // A ciphertext copied from another immutable binding must not be restored
+    // as an in-process private capability, even though it decrypts with the
+    // same queue key and observation AAD.
+    const resultReferenceKey = `${prefix}:provider-observation:result-reference:${observation.observationId}`;
+    const referenceTtl = await redis.pttl(resultReferenceKey);
+    if (referenceTtl < 1) throw new Error("expected result-reference TTL");
+    const mismatched = cipher.encrypt({
+      source: "air-provider-result-reference-persistence" as const,
+      schemaVersion: 1 as const,
+      binding: {
+        jobId: "other-admitted-job",
+        provider: snapshot.model.provider,
+        adapterKey: snapshot.model.adapterKey,
+        providerModelId: snapshot.model.providerModelId,
+        resultSchemaFingerprint: snapshot.model.resultSchemaFingerprint,
+        outputCount: 1,
+        outputs: [{ outputIndex: 1 as const, mediaType: snapshot.output.type }],
+      },
+      material: { kind: "signed-url" as const, url: privateUrl },
+    }, `provider-result-reference:${observation.observationId}`);
+    await redis.set(resultReferenceKey, JSON.stringify(mismatched), { px: referenceTtl });
+    await expect(store.getProviderResultReference(subrun.subrunId)).resolves.toBeNull();
+    await lease.release();
+  });
+
+  it("retries a sealed result materialization without another provider poll and fences materialization failure", async () => {
+    const setup = await activeCanaryFixture();
+    const { store, redis, prefix, advance, now } = setup;
+    const { snapshot, subrun } = await submittedProviderSubrun(setup, "sealed-result-materialization-retry", {
+      pollIntervalMs: 1_000,
+      deadlineMs: 120_000,
+    });
+    const observation = await store.ensureProviderObservation(subrun, snapshot);
+    if (!observation) throw new Error("expected provider observation");
+    const statusLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!statusLease) throw new Error("expected status lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, statusLease.token)).resolves.toMatchObject({ kind: "ready" });
+    await expect(store.commitProviderResultReference(
+      subrun.subrunId,
+      statusLease.token,
+      sealedProviderResultReference(subrun.jobId, snapshot),
+    )).resolves.toMatchObject({ kind: "result_ready" });
+    await statusLease.release();
+
+    const materializationLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!materializationLease) throw new Error("expected materialization lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, materializationLease.token, {
+      startResultMaterialization: true,
+    })).resolves.toMatchObject({
+      kind: "result_ready",
+      observation: { state: "result_ready", pollAttempts: 1, materializationAttempts: 1 },
+    });
+    await expect(store.finishProviderObservation(subrun.subrunId, materializationLease.token, { kind: "pending" }))
+      .resolves.toMatchObject({
+        kind: "pending",
+        observation: { state: "result_ready", pollAttempts: 1, nextDueAtMs: now() + 1_000 },
+      });
+
+    const earlyLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!earlyLease) throw new Error("expected early materialization lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, earlyLease.token))
+      .resolves.toMatchObject({ kind: "not_due", observation: { state: "result_ready" } });
+    advance(1_000);
+    const failingLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!failingLease) throw new Error("expected failing materialization lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, failingLease.token, {
+      startResultMaterialization: true,
+    })).resolves.toMatchObject({ kind: "result_ready", observation: { materializationAttempts: 2 } });
+    await expect(store.finishProviderObservation(subrun.subrunId, failingLease.token, {
+      kind: "failed",
+      failureDisposition: "reconciliation_required",
+    })).resolves.toMatchObject({
+      kind: "failed",
+      observation: { state: "failed", failureDisposition: "reconciliation_required" },
+    });
+    await expect(redis.get(`${prefix}:provider-observation:result-reference:${observation.observationId}`))
+      .resolves.toBeNull();
+  });
+
+  it("caps crashed or retryable sealed-result materialization attempts before another artifact read", async () => {
+    const setup = await activeCanaryFixture();
+    const { store, redis, prefix, advance } = setup;
+    const { snapshot, subrun } = await submittedProviderSubrun(setup, "sealed-result-materialization-cap", {
+      pollIntervalMs: 1_000,
+      deadlineMs: 300_000,
+    });
+    const observation = await store.ensureProviderObservation(subrun, snapshot);
+    if (!observation) throw new Error("expected provider observation");
+
+    const statusLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!statusLease) throw new Error("expected status lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, statusLease.token)).resolves.toMatchObject({ kind: "ready" });
+    await expect(store.commitProviderResultReference(
+      subrun.subrunId,
+      statusLease.token,
+      sealedProviderResultReference(subrun.jobId, snapshot),
+    )).resolves.toMatchObject({ kind: "result_ready" });
+    await statusLease.release();
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const lease = await store.acquireProviderObservationLease(subrun.subrunId);
+      if (!lease) throw new Error("expected materialization lease");
+      await expect(store.beginProviderObservation(subrun.subrunId, lease.token, {
+        startResultMaterialization: true,
+      })).resolves.toMatchObject({ kind: "result_ready", observation: { materializationAttempts: attempt } });
+      await expect(store.finishProviderObservation(subrun.subrunId, lease.token, { kind: "pending" }))
+        .resolves.toMatchObject({ kind: "pending", observation: { materializationAttempts: attempt } });
+      advance(1_000);
+    }
+
+    const exhaustedLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!exhaustedLease) throw new Error("expected cap-check lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, exhaustedLease.token, {
+      startResultMaterialization: true,
+    })).resolves.toMatchObject({ kind: "attempts_exhausted", observation: { state: "attempts_exhausted" } });
+    await expect(redis.get(`${prefix}:provider-observation:result-reference:${observation.observationId}`))
+      .resolves.toBeNull();
+  });
+
+  it("accepts result_ready in the prepared-output finalizer and clears the sealed provider reference", async () => {
+    const setup = await activeCanaryFixture();
+    const { store, redis, prefix, advance } = setup;
+    const { executing, snapshot, subrun } = await submittedProviderSubrun(setup, "sealed-result-finalizer", {
+      deadlineMs: 120_000,
+    });
+    const observation = await store.ensureProviderObservation(subrun, snapshot);
+    if (!observation) throw new Error("expected provider observation");
+    const statusLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!statusLease) throw new Error("expected status lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, statusLease.token)).resolves.toMatchObject({ kind: "ready" });
+    await expect(store.commitProviderResultReference(
+      subrun.subrunId,
+      statusLease.token,
+      sealedProviderResultReference(subrun.jobId, snapshot),
+    )).resolves.toMatchObject({ kind: "result_ready" });
+    await statusLease.release();
+
+    await expect(store.ensureJobResultPreparation(executing.jobId, 1)).resolves.toBeTruthy();
+    const preparationLease = await store.acquireJobResultPreparationLease(executing.jobId, 1);
+    if (!preparationLease) throw new Error("expected preparation lease");
+    await expect(store.beginJobResultPreparation(executing, 1, preparationLease.token)).resolves.toMatchObject({ kind: "ready" });
+    await expect(store.finishJobResultPreparation(executing, 1, preparationLease.token, {
+      kind: "prepared",
+      output: { transport: "photon", attachmentGuid: "sealed-result-finalizer-guid" },
+    })).resolves.toMatchObject({ kind: "prepared" });
+
+    const finalizerLease = await store.acquireProviderObservationLease(subrun.subrunId);
+    if (!finalizerLease) throw new Error("expected finalizer lease");
+    await expect(store.beginProviderObservation(subrun.subrunId, finalizerLease.token))
+      .resolves.toMatchObject({ kind: "result_ready" });
+    await expect(store.finalizePreparedProviderResult(subrun.subrunId, finalizerLease.token))
+      .resolves.toMatchObject({ kind: "finalized", observation: { state: "succeeded" } });
+    await expect(redis.get(`${prefix}:provider-observation:result-reference:${observation.observationId}`))
+      .resolves.toBeNull();
   });
 
   it("retries only bounded safe provider polls after a crashed observation lease", async () => {

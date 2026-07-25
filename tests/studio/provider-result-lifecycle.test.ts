@@ -17,8 +17,13 @@ import type {
 import type {
   StudioProviderObservationPort,
   StudioProviderObservationResult,
+  StudioProviderObservationInput,
+  StudioProviderResultMaterializationResult,
+  StudioProviderResultPollResult,
+  StudioProviderResultReferencePort,
   StudioProviderSubmitResult,
 } from "../../lib/studio/provider-port.js";
+import { createStudioProviderResultReference } from "../../lib/studio/provider-result-reference.js";
 import type { StudioRuntime } from "../../lib/studio/runtime.js";
 import {
   STUDIO_REDIS_PREFIX,
@@ -30,7 +35,12 @@ import {
   type StudioJobRecordWithPayload,
   type StudioPreparedOutput,
 } from "../../lib/studio/store.js";
-import { drainStudio, drainStudioJobs, drainStudioOutbox } from "../../lib/studio/engine.js";
+import {
+  createStudioDrainBudget,
+  drainStudio,
+  drainStudioJobs,
+  drainStudioOutbox,
+} from "../../lib/studio/engine.js";
 import { executeStudioProviderSubrun } from "../../lib/studio/workflow-executor.js";
 
 const IDENTITY_SECRET = "provider-result-lifecycle-test-identity";
@@ -52,6 +62,12 @@ const ONE_PIXEL_PNG = Uint8Array.from(Buffer.from(
 type RecordingProvider = StudioProviderObservationPort & {
   readonly submit: ReturnType<typeof vi.fn>;
   readonly observe: ReturnType<typeof vi.fn>;
+};
+
+type RecordingSplitProvider = StudioProviderResultReferencePort & {
+  readonly submit: ReturnType<typeof vi.fn>;
+  readonly pollResult: ReturnType<typeof vi.fn>;
+  readonly materializeResult: ReturnType<typeof vi.fn>;
 };
 
 type RecordingTransport = StudioIMessageTransport & StudioPreparedOutputTransport & {
@@ -157,6 +173,55 @@ function fakeProvider(results: readonly StudioProviderObservationResult[]): Reco
   } as RecordingProvider;
 }
 
+function readyPrivateResultReference(input: StudioProviderObservationInput) {
+  return createStudioProviderResultReference({
+    jobId: input.job.jobId,
+    provider: input.job.provider,
+    adapterKey: input.snapshot.model.adapterKey,
+    providerModelId: input.snapshot.model.providerModelId,
+    resultSchemaFingerprint: input.snapshot.model.resultSchemaFingerprint,
+    outputs: [{ outputIndex: 1, mediaType: input.snapshot.output.type }],
+    material: { kind: "provider-private", url: PRIVATE_RESULT_URL },
+  });
+}
+
+/**
+ * Models the reviewed split boundary: the first call only returns an opaque
+ * sealed retrieval capability; a later materialization call yields bytes.
+ */
+function fakeSplitProvider(options: {
+  readonly pollResults?: readonly StudioProviderResultPollResult[];
+  readonly materializationResults?: readonly StudioProviderResultMaterializationResult[];
+} = {}): RecordingSplitProvider {
+  const polls = [...(options.pollResults ?? [])];
+  const materializations = [...(options.materializationResults ?? [])];
+  let defaultPollConsumed = false;
+  let defaultMaterializationConsumed = false;
+  return {
+    verified: true,
+    resultPollingSupported: true,
+    resultMaterializationSupported: true,
+    submit: vi.fn(async (): Promise<StudioProviderSubmitResult> => frozen({
+      kind: "accepted" as const,
+      providerRequestId: PROVIDER_REQUEST_ID,
+    })),
+    pollResult: vi.fn(async (input: StudioProviderObservationInput): Promise<StudioProviderResultPollResult> => {
+      const next = polls.shift();
+      if (next !== undefined) return next;
+      if (defaultPollConsumed) throw new Error("unexpected split provider poll");
+      defaultPollConsumed = true;
+      return frozen({ kind: "ready" as const, reference: readyPrivateResultReference(input) });
+    }),
+    materializeResult: vi.fn(async (): Promise<StudioProviderResultMaterializationResult> => {
+      const next = materializations.shift();
+      if (next !== undefined) return next;
+      if (defaultMaterializationConsumed) throw new Error("unexpected split result materialization");
+      defaultMaterializationConsumed = true;
+      return readyPrivateImage();
+    }),
+  } as RecordingSplitProvider;
+}
+
 function fakeTransport(
   prepareOutcome: StudioPrepareOutputOutcome = frozen({ kind: "prepared" as const, output: PREPARED_OUTPUT }),
 ): RecordingTransport {
@@ -187,8 +252,12 @@ function fakeTransport(
 async function fixture(options: {
   readonly observations?: readonly StudioProviderObservationResult[];
   readonly prepareOutcome?: StudioPrepareOutputOutcome;
+  readonly splitProvider?: RecordingSplitProvider;
+  readonly pollingDeadlineMs?: number;
+  /** Align bounded-deadline tests with the real wall clock used by transport guards. */
+  readonly startAtMs?: number;
 } = {}) {
-  let now = Date.UTC(2026, 6, 23, 12, 0, 0);
+  let now = options.startAtMs ?? Date.UTC(2026, 6, 23, 12, 0, 0);
   const redis = new MemoryRedis(() => now);
   const cipher = createQueueCipher(QUEUE_KEY);
   const prefix = `${STUDIO_REDIS_PREFIX}:provider-result-lifecycle-test`;
@@ -214,13 +283,14 @@ async function fixture(options: {
   expect(await store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
 
   const provider = fakeProvider(options.observations ?? []);
+  const activeProvider = options.splitProvider ?? provider;
   const transport = fakeTransport(options.prepareOutcome);
   const runtime: StudioRuntime = {
     environment: environment(),
     cipher,
     store,
     transport,
-    provider,
+    provider: activeProvider,
     storageTransport: "rest",
     readiness: (): readonly string[] => [],
     close: async (): Promise<void> => undefined,
@@ -243,7 +313,12 @@ async function fixture(options: {
     }),
     output: frozen({ type: "image" as const, count: 1 }),
     maximumQuotedCostCents: 25,
-    polling: frozen({ requestTimeoutMs: 5_000, pollIntervalMs: 1_000, maxPollAttempts: 4, deadlineMs: 15_000 }),
+    polling: frozen({
+      requestTimeoutMs: 5_000,
+      pollIntervalMs: 1_000,
+      maxPollAttempts: 4,
+      deadlineMs: options.pollingDeadlineMs ?? 15_000,
+    }),
     releaseStamp,
   });
 
@@ -300,6 +375,7 @@ async function fixture(options: {
     cipher,
     prefix,
     provider,
+    splitProvider: options.splitProvider,
     transport,
     snapshot,
     job,
@@ -356,6 +432,242 @@ function expectProviderSecretsAbsent(setup: Awaited<ReturnType<typeof fixture>>)
 }
 
 describe("private provider result lifecycle", () => {
+  it("persists a split ready reference before materializing it after a worker restart", async () => {
+    const splitProvider = fakeSplitProvider();
+    const setup = await fixture({
+      splitProvider,
+      // A real split recovery needs time for a later Cron invocation, rather
+      // than the legacy unit-test-only 15-second one-shot poll window.
+      pollingDeadlineMs: 120_000,
+    });
+    const job = await submitAccepted(setup, "split-ready-reference-restart");
+
+    // Phase A owns only the idempotent status poll and encrypted capability
+    // commit. It must not fetch bytes or mint/upload a Photon attachment in
+    // the same invocation that learned the provider output is ready.
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId))
+      .resolves.toMatchObject({ kind: "pending" });
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).not.toHaveBeenCalled();
+    expect(setup.transport.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+
+    const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
+    if (!subrun) throw new Error("expected submitted subrun");
+    await expect(setup.store.getProviderObservation(subrun.subrunId))
+      .resolves.toMatchObject({ state: "result_ready" });
+    await expect(setup.store.getProviderResultReference(subrun.subrunId))
+      .resolves.toMatchObject({
+        source: "air-sealed-provider-result-reference",
+        jobId: job.jobId,
+      });
+
+    // The retrieval URL is encrypted at rest. Neither the request ID nor the
+    // bare private provider URL may appear in any MemoryRedis string record.
+    expectProviderSecretsAbsent(setup);
+
+    // Recreate the store the way a fresh Cron worker would. It must reopen
+    // the sealed capability and materialize it, without issuing another
+    // provider status poll after phase A already consumed that safe GET.
+    const restartedStore = new StudioStore({
+      redis: setup.redis,
+      cipher: setup.cipher,
+      identityHashSecret: IDENTITY_SECRET,
+      prefix: setup.prefix,
+      clock: setup.now,
+      releaseStamp: setup.snapshot.releaseStamp,
+    });
+    const restartedRuntime: StudioRuntime = { ...setup.runtime, store: restartedStore };
+    await expect(advanceStudioProviderResultLifecycle(restartedRuntime, job.jobId))
+      .resolves.toEqual({ kind: "ready" });
+
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).toHaveBeenCalledTimes(1);
+    expect(setup.transport.prepareValidatedProviderArtifact).toHaveBeenCalledTimes(1);
+    await expect(restartedStore.getJob(job.jobId)).resolves.toMatchObject({ state: "ready" });
+    expectProviderSecretsAbsent(setup);
+  });
+
+  it("persists the sealed reference before materializing it in a bounded drain with a full window", async () => {
+    const splitProvider = fakeSplitProvider();
+    const setup = await fixture({ splitProvider, pollingDeadlineMs: 120_000, startAtMs: Date.now() });
+    const job = await submitAccepted(setup, "split-result-next-drain-only");
+
+    splitProvider.materializeResult.mockImplementation(async () => {
+      const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
+      if (!subrun) throw new Error("expected submitted subrun");
+      await expect(setup.store.getProviderObservation(subrun.subrunId)).resolves.toMatchObject({ state: "result_ready" });
+      await expect(setup.store.getProviderSubrunReference(subrun.subrunId)).resolves.toBeNull();
+      return readyPrivateImage();
+    });
+
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).toHaveBeenCalledTimes(1);
+    expect(setup.transport.prepareValidatedProviderArtifact).toHaveBeenCalledTimes(1);
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "ready" });
+    expectProviderSecretsAbsent(setup);
+  });
+
+  it("retains the Photon physical-upload window after a bounded private artifact read", async () => {
+    const baseNow = Date.now();
+    const splitProvider = fakeSplitProvider();
+    const setup = await fixture({ splitProvider, pollingDeadlineMs: 120_000, startAtMs: baseNow });
+    const job = await submitAccepted(setup, "split-result-post-fetch-preparation-window");
+    let wallClock = baseNow;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallClock);
+    try {
+      splitProvider.materializeResult.mockImplementation(async () => {
+        // The reviewed private-read allowance is spent here. The remaining
+        // 37.3 seconds are enough for the Photon physical-upload reserve but
+        // not another complete private-read-plus-token-mint admission window.
+        wallClock += 11_000;
+        return readyPrivateImage();
+      });
+
+      await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId, {
+        deadlineAtMs: baseNow + 48_300,
+        minimumDeliveryPreparationRemainingMs: 36_000,
+      })).resolves.toEqual({ kind: "ready" });
+
+      expect(splitProvider.materializeResult).toHaveBeenCalledTimes(1);
+      expect(setup.transport.prepareValidatedProviderArtifact).toHaveBeenCalledTimes(1);
+      await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "ready" });
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it("does not require a second token-mint reserve after Photon preflight", async () => {
+    const baseNow = Date.now();
+    const splitProvider = fakeSplitProvider();
+    const setup = await fixture({ splitProvider, pollingDeadlineMs: 120_000, startAtMs: baseNow });
+    const job = await submitAccepted(setup, "split-result-post-token-window");
+    let wallClock = baseNow;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => wallClock);
+    const getDeliveryTransport = vi.fn(async () => {
+      // A cold Photon token issuance is bounded to ten seconds. It is part of
+      // the first 48-second admission, not a second 48-second requirement.
+      wallClock += 10_000;
+      return setup.transport;
+    });
+    Object.assign(setup.runtime, { getDeliveryTransport });
+    try {
+      await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId, {
+        deadlineAtMs: baseNow + 48_300,
+        minimumDeliveryPreparationRemainingMs: 36_000,
+        minimumPhysicalActionRemainingMs: 22_000,
+      })).resolves.toEqual({ kind: "ready" });
+
+      expect(getDeliveryTransport).toHaveBeenCalledTimes(1);
+      expect(splitProvider.materializeResult).toHaveBeenCalledTimes(1);
+      expect(setup.transport.prepareValidatedProviderArtifact).toHaveBeenCalledTimes(1);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it("keeps a committed split result untouched when less than 48 seconds remain", async () => {
+    const splitProvider = fakeSplitProvider();
+    const setup = await fixture({ splitProvider, pollingDeadlineMs: 120_000, startAtMs: Date.now() });
+    const job = await submitAccepted(setup, "split-ready-reference-short-deadline");
+    const boundedOptions = { deadlineAtMs: Date.now() + 47_000 };
+
+    // Polling and sealed-reference persistence are deliberately permitted in
+    // the bounded worker. The subsequent bytes/upload phase is not.
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId, boundedOptions))
+      .resolves.toMatchObject({ kind: "pending" });
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).not.toHaveBeenCalled();
+
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId, boundedOptions))
+      .resolves.toMatchObject({ kind: "pending", deferToNextDrain: true });
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).not.toHaveBeenCalled();
+    expect(setup.transport.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+
+    const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
+    if (!subrun) throw new Error("expected submitted subrun");
+    await expect(setup.store.getProviderObservation(subrun.subrunId))
+      .resolves.toMatchObject({ state: "result_ready" });
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "executing" });
+    expectProviderSecretsAbsent(setup);
+  });
+
+  it("yields an immediately-due sealed result to the next Cron instead of self-reclaiming it", async () => {
+    const splitProvider = fakeSplitProvider();
+    const setup = await fixture({ splitProvider, pollingDeadlineMs: 120_000, startAtMs: Date.now() });
+    const job = await submitAccepted(setup, "split-result-next-cron-yield");
+    const narrowBudget = createStudioDrainBudget({ deadlineAtMs: Date.now() + 47_000 });
+
+    await expect(drainStudioJobs(setup.runtime, narrowBudget)).resolves.toBe(1);
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).not.toHaveBeenCalled();
+
+    const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
+    if (!subrun) throw new Error("expected submitted subrun");
+    await expect(setup.store.getProviderObservation(subrun.subrunId))
+      .resolves.toMatchObject({ state: "result_ready", nextDueAtMs: setup.now() });
+
+    // The subsequent Cron begins with a full bounded window, and gets the
+    // still-immediately-due record without a second status poll.
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).toHaveBeenCalledTimes(1);
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "ready" });
+  });
+
+  it("yields a retryable sealed materialization to the next Cron without burning attempts", async () => {
+    const splitProvider = fakeSplitProvider({
+      materializationResults: [frozen({ kind: "retryable_failure" as const })],
+    });
+    const setup = await fixture({ splitProvider, pollingDeadlineMs: 120_000, startAtMs: Date.now() });
+    const job = await submitAccepted(setup, "split-result-retry-next-cron");
+
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).toHaveBeenCalledTimes(1);
+
+    const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
+    if (!subrun) throw new Error("expected submitted subrun");
+    await expect(setup.store.getProviderObservation(subrun.subrunId)).resolves.toMatchObject({
+      state: "result_ready",
+      materializationAttempts: 1,
+    });
+
+    setup.advance(1_000);
+    await expect(drainStudioJobs(setup.runtime)).resolves.toBe(1);
+    expect(splitProvider.pollResult).toHaveBeenCalledTimes(1);
+    expect(splitProvider.materializeResult).toHaveBeenCalledTimes(2);
+    await expect(setup.store.getJob(job.jobId)).resolves.toMatchObject({ state: "ready" });
+  });
+
+  it("does not consume a materialization attempt when Photon preflight fails", async () => {
+    const splitProvider = fakeSplitProvider();
+    const setup = await fixture({ splitProvider, pollingDeadlineMs: 120_000 });
+    const job = await submitAccepted(setup, "split-result-token-preflight");
+
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId))
+      .resolves.toMatchObject({ kind: "pending" });
+    const transportUnavailable: StudioRuntime = {
+      ...setup.runtime,
+      getDeliveryTransport: async () => {
+        throw new Error("token_unavailable");
+      },
+    };
+    await expect(advanceStudioProviderResultLifecycle(transportUnavailable, job.jobId))
+      .resolves.toEqual({ kind: "disabled" });
+
+    const subrun = await setup.store.getProviderSubrunForJob(job.jobId);
+    if (!subrun) throw new Error("expected submitted subrun");
+    await expect(setup.store.getProviderObservation(subrun.subrunId))
+      .resolves.toMatchObject({ state: "result_ready", materializationAttempts: 0 });
+    expect(splitProvider.materializeResult).not.toHaveBeenCalled();
+
+    await expect(advanceStudioProviderResultLifecycle(setup.runtime, job.jobId))
+      .resolves.toEqual({ kind: "ready" });
+    expect(splitProvider.materializeResult).toHaveBeenCalledTimes(1);
+  });
+
   it("defers a deadline-bound executing recovery before provider or Photon work", async () => {
     const setup = await fixture({ observations: [readyPrivateImage()] });
     const job = await submitAccepted(setup, "deadline-bound-result-recovery");

@@ -24,20 +24,19 @@ This is **not** a paid-generation activation:
 - The committed `2.1.0` model registry has zero enabled models and no mode
   defaults. `/imagine`, `/animate`, `/edit-image`, and `/edit-video` cannot
   reserve spend or call a provider.
-- `GMI_API_KEY` is present as an encrypted, server-only Vercel environment
-  variable by name for Preview and Production. A protected production process
-  check received it as an empty value; no secret value was printed or retained.
-  Treat the credential as unavailable until its owner corrects it directly in
-  Vercel. A key by itself cannot provision the runtime: provider composition
-  also requires one exactly reviewed, enabled registry entry.
+- `GMI_API_KEY` is configured as an encrypted, server-only production
+  environment variable. Its value is never retrieved or used as readiness
+  evidence: the protected audit and the exact reviewed registry entry are
+  still required before any provider composition can occur.
 - The already-approved shared `$100` ceiling remains a background hard safety
   control. It is not a user-confirmation step and it is not a model approval.
 - The documented Flux result example combines `is_public: false` with a bare
   storage URL. That is not a private or signed retrieval contract, so it is
   insufficient for Air and no GMI model is armed.
-- This release rejects bare, malformed, or cross-model provider results before
-  any artifact fetch and prevents an attachment from leaving after a failed
-  result preamble on a restarted worker.
+- This release rejects bare, malformed, expired, or cross-model provider
+  results before any artifact fetch. A reviewed split provider must persist an
+  encrypted, binding-checked retrieval capability before a later bounded
+  worker reads bytes or starts a Photon upload.
 - The direct Photon webhook configuration and an owner-originated allowlisted
   `/help` reply have not yet been observed on this deployment. Text delivery
   is therefore deployed but not yet accepted as a handset smoke result.
@@ -49,14 +48,10 @@ This is **not** a paid-generation activation:
 Photon project API credential that is used only when Air prepares delivery.
 They are not interchangeable, and neither is needed in chat or source control.
 
-A Photon CLI response unexpectedly exposed the outbound project credential in
-local tool output. Treat that credential as compromised. Do not paste it,
-retrieve it again, or rotate it as a routine smoke-test step. A replacement
-requires the owner's explicit authorization and a coordinated operation that
-rotates the **outbound** credential, updates every intended encrypted Vercel
-environment target, redeploys, and only then runs the signed handset `/help`
-test. The inbound webhook HMAC secret must remain separate and unchanged
-unless its own incident requires rotation.
+The previously exposed outbound credential was rotated through an explicitly
+authorized coordinated Vercel update. Do not retrieve, paste, or rotate its
+replacement as part of a smoke test. The inbound webhook HMAC secret remains
+separate and unchanged unless its own incident requires rotation.
 
 ## Privacy and ingress guarantees
 
@@ -190,12 +185,15 @@ and enabled, it protects the post-submit path as follows:
    automatic physical resend. A release-fence mismatch blocks stale outbox
    delivery before dispatch.
 
-The minute Vercel Cron has a bounded execution budget. Until Air has a
-durable encrypted provider-result reference split and a reviewed timing proof,
-that worker deliberately does **not** begin an `executing` provider-result
-recovery (provider observation, artifact retrieval, and Photon upload). It
-may still reconcile already prepared `ready` and `delivering` state. This is a
-fail-closed `/imagine` activation gate, not an automatic retry delay.
+The minute Vercel Cron has a bounded execution budget. The implemented split
+path may make one status-only poll, then atomically persist an encrypted,
+binding-checked result reference with the job-payload lifetime. The current or
+a later drain starts private retrieval and Photon preparation only when it
+reserves the full 48-second window; otherwise it leaves that reference
+untouched. A legacy combined poll/fetch/upload adapter remains unavailable to
+the bounded worker.
+This is still a fail-closed `/imagine` activation gate, not an automatic retry
+delay.
 
 These safeguards do not establish that a provider model is approved, private,
 priced, or live. They are failure boundaries for a later reviewed release.
@@ -224,10 +222,10 @@ the following are recorded and deployed together:
    fingerprints, input policy, output policy, price quote, polling bounds, and
    one-image contract. The release must then pass typecheck, tests, and the
    Vercel build verifier.
-6. A durable encrypted provider-result reference split (or a reviewed proof
-   that the full observe/retrieve/validate/upload/finalize chain fits the
-   bounded worker deadline) is deployed. The current bounded Cron intentionally
-   defers that `executing` recovery path.
+6. The deployed durable encrypted provider-result reference split passes its
+   end-to-end bounded recovery tests for this exact adapter. The status poll
+   must retain adequate signed-URL lifetime, and materialization must reserve
+   its full bounded private-read/Photon window.
 7. The exposed outbound Photon credential has been replaced through the
    explicitly authorized coordinated rotation, and the direct webhook plus
    allowlisted handset `/help` smoke have passed.
@@ -252,10 +250,8 @@ server-only.
 
 Keep the two Photon credentials distinct: `IMESSAGE_WEBHOOK_SECRET` verifies
 inbound raw-HMAC webhooks, while `IMESSAGE_PROJECT_SECRET` authorizes lazy
-outbound delivery. Because the latter was exposed by a CLI response, do not
-use it for a live `/help` test. Wait for explicit owner authorization for the
-coordinated rotation and Vercel update described above; never ask an operator
-to paste either secret into chat.
+outbound delivery. The outbound replacement is already installed
+server-side; never ask an operator to paste either secret into chat.
 
 Paid provider work requires all of the following at runtime: an active release
 phase, explicit admission/submit policy, explicit positive per-job and daily

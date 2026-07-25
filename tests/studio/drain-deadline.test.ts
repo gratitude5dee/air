@@ -46,9 +46,19 @@ function deliveryEnvironment(): StudioEnvironment {
 }
 
 function fixture() {
-  const claimNextInbox = vi.fn(async () => null);
-  const claimNextOutbox = vi.fn(async () => null);
-  const claimNextJob = vi.fn(async () => null);
+  const claims: string[] = [];
+  const claimNextInbox = vi.fn(async () => {
+    claims.push("inbox");
+    return null;
+  });
+  const claimNextOutbox = vi.fn(async () => {
+    claims.push("outbox");
+    return null;
+  });
+  const claimNextJob = vi.fn(async () => {
+    claims.push("job");
+    return null;
+  });
   const transport = {
     verified: true,
     showTyping: vi.fn(async () => undefined),
@@ -67,7 +77,7 @@ function fixture() {
     readiness: () => [],
     close: async () => undefined,
   } as unknown as StudioRuntime;
-  return { runtime, claimNextInbox, claimNextOutbox, claimNextJob, transport };
+  return { runtime, claimNextInbox, claimNextOutbox, claimNextJob, transport, claims };
 }
 
 describe("Studio Cron invocation budget", () => {
@@ -80,6 +90,14 @@ describe("Studio Cron invocation budget", () => {
     // publication waits for the following minute Cron instead of reopening a
     // second unbounded Photon dispatch loop.
     expect(claimNextOutbox).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives durable job recovery first access to a fresh Cron budget", async () => {
+    const { runtime, claims } = fixture();
+
+    await drainStudio(runtime);
+
+    expect(claims).toEqual(["job", "inbox", "outbox"]);
   });
 
   it("shares one elapsed deadline across inbox, outbox, and job admissions", async () => {

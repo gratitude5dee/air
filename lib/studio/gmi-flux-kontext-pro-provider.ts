@@ -8,7 +8,9 @@ import type {
 import {
   fetchStudioProviderArtifact,
   normalizeStudioProviderArtifactReference,
+  STUDIO_PROVIDER_ARTIFACT_FETCH_DEFAULT_TIMEOUT_MS,
   StudioProviderArtifactFetchError,
+  validateStudioProviderArtifactReferenceLifetime,
   type StudioProviderArtifactFetchPolicy,
 } from "./provider-artifact-fetch.js";
 import {
@@ -42,6 +44,18 @@ export const GMI_FLUX_KONTEXT_PRO_MODEL_ID = "flux-kontext-pro" as const;
  * be injected into a runtime. It is intentionally more specific than `gmi`.
  */
 export const GMI_FLUX_KONTEXT_PRO_ADAPTER_KEY = "gmi.flux-kontext-pro.v1" as const;
+
+/**
+ * A persisted result is normally materialized by the following minute Cron.
+ * Reserve one full minute plus the bounded private-read/Photon preparation
+ * window before retaining a signed capability, rather than discovering its
+ * expiry only after the provider output has become unrecoverable.
+ */
+const MINIMUM_PERSISTED_RESULT_REFERENCE_LIFETIME_MS = 120_000;
+/** The worker must still have a full private-read + delivery window at use. */
+const MINIMUM_RESULT_MATERIALIZATION_LIFETIME_MS = 48_000;
+/** The lifecycle budget reserves the reviewed default 12-second artifact read. */
+const MINIMUM_ARTIFACT_FETCH_TIMEOUT_MS = 250;
 
 /**
  * The narrow injected dependency prevents this adapter from constructing a
@@ -185,6 +199,11 @@ export class GmiFluxKontextProStudioProvider implements
         url: resultUrl,
         policy: this.options.outputPolicy,
       });
+      validateStudioProviderArtifactReferenceLifetime({
+        url,
+        policy: this.options.outputPolicy,
+        minimumRemainingMs: MINIMUM_PERSISTED_RESULT_REFERENCE_LIFETIME_MS,
+      });
       const reference = createStudioProviderResultReference({
         jobId: input.job.jobId,
         provider: "gmi",
@@ -214,7 +233,11 @@ export class GmiFluxKontextProStudioProvider implements
   public async materializeResult(
     input: StudioProviderResultMaterializationInput,
   ): Promise<StudioProviderResultMaterializationResult> {
-    if (!hasExactFluxKontextProExecutionBinding(input) || !this.options.outputPolicy) {
+    if (
+      !hasExactFluxKontextProExecutionBinding(input)
+      || !this.options.outputPolicy
+      || !hasReviewedArtifactFetchTimeout(this.options.artifactFetchTimeoutMs)
+    ) {
       return reconciliationRequired();
     }
     if (!hasExactFluxKontextProResultReference(input.reference, input)) {
@@ -224,6 +247,14 @@ export class GmiFluxKontextProStudioProvider implements
     if (material?.kind !== "signed-url") return reconciliationRequired();
 
     try {
+      // Re-check the sealed capability at the point of use. An expired or
+      // too-short-lived URL is a deterministic privacy/recovery failure, not
+      // a generic transport retry that might outlive the provider contract.
+      validateStudioProviderArtifactReferenceLifetime({
+        url: material.url,
+        policy: this.options.outputPolicy,
+        minimumRemainingMs: MINIMUM_RESULT_MATERIALIZATION_LIFETIME_MS,
+      });
       const artifact = await fetchStudioProviderArtifact({
         url: material.url,
         policy: this.options.outputPolicy,
@@ -371,6 +402,19 @@ function isRetryableArtifactFetchError(error: unknown): boolean {
     default:
       return false;
   }
+}
+
+/**
+ * The durable worker reserves the default twelve-second provider read. A
+ * future model review may tighten that deadline, but it cannot silently make
+ * this adapter consume more of the shared Cron window.
+ */
+function hasReviewedArtifactFetchTimeout(value: number | undefined): boolean {
+  return value === undefined || (
+    Number.isSafeInteger(value)
+    && value >= MINIMUM_ARTIFACT_FETCH_TIMEOUT_MS
+    && value <= STUDIO_PROVIDER_ARTIFACT_FETCH_DEFAULT_TIMEOUT_MS
+  );
 }
 
 function mapGmiSubmitResult(result: GmiSubmitResult): StudioProviderSubmitResult {
