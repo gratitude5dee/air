@@ -468,6 +468,37 @@ describe("Air v2 studio durable store", () => {
     expect(await store.claimNextOutbox()).toBeNull();
   });
 
+  it("holds an independent sender response behind the complete onboarding preamble", async () => {
+    const { store } = fixture();
+    const { senderHash } = identities();
+    const bundle = onboardingBundleInput(store, senderHash, "onboarding-gate", "private first route");
+    await expect(store.ensureOnboardingBundle(bundle)).resolves.toEqual({ kind: "created" });
+
+    // This id sorts before the derived onboarding ids at the same ready score.
+    // Without the sender-wide gate it would physically overtake both welcomes.
+    const followupId = "0".repeat(64);
+    await store.createOutbox({
+      outboxId: followupId,
+      senderHash,
+      lane: "request-response",
+      sequence: 1,
+      payload: bundle.bubbles[0].payload,
+    });
+
+    const first = await store.claimNextOutbox();
+    expect(first?.record).toMatchObject({ outboxId: bundle.bubbles[0].outboxId, lane: "onboarding", sequence: 1 });
+    if (!first) throw new Error("expected first onboarding bubble");
+    await expect(store.finishOutbox(first.record.outboxId, first.leaseToken, "sent")).resolves.toBe(true);
+
+    const second = await store.claimNextOutbox();
+    expect(second?.record).toMatchObject({ outboxId: bundle.bubbles[1].outboxId, lane: "onboarding", sequence: 2 });
+    if (!second) throw new Error("expected second onboarding bubble");
+    await expect(store.finishOutbox(second.record.outboxId, second.leaseToken, "sent")).resolves.toBe(true);
+
+    const followup = await store.claimNextOutbox();
+    expect(followup?.record).toMatchObject({ outboxId: followupId, lane: "request-response", sequence: 1 });
+  });
+
   it("assigns receipt order once and rejects A → B → retry-A without wall-clock ordering", async () => {
     const { store } = fixture();
     const { senderHash, threadHash } = identities();

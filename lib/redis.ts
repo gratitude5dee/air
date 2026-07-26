@@ -1223,7 +1223,7 @@ export class MemoryRedis implements RedisLike {
     if (script.includes("AIR_STUDIO_RETRY_INBOX_V4")) {
       return this.evalStudioRetryInbox(options.keys, options.arguments);
     }
-    if (script.includes("AIR_STUDIO_CLAIM_OUTBOX_V5")) {
+    if (script.includes("AIR_STUDIO_CLAIM_OUTBOX_V6")) {
       return this.evalStudioClaimOutbox(options.keys, options.arguments);
     }
     if (script.includes("AIR_STUDIO_AUTHORIZE_OUTBOX_DELIVERY_V5")) {
@@ -2760,7 +2760,7 @@ export class MemoryRedis implements RedisLike {
   }
 
   private evalStudioClaimOutbox(keys: readonly string[], args: readonly string[]): string | false {
-    this.assertStudioArity(keys, args, 9, 8);
+    this.assertStudioArity(keys, args, 10, 8);
     const recordKey = this.studioKey(keys, 0);
     const outboxPayloadKey = this.studioKey(keys, 1);
     const leaseKey = this.studioKey(keys, 2);
@@ -2770,6 +2770,7 @@ export class MemoryRedis implements RedisLike {
     const payloadKey = this.studioKey(keys, 6);
     const scopeCounterKey = this.studioKey(keys, 7);
     const releaseFenceKey = this.studioKey(keys, 8);
+    const onboardingLaneKey = this.studioKey(keys, 9);
     const token = this.studioArgument(args, 0);
     const leaseTtl = this.studioPositiveInteger(this.studioArgument(args, 1));
     const now = this.studioNonnegativeInteger(this.studioArgument(args, 2));
@@ -2781,6 +2782,10 @@ export class MemoryRedis implements RedisLike {
     if (releasePhase !== "dark" && releasePhase !== "canary" && releasePhase !== "production") return false;
     const record = this.studioRecord(recordKey);
     if (!record || (record.state !== "intent" && record.state !== "retryable_failure")) return false;
+    // The two welcome bubbles form a sender-wide preamble.  A separate
+    // request-response lane cannot race ahead on an equal ready score.
+    this.assertZSetOrMissing(onboardingLaneKey);
+    if (record.lane !== "onboarding" && (this.getZSet(onboardingLaneKey, false)?.value.size ?? 0) > 0) return false;
     const laneHead = [...(this.getZSet(laneKey, false)?.value.entries() ?? [])]
       .sort(([firstMember, firstSequence], [secondMember, secondSequence]) =>
         firstSequence === secondSequence ? firstMember.localeCompare(secondMember) : firstSequence - secondSequence,

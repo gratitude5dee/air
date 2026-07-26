@@ -3790,6 +3790,10 @@ export class StudioStore {
           ? this.unusedInboxScopeSequenceKey()
           : this.inboxScopeSequenceKey(record.senderHash, pendingGuard.threadHash),
         this.releaseFenceKey(),
+        // First-contact onboarding is a sender-wide logical preamble. A
+        // different lane must not overtake it simply because two durable
+        // intents share the same ready-index score.
+        this.onboardingLaneKey(record.senderHash),
       ],
       arguments: [
         leaseToken,
@@ -3932,6 +3936,7 @@ export class StudioStore {
   private outboxPayloadKey(outboxId: string): string { return `${this.prefix}:outbox:payload:${outboxId}`; }
   private readyOutboxKey(): string { return `${this.prefix}:outbox:ready`; }
   private outboxLeaseKey(outboxId: string): string { return `${this.prefix}:outbox:lease:${outboxId}`; }
+  private onboardingLaneKey(senderHash: SenderHash): string { return `${this.prefix}:outbox:lane:${senderHash}:onboarding`; }
   /** Fixed unused keys keep the optional initial-tapback Lua invocation bounded. */
   private unusedInitialAdmissionOutboxKey(): string { return `${this.prefix}:outbox:initial-admission:unused`; }
   private unusedInitialAdmissionOutboxPayloadKey(): string { return `${this.prefix}:outbox:payload:initial-admission:unused`; }
@@ -5495,7 +5500,7 @@ return 1
 `;
 
 const CLAIM_OUTBOX_LUA = `
--- AIR_STUDIO_CLAIM_OUTBOX_V5
+-- AIR_STUDIO_CLAIM_OUTBOX_V6
 local raw = redis.call('GET', KEYS[1])
 if not raw then return false end
 local record = cjson.decode(raw)
@@ -5519,6 +5524,15 @@ end
 local releaseStatus = releaseFenceStatus()
 local laneHead = redis.call('ZRANGE', KEYS[5], 0, 0)
 if #laneHead ~= 1 or laneHead[1] ~= ARGV[5] then return false end
+-- Onboarding is a sender-wide preamble rather than merely one independent
+-- lane. Its pair is committed atomically, but request-response intents have
+-- their own lane and can otherwise win a same-score lexicographic ZSET tie.
+-- Keep all later sender traffic behind the pair, including a retryable or
+-- unknown first bubble, until its durable lane is terminally clear.
+if record.lane ~= 'onboarding' then
+  local onboardingHead = redis.call('ZRANGE', KEYS[10], 0, 0)
+  if #onboardingHead ~= 0 then return false end
+end
 if releaseStatus == 0 then return false end
 if releaseStatus == -1 then
   record.state = 'canceled'

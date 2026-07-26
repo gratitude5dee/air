@@ -10,7 +10,7 @@ import {
   type PhotonIMessageClient,
   type PhotonIMessagePort,
 } from "../../lib/studio/photon-transport.js";
-import { UnprovisionedStudioProvider } from "../../lib/studio/provider-port.js";
+import type { StudioProviderResultReferencePort } from "../../lib/studio/provider-port.js";
 import { StudioStore } from "../../lib/studio/store.js";
 import { authorizeStudioDrain, handleStudioIMessageWebhook } from "../../lib/studio/webhook-handler.js";
 import type { StudioRuntime } from "../../lib/studio/runtime.js";
@@ -19,6 +19,16 @@ const webhookSecret = "webhook-secret";
 const identitySecret = "identity-secret";
 const senderId = "+14155550123";
 const queueKey = Buffer.alloc(32, 19).toString("base64");
+const welcomeOne = "Hey — I’m Air by WZRD ⚡ Your image + video studio in iMessage.";
+const welcomeTwo = "Create with /imagine, /animate, /edit-image, or /edit-video. Try: /imagine a chrome hummingbird at sunrise. Settings: /model-settings • Help: /help. Generation is currently unavailable while Air completes provider review; any later approved path will disclose its media-retention terms.";
+const helpText = [
+  "Air commands:",
+  "/imagine <prompt>",
+  "/animate <prompt>",
+  "/edit-image <prompt>",
+  "/edit-video <prompt>",
+  "/models [mode] • /model-settings • /status • /cancel • /privacy",
+].join("\n");
 
 type PersistInput = {
   readonly receiptId: string;
@@ -110,6 +120,101 @@ function runtimeWith(persistInbox: (input: PersistInput) => Promise<unknown>): S
   } as unknown as StudioRuntime;
 }
 
+/**
+ * Production-shaped delivery-only wiring for the ingress/drain regression.
+ * The provider exposes every paid recovery boundary as a tripwire so this
+ * non-paid path proves it does not submit, poll, or materialize an artifact.
+ */
+async function createActiveDeliveryOnlyFixture() {
+  configureEnvironment({
+    VERCEL_ENV: "production",
+    AIR_RELEASE_PHASE: "production",
+    AIR_RELEASE_GENERATION: "1",
+    AIR_RELEASE_FENCE_SECRET: "test-release-fence-secret",
+    AIR_DELIVERY_ENABLED: "true",
+    AIR_JOB_SPEND_CAP_USD: "0",
+    AIR_DAILY_SPEND_CAP_USD: "0",
+  });
+  const environment = loadStudioEnvironment();
+  const now = Date.now();
+  const cipher = createQueueCipher(queueKey);
+  const redis = new MemoryRedis(() => now);
+  const store = new StudioStore({
+    redis,
+    cipher,
+    identityHashSecret: identitySecret,
+    clock: () => now,
+    releaseStamp: { generation: environment.releaseGeneration, phase: environment.releasePhase },
+  });
+  const darkStore = new StudioStore({
+    redis,
+    cipher,
+    identityHashSecret: identitySecret,
+    clock: () => now,
+    releaseStamp: { generation: 0, phase: "dark" },
+  });
+  expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
+  expect(await store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+
+  const sendText = vi.fn<PhotonIMessageClient["messages"]["sendText"]>(async () => ({ guid: "mock-sent-message" }));
+  const sendAttachment = vi.fn<PhotonIMessageClient["messages"]["sendAttachment"]>(async () => ({ guid: "mock-attachment-message" }));
+  const setReaction = vi.fn<PhotonIMessageClient["messages"]["setReaction"]>(async () => ({ guid: "mock-reaction-message" }));
+  const upload = vi.fn<PhotonIMessageClient["attachments"]["upload"]>(async () => ({
+    attachment: { guid: "mock-uploaded-attachment" },
+  }));
+  const client: PhotonIMessageClient = {
+    chats: { setTyping: vi.fn<PhotonIMessageClient["chats"]["setTyping"]>(async () => undefined) },
+    attachments: { upload },
+    messages: { sendText, sendAttachment, setReaction },
+  };
+  const getClient = vi.fn<PhotonIMessagePort["getClient"]>(async () => client);
+  const transport = new PhotonIMessageTransport({
+    projectId: "photon-project",
+    projectSecret: "photon-project-secret",
+    webhookSecret,
+    port: { getClient },
+  });
+  const prepareValidatedProviderArtifact = vi.spyOn(transport, "prepareValidatedProviderArtifact");
+  const sendPreparedOutput = vi.spyOn(transport, "sendPreparedOutput");
+  const fetchAttachment = vi.spyOn(transport, "fetchAttachment");
+  const provider = {
+    verified: true,
+    resultPollingSupported: true as const,
+    resultMaterializationSupported: true as const,
+    submit: vi.fn<StudioProviderResultReferencePort["submit"]>(async () => ({
+      kind: "accepted" as const,
+      providerRequestId: "must-not-submit",
+    })),
+    pollResult: vi.fn<StudioProviderResultReferencePort["pollResult"]>(async () => ({ kind: "pending" as const })),
+    materializeResult: vi.fn<StudioProviderResultReferencePort["materializeResult"]>(async () => ({ kind: "pending" as const })),
+  } satisfies StudioProviderResultReferencePort;
+  const runtime: StudioRuntime = {
+    environment,
+    cipher,
+    store,
+    transport,
+    provider,
+    storageTransport: "tcp",
+    readiness: () => [],
+    close: async () => undefined,
+  };
+
+  return {
+    runtime,
+    store,
+    provider,
+    transport,
+    sendText,
+    sendAttachment,
+    setReaction,
+    upload,
+    getClient,
+    prepareValidatedProviderArtifact,
+    sendPreparedOutput,
+    fetchAttachment,
+  };
+}
+
 describe("Air iMessage webhook", () => {
   it("persists an allowlisted inbound DM before acknowledging its signed raw delivery", async () => {
     configureEnvironment();
@@ -172,101 +277,42 @@ describe("Air iMessage webhook", () => {
     expect(persistInbox).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves a signed allowlisted /help for the authoritative Cron drain", async () => {
-    configureEnvironment({
-      VERCEL_ENV: "production",
-      AIR_RELEASE_PHASE: "production",
-      AIR_RELEASE_GENERATION: "1",
-      AIR_RELEASE_FENCE_SECRET: "test-release-fence-secret",
-      AIR_DELIVERY_ENABLED: "true",
-      AIR_JOB_SPEND_CAP_USD: "0",
-      AIR_DAILY_SPEND_CAP_USD: "0",
-    });
-    const environment = loadStudioEnvironment();
-    const now = Date.now();
-    const cipher = createQueueCipher(queueKey);
-    const redis = new MemoryRedis(() => now);
-    const store = new StudioStore({
-      redis,
-      cipher,
-      identityHashSecret: identitySecret,
-      clock: () => now,
-      releaseStamp: { generation: environment.releaseGeneration, phase: environment.releasePhase },
-    });
-    const darkStore = new StudioStore({
-      redis,
-      cipher,
-      identityHashSecret: identitySecret,
-      clock: () => now,
-      releaseStamp: { generation: 0, phase: "dark" },
-    });
-    expect(await darkStore.advanceReleaseFence(-1)).toEqual({ kind: "advanced" });
-    expect(await store.advanceReleaseFence(0)).toEqual({ kind: "advanced" });
+  it("deduplicates a signed /help retry into exactly one delivery-only Photon response sequence", async () => {
+    const fixture = await createActiveDeliveryOnlyFixture();
+    const persistInbox = vi.spyOn(fixture.store, "persistInbox");
+    const payload = messagePayload({ messageId: "help-delivery-001", text: "/help" });
+    const receiptId = fixture.store.receiptId("photon-project", "help-delivery-001");
 
-    const sendText = vi.fn<PhotonIMessageClient["messages"]["sendText"]>(async () => ({ guid: "mock-sent-message" }));
-    const sendAttachment = vi.fn<PhotonIMessageClient["messages"]["sendAttachment"]>(async () => ({ guid: "mock-attachment-message" }));
-    const setReaction = vi.fn<PhotonIMessageClient["messages"]["setReaction"]>(async () => ({ guid: "mock-reaction-message" }));
-    const upload = vi.fn<PhotonIMessageClient["attachments"]["upload"]>(async () => ({
-      attachment: { guid: "mock-uploaded-attachment" },
-    }));
-    const client: PhotonIMessageClient = {
-      chats: { setTyping: vi.fn<PhotonIMessageClient["chats"]["setTyping"]>(async () => undefined) },
-      attachments: { upload },
-      messages: { sendText, sendAttachment, setReaction },
-    };
-    const getClient = vi.fn<PhotonIMessagePort["getClient"]>(async () => client);
-    const port: PhotonIMessagePort = { getClient };
-    const transport = new PhotonIMessageTransport({
-      projectId: "photon-project",
-      projectSecret: "photon-project-secret",
-      webhookSecret,
-      port,
+    const first = await handleStudioIMessageWebhook(signedRequest(payload, { webhookId: "help-first" }), {
+      getRuntime: async () => fixture.runtime,
     });
-    const provider = new UnprovisionedStudioProvider();
-    const submit = vi.spyOn(provider, "submit");
-    const runtime: StudioRuntime = {
-      environment,
-      cipher,
-      store,
-      transport,
-      provider,
-      storageTransport: "tcp",
-      readiness: () => [],
-      close: async () => undefined,
-    };
-    const response = await handleStudioIMessageWebhook(
-      signedRequest(messagePayload({ messageId: "help-delivery-001", text: "/help" })),
-      {
-        getRuntime: async () => runtime,
-      },
-    );
+    const retry = await handleStudioIMessageWebhook(signedRequest(payload, { webhookId: "help-retry" }), {
+      getRuntime: async () => fixture.runtime,
+    });
 
-    expect(response.status).toBe(200);
-    expect(sendText).not.toHaveBeenCalled();
-    expect(submit).not.toHaveBeenCalled();
+    expect(first.status).toBe(200);
+    expect(retry.status).toBe(200);
+    expect(persistInbox).toHaveBeenCalledTimes(2);
+    expect(persistInbox.mock.calls.map(([input]) => input.receiptId)).toEqual([
+      receiptId,
+      receiptId,
+    ]);
+    expect(fixture.sendText).not.toHaveBeenCalled();
 
-    await drainStudio(runtime);
+    await drainStudio(fixture.runtime);
 
-    const sentTexts = sendText.mock.calls.map(([, text]) => text);
-    const welcomeOne = "Hey — I’m Air by WZRD ⚡ Your image + video studio in iMessage.";
-    const welcomeTwo = "Create with /imagine, /animate, /edit-image, or /edit-video. Try: /imagine a chrome hummingbird at sunrise. Settings: /model-settings • Help: /help. Generation is currently unavailable while Air completes provider review; any later approved path will disclose its media-retention terms.";
-    expect(sentTexts).toHaveLength(3);
-    expect(sentTexts).toEqual(expect.arrayContaining([
-      welcomeOne,
-      welcomeTwo,
-      expect.stringContaining("Air commands:"),
-    ]));
-    expect(sentTexts.indexOf(welcomeOne)).toBeLessThan(sentTexts.indexOf(welcomeTwo));
-    expect(sendText).toHaveBeenCalledWith(
-      "any;-;+14155550123",
-      expect.any(String),
-      expect.objectContaining({
+    expect(fixture.sendText.mock.calls.map(([, text]) => text)).toEqual([welcomeOne, welcomeTwo, helpText]);
+    expect(fixture.sendText).toHaveBeenCalledTimes(3);
+    for (const [chatGuid, _text, options] of fixture.sendText.mock.calls) {
+      expect(chatGuid).toBe("any;-;+14155550123");
+      expect(options).toEqual(expect.objectContaining({
         clientMessageId: expect.stringMatching(/^air-v2-outbox-[a-f0-9]{64}$/),
         enableDataDetection: false,
         enableLinkPreview: false,
-      }),
-    );
-    expect(getClient).toHaveBeenCalledWith(
+        replyTo: "help-delivery-001",
+      }));
+    }
+    expect(fixture.getClient).toHaveBeenCalledWith(
       "+14155550999",
       expect.objectContaining({
         deadlineAtMs: expect.any(Number),
@@ -274,8 +320,49 @@ describe("Air iMessage webhook", () => {
         minimumDeliveryPreparationRemainingMs: expect.any(Number),
       }),
     );
-    expect(submit).not.toHaveBeenCalled();
-    expect(await store.getActiveJob(createSenderIdentity(identitySecret, senderId).senderHash)).toBeNull();
+    // The delivery-only release has no paid-provider or media path, even when
+    // a fully shaped provider/Photon artifact surface is present as a trap.
+    expect(fixture.provider.submit).not.toHaveBeenCalled();
+    expect(fixture.provider.pollResult).not.toHaveBeenCalled();
+    expect(fixture.provider.materializeResult).not.toHaveBeenCalled();
+    expect(fixture.fetchAttachment).not.toHaveBeenCalled();
+    expect(fixture.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedOutput).not.toHaveBeenCalled();
+    expect(fixture.sendAttachment).not.toHaveBeenCalled();
+    expect(fixture.upload).not.toHaveBeenCalled();
+    expect(fixture.setReaction).not.toHaveBeenCalled();
+    expect(await fixture.store.getActiveJob(createSenderIdentity(identitySecret, senderId).senderHash)).toBeNull();
+  });
+
+  it("keeps an active delivery-only release from admitting or submitting signed generation", async () => {
+    const fixture = await createActiveDeliveryOnlyFixture();
+    const admitJob = vi.spyOn(fixture.store, "admitJobWithInitialNotifications");
+    const receiptId = fixture.store.receiptId("photon-project", "delivery-only-create-001");
+    const response = await handleStudioIMessageWebhook(
+      signedRequest(messagePayload({ messageId: "delivery-only-create-001", text: "/imagine a glass lantern" })),
+      { getRuntime: async () => fixture.runtime },
+    );
+
+    expect(response.status).toBe(200);
+    await drainStudio(fixture.runtime);
+    // Run the next job-first Cron pass too: no deferred accepted job may find
+    // a provider boundary after the delivery-only inbox response is sent.
+    await drainStudio(fixture.runtime);
+
+    await expect(fixture.store.readInbox(receiptId))
+      .resolves.toMatchObject({ state: "maintenance_rejected" });
+    expect(admitJob).not.toHaveBeenCalled();
+    expect(await fixture.store.getActiveJob(createSenderIdentity(identitySecret, senderId).senderHash)).toBeNull();
+    expect(fixture.provider.submit).not.toHaveBeenCalled();
+    expect(fixture.provider.pollResult).not.toHaveBeenCalled();
+    expect(fixture.provider.materializeResult).not.toHaveBeenCalled();
+    expect(fixture.fetchAttachment).not.toHaveBeenCalled();
+    expect(fixture.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+    expect(fixture.sendPreparedOutput).not.toHaveBeenCalled();
+    expect(fixture.upload).not.toHaveBeenCalled();
+    expect(fixture.sendText.mock.calls.map(([, text]) => text)).toContain(
+      "Air is in maintenance mode: new generation requests are not being accepted. No generation was submitted.",
+    );
   });
 
   it("ignores signed groups, outbound echoes, and non-allowlisted DMs without opening storage", async () => {
