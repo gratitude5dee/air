@@ -148,12 +148,14 @@ narrow:
   prices. `pricing: "manual_console_required"` is expected.
 
 An operator may invoke it from a terminal where they already hold the secret;
-never paste `CRON_SECRET` into chat, source, a URL, or logs:
+never paste `CRON_SECRET` into chat, source, a URL, logs, or a curl argument.
+Keep shell tracing disabled and stream the header through curl standard input:
 
 ```sh
-curl --fail-with-body -sS \
-  -H "Authorization: Bearer ${CRON_SECRET}" \
-  https://air.wzrd.tech/internal/provider-audit
+set +x
+builtin printf 'Authorization: Bearer %s\n' "${CRON_SECRET}" |
+  curl --fail-with-body -sS --header @- \
+    https://air.wzrd.tech/internal/provider-audit
 ```
 
 A `401` or `503` is a stop condition, not a reason to expose a secret or

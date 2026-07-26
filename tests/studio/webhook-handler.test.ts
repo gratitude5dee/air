@@ -29,6 +29,38 @@ const helpText = [
   "/edit-video <prompt>",
   "/models [mode] • /model-settings • /status • /cancel • /privacy",
 ].join("\n");
+const deliveryOnlyResponseMatrix = [
+  {
+    name: "/privacy",
+    messageId: "delivery-only-privacy-001",
+    text: "/privacy",
+    expected: "Air is private and allowlist-only. This deployment accepts no generation work and is not sending media to a generation provider. Air keeps its own accepted-work media references for up to 24 hours; any later approved path must disclose provider retention and hosted-public input terms. Avoid sending sensitive media.",
+  },
+  {
+    name: "/status with no job",
+    messageId: "delivery-only-status-001",
+    text: "/status",
+    expected: "No active or recent jobs are available in this deployment. Use /help for the command reference.",
+  },
+  {
+    name: "/models with the empty registry",
+    messageId: "delivery-only-models-001",
+    text: "/models",
+    expected: "No verified models are enabled in this deployment. Candidate names are not selectable until catalog, schema, price, and privacy review complete.",
+  },
+  {
+    name: "an unknown slash command",
+    messageId: "delivery-only-unknown-001",
+    text: "/not-a-real-command",
+    expected: helpText,
+  },
+  {
+    name: "bare text without a pending intent",
+    messageId: "delivery-only-bare-text-001",
+    text: "just checking in",
+    expected: helpText,
+  },
+] as const;
 
 type PersistInput = {
   readonly receiptId: string;
@@ -43,7 +75,10 @@ type PersistInput = {
   };
 };
 
-afterEach(() => vi.unstubAllEnvs());
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+});
 
 function configureEnvironment(overrides: Record<string, string | undefined> = {}): void {
   const values: Record<string, string | undefined> = {
@@ -68,7 +103,8 @@ function configureEnvironment(overrides: Record<string, string | undefined> = {}
 
 function messagePayload(overrides: {
   readonly chatGuid?: string;
-  readonly phone?: string;
+  /** `null` deliberately omits the Spectrum sending-line field. */
+  readonly phone?: string | null;
   readonly spaceType?: "dm" | "group";
   readonly direction?: "inbound" | "outbound";
   readonly senderId?: string;
@@ -78,8 +114,8 @@ function messagePayload(overrides: {
 } = {}): Record<string, unknown> {
   const space = {
     id: overrides.chatGuid ?? "any;-;+14155550123",
-    phone: overrides.phone ?? "+14155550999",
     type: overrides.spaceType ?? "dm",
+    ...(overrides.phone === null ? {} : { phone: overrides.phone ?? "+14155550999" }),
   };
   return {
     event: "messages",
@@ -94,9 +130,12 @@ function messagePayload(overrides: {
   };
 }
 
-function signedRequest(payload: unknown, options: { readonly signature?: string; readonly webhookId?: string } = {}): Request {
+function signedRequest(
+  payload: unknown,
+  options: { readonly signature?: string; readonly timestamp?: string; readonly webhookId?: string } = {},
+): Request {
   const raw = typeof payload === "string" ? payload : JSON.stringify(payload);
-  const timestamp = String(Math.floor(Date.now() / 1_000));
+  const timestamp = options.timestamp ?? String(Math.floor(Date.now() / 1_000));
   const signature = options.signature ?? `v0=${createHmac("sha256", webhookSecret)
     .update(`v0:${timestamp}:${raw}`)
     .digest("hex")}`;
@@ -215,6 +254,25 @@ async function createActiveDeliveryOnlyFixture() {
   };
 }
 
+function expectNoPaidOrMediaWork(
+  fixture: Awaited<ReturnType<typeof createActiveDeliveryOnlyFixture>>,
+  outboundFetch: ReturnType<typeof vi.fn>,
+): void {
+  // This release has no legacy Zap boundary. A fetch tripwire makes a future
+  // accidental egress through one observable alongside the paid-provider and
+  // media-path tripwires below.
+  expect(outboundFetch).not.toHaveBeenCalled();
+  expect(fixture.provider.submit).not.toHaveBeenCalled();
+  expect(fixture.provider.pollResult).not.toHaveBeenCalled();
+  expect(fixture.provider.materializeResult).not.toHaveBeenCalled();
+  expect(fixture.fetchAttachment).not.toHaveBeenCalled();
+  expect(fixture.prepareValidatedProviderArtifact).not.toHaveBeenCalled();
+  expect(fixture.sendPreparedOutput).not.toHaveBeenCalled();
+  expect(fixture.sendAttachment).not.toHaveBeenCalled();
+  expect(fixture.upload).not.toHaveBeenCalled();
+  expect(fixture.setReaction).not.toHaveBeenCalled();
+}
+
 describe("Air iMessage webhook", () => {
   it("persists an allowlisted inbound DM before acknowledging its signed raw delivery", async () => {
     configureEnvironment();
@@ -280,7 +338,15 @@ describe("Air iMessage webhook", () => {
   it("deduplicates a signed /help retry into exactly one delivery-only Photon response sequence", async () => {
     const fixture = await createActiveDeliveryOnlyFixture();
     const persistInbox = vi.spyOn(fixture.store, "persistInbox");
-    const payload = messagePayload({ messageId: "help-delivery-001", text: "/help" });
+    // Shared-pool Spectrum webhooks identify the receiving line with the
+    // opaque literal "shared". Preserve that exact routing label through
+    // durable ingress and the direct Photon transport rather than substituting
+    // a guessed dedicated-line or sender number.
+    const payload = messagePayload({
+      messageId: "help-delivery-001",
+      text: "/help",
+      phone: "shared",
+    });
     const receiptId = fixture.store.receiptId("photon-project", "help-delivery-001");
 
     const first = await handleStudioIMessageWebhook(signedRequest(payload, { webhookId: "help-first" }), {
@@ -313,7 +379,7 @@ describe("Air iMessage webhook", () => {
       }));
     }
     expect(fixture.getClient).toHaveBeenCalledWith(
-      "+14155550999",
+      "shared",
       expect.objectContaining({
         deadlineAtMs: expect.any(Number),
         minimumPhysicalActionRemainingMs: expect.any(Number),
@@ -364,6 +430,36 @@ describe("Air iMessage webhook", () => {
       "Air is in maintenance mode: new generation requests are not being accepted. No generation was submitted.",
     );
   });
+
+  it.each(deliveryOnlyResponseMatrix)(
+    "delivers $name without paid, media, or legacy-work egress",
+    async ({ messageId, text, expected }) => {
+      const fixture = await createActiveDeliveryOnlyFixture();
+      const admitJob = vi.spyOn(fixture.store, "admitJobWithInitialNotifications");
+      const outboundFetch = vi.fn();
+      vi.stubGlobal("fetch", outboundFetch);
+
+      const response = await handleStudioIMessageWebhook(
+        signedRequest(messagePayload({ messageId, text })),
+        { getRuntime: async () => fixture.runtime },
+      );
+
+      expect(response.status).toBe(200);
+      await drainStudio(fixture.runtime);
+      // A second Cron pass proves none of these delivery-only responses leaves
+      // an executable job waiting to reach a provider boundary later.
+      await drainStudio(fixture.runtime);
+
+      expect(fixture.sendText.mock.calls.map(([, deliveredText]) => deliveredText)).toEqual([
+        welcomeOne,
+        welcomeTwo,
+        expected,
+      ]);
+      expect(admitJob).not.toHaveBeenCalled();
+      expect(await fixture.store.getActiveJob(createSenderIdentity(identitySecret, senderId).senderHash)).toBeNull();
+      expectNoPaidOrMediaWork(fixture, outboundFetch);
+    },
+  );
 
   it("ignores signed groups, outbound echoes, and non-allowlisted DMs without opening storage", async () => {
     configureEnvironment();
@@ -423,6 +519,38 @@ describe("Air iMessage webhook", () => {
       { getRuntime },
     );
     expect(response.status).toBe(401);
+    expect(getRuntime).not.toHaveBeenCalled();
+  });
+
+  it("rejects a stale but otherwise correctly signed Spectrum delivery before runtime setup", async () => {
+    configureEnvironment();
+    const getRuntime = vi.fn(async () => runtimeWith(async () => ({ created: true, record: {} })));
+
+    const response = await handleStudioIMessageWebhook(
+      signedRequest(messagePayload({ messageId: "stale-signed-001" }), {
+        // A valid HMAC must not make a replay from the Unix epoch actionable.
+        timestamp: "1",
+      }),
+      { getRuntime },
+    );
+
+    expect(response.status).toBe(400);
+    expect(getRuntime).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges a signed inbound event missing its sending line without opening storage", async () => {
+    configureEnvironment();
+    const getRuntime = vi.fn(async () => runtimeWith(async () => ({ created: true, record: {} })));
+
+    const response = await handleStudioIMessageWebhook(
+      signedRequest(messagePayload({ messageId: "missing-line-001", phone: null })),
+      { getRuntime },
+    );
+
+    // Spectrum may deliver a message-shaped event without an addressable
+    // receiving line. It is validly signed but cannot be routed safely, so
+    // acknowledge it without persisting or sending anything.
+    expect(response.status).toBe(200);
     expect(getRuntime).not.toHaveBeenCalled();
   });
 

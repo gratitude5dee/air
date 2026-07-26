@@ -1,4 +1,4 @@
-# Air Direct Studio — v2.1 delivery goal
+# Air Direct Studio — v2.1 delivery-only recovery goal
 
 Air is being rebuilt as a private, allowlisted iMessage studio for image and
 video generation on the existing Vercel `air` project and existing Redis
@@ -8,20 +8,26 @@ It contains no Eve, Zap, chat-adapter, or LLM runtime dependency.
 
 ## Current authorized scope
 
-This revision may be built, tested, pushed, and deployed as a Vercel **dark
-preview** only. It must remain non-billable and non-delivering:
+The original dark-preview posture has been superseded by a narrowly scoped
+**delivery-only production recovery**. It may receive an allowlisted signed
+iMessage receipt and send the non-paid text responses needed to prove the
+direct path. It remains non-billable and may not admit or submit generation:
 
-- `AIR_RELEASE_PHASE=dark`.
+- `AIR_RELEASE_PHASE=production` with a reviewed positive release generation
+  and matching durable release fence.
 - `AIR_ACCEPT_NEW_JOBS=false`.
 - `AIR_ALLOW_PROVIDER_SUBMIT=false`.
 - `AIR_ALLOW_PROVIDER_RECOVERY=false`.
-- `AIR_DELIVERY_ENABLED=false`.
+- `AIR_DELIVERY_ENABLED=true` only for direct text delivery.
 - The committed registry has zero enabled models and no default model.
-- The Photon transport remains unverified and fails closed.
+- The Photon transport may be lazily verified only by authenticated readiness
+  or a durable outbox drain; it must fail closed before any physical send.
 
-No upstream iMessage webhook, paid GMI request, provider catalog call, canary,
-production promotion, payment action, or new paid infrastructure is authorized
-by this document.
+No new Photon project, user, line, or webhook is authorized. Existing inbound
+webhook configuration may be inspected but not changed without a separate
+trust-boundary approval. No paid GMI/fal request, provider catalog call,
+canary, payment action, or new paid infrastructure is authorized by this
+document.
 
 ## Required safety properties
 
@@ -65,5 +71,7 @@ A separate Fable approval must cover all of the following before a canary:
   responses outside pending assembly; the future provider executor must bind
   its own intents before any provider enablement.
 
-Production remains blocked until the canary has completed, the limits are
-enforced by evidence, and the owner explicitly approves promotion.
+Paid generation remains blocked until the canary has completed, the limits are
+enforced by evidence, and the owner explicitly approves a separate paid
+promotion. The delivery-only handset recovery is not a canary or provider
+approval.

@@ -61,6 +61,11 @@ and privacy gates below.
    API credential used only at lazy delivery. Never substitute one for the
    other or paste either into a command transcript.
 
+Protected-route examples below stream their bearer header from standard input.
+Keep shell tracing disabled (`set +x`); do not replace `--header @-` with an
+expanded header argument, because process inspection can expose command-line
+arguments.
+
 ## Release verification
 
 Before a future direct deployment, run the checks from the exact source
@@ -94,6 +99,42 @@ vercel env ls production --scope 5dee-studios
 
 Do not run `vercel env pull`, do not call a command that echoes a value, and do
 not include an environment value in a support transcript.
+
+## Production delivery-only readiness
+
+Before a handset smoke, use the existing `CRON_SECRET` only from an
+operator-controlled terminal. Do not retrieve it into a file or substitute it
+into a command-line header. The following streams the header through standard
+input and prints only the secret-safe readiness categories:
+
+```sh
+set +x
+builtin printf 'Authorization: Bearer %s\n' "${CRON_SECRET}" |
+  curl --fail-with-body -sS --header @- \
+    https://air.wzrd.tech/internal/readiness |
+  jq -e '
+    select(
+      .ok == true and
+      .releasePhase == "production" and
+      .enabledModels == 0 and
+      .redis == "reachable" and
+      .cron == "fresh" and
+      .releaseFence == "current" and
+      .effectiveSideEffects.acceptNewJobs == false and
+      .effectiveSideEffects.allowProviderSubmit == false and
+      .effectiveSideEffects.allowProviderRecovery == false and
+      .effectiveSideEffects.deliveryEnabled == true and
+      (.problems | length == 0)
+    ) |
+    { ok, releasePhase, enabledModels, effectiveSideEffects,
+      redis, cron, releaseFence, inboxFifo, problems }
+  '
+```
+
+A nonzero exit, `401`, or `503` is a stop condition. A successful result
+proves the secret-safe Redis probe, fresh authenticated Cron heartbeat,
+current release fence, and lazy Photon transport verification for the
+delivery-only configuration. It does not authorize a provider or model.
 
 ## Protected inbox FIFO cutover
 
@@ -134,9 +175,9 @@ secrets).
    operator:
 
    ```sh
-   curl --fail-with-body -sS \
-     -H "Authorization: Bearer ${AIR_RELEASE_FENCE_SECRET}" \
-     "${AIR_FIFO_URL}"
+   set +x
+   builtin printf 'Authorization: Bearer %s\n' "${AIR_RELEASE_FENCE_SECRET}" |
+     curl --fail-with-body -sS --header @- "${AIR_FIFO_URL}"
    ```
 
    Expect a secret-free response such as
@@ -146,10 +187,11 @@ secrets).
 2. Only when status is `legacy`, request the first one-way transition:
 
    ```sh
-   curl --fail-with-body -sS -X POST \
-     -H "Authorization: Bearer ${AIR_RELEASE_FENCE_SECRET}" \
-     -H "X-Air-Fifo-Migration-Action: begin" \
-     "${AIR_FIFO_URL}"
+   set +x
+   builtin printf 'Authorization: Bearer %s\n' "${AIR_RELEASE_FENCE_SECRET}" |
+     curl --fail-with-body -sS -X POST --header @- \
+       -H "X-Air-Fifo-Migration-Action: begin" \
+       "${AIR_FIFO_URL}"
    ```
 
    A `202` response of `{"kind":"holding"}` starts the cutover.
@@ -163,10 +205,11 @@ secrets).
    holding scopes:
 
    ```sh
-   curl --fail-with-body -sS -X POST \
-     -H "Authorization: Bearer ${AIR_RELEASE_FENCE_SECRET}" \
-     -H "X-Air-Fifo-Migration-Action: prepare" \
-     "${AIR_FIFO_URL}"
+   set +x
+   builtin printf 'Authorization: Bearer %s\n' "${AIR_RELEASE_FENCE_SECRET}" |
+     curl --fail-with-body -sS -X POST --header @- \
+       -H "X-Air-Fifo-Migration-Action: prepare" \
+       "${AIR_FIFO_URL}"
    ```
 
    A `202` `prepared` response includes only `preparedScopes` and
@@ -180,10 +223,11 @@ secrets).
    "holdingScopes":0}`, request activation:
 
    ```sh
-   curl --fail-with-body -sS -X POST \
-     -H "Authorization: Bearer ${AIR_RELEASE_FENCE_SECRET}" \
-     -H "X-Air-Fifo-Migration-Action: activate" \
-     "${AIR_FIFO_URL}"
+   set +x
+   builtin printf 'Authorization: Bearer %s\n' "${AIR_RELEASE_FENCE_SECRET}" |
+     curl --fail-with-body -sS -X POST --header @- \
+       -H "X-Air-Fifo-Migration-Action: activate" \
+       "${AIR_FIFO_URL}"
    ```
 
    A `202` `activated` response completes the one-way transition. A `409`
@@ -214,6 +258,20 @@ printed, saved, or pasted. `IMESSAGE_WEBHOOK_SECRET` was not changed. Do not
 rotate either credential merely to perform a smoke test; only verify deployed
 names/status and use the signed handset `/help` procedure below.
 
+## Photon webhook registration
+
+Use the signed-in Photon Dashboard for the existing Air project and open its
+**Webhooks** view in read-only mode. Confirm exactly one row whose target is
+`https://air.wzrd.tech/webhooks/imessage`. Do not add, delete, or replace a
+webhook during a smoke; that would change the inbound trust boundary.
+
+The Photon CLI intentionally has no webhook-management command. Photon’s
+authenticated list API does not return a webhook signing secret, so a list can
+prove count and target only. Keep only the count and exact target in the
+handoff; do not retain a webhook ID, sender, message, request header, or
+secret. A real signed handset delivery is the proof that the unreturned
+signing secret matches production.
+
 ## Protected GMI catalog/schema audit
 
 The GMI key may be used only through the deployed read-only audit until a
@@ -222,9 +280,10 @@ be retrieved, printed, or inferred from a variable listing. From an
 operator-controlled terminal where `CRON_SECRET` is already set, run:
 
 ```sh
-curl --fail-with-body -sS \
-  -H "Authorization: Bearer ${CRON_SECRET}" \
-  https://air.wzrd.tech/internal/provider-audit
+set +x
+builtin printf 'Authorization: Bearer %s\n' "${CRON_SECRET}" |
+  curl --fail-with-body -sS --header @- \
+    https://air.wzrd.tech/internal/provider-audit
 ```
 
 Never reveal the header value. The response is intentionally safe to retain as
