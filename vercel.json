@@ -8,6 +8,13 @@
     }
   },
   "rewrites": [
+    {
+      "source": "/",
+      "has": [
+        { "type": "header", "key": "accept", "value": ".*text/html.*" }
+      ],
+      "destination": "/air-landing.html"
+    },
     { "source": "/", "destination": "/api" },
     { "source": "/healthz", "destination": "/api/healthz" },
     { "source": "/webhooks/imessage", "destination": "/api/webhooks/imessage" },

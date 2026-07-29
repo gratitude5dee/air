@@ -14,14 +14,19 @@ const EXPECTED_API_FILES = Object.freeze([
   "api/webhooks/imessage.ts",
 ]);
 const EXPECTED_REWRITES = Object.freeze([
-  ["/", "/api"],
-  ["/healthz", "/api/healthz"],
-  ["/webhooks/imessage", "/api/webhooks/imessage"],
-  ["/internal/drain-inbox", "/api/internal/drain-inbox"],
-  ["/internal/provider-audit", "/api/internal/provider-audit"],
-  ["/internal/readiness", "/api/internal/readiness"],
-  ["/internal/release-fence", "/api/internal/release-fence"],
-  ["/internal/inbox-fifo-migration", "/api/internal/inbox-fifo-migration"],
+  {
+    source: "/",
+    destination: "/air-landing.html",
+    has: [{ type: "header", key: "accept", value: ".*text/html.*" }],
+  },
+  { source: "/", destination: "/api" },
+  { source: "/healthz", destination: "/api/healthz" },
+  { source: "/webhooks/imessage", destination: "/api/webhooks/imessage" },
+  { source: "/internal/drain-inbox", destination: "/api/internal/drain-inbox" },
+  { source: "/internal/provider-audit", destination: "/api/internal/provider-audit" },
+  { source: "/internal/readiness", destination: "/api/internal/readiness" },
+  { source: "/internal/release-fence", destination: "/api/internal/release-fence" },
+  { source: "/internal/inbox-fifo-migration", destination: "/api/internal/inbox-fifo-migration" },
 ]);
 
 /** Packages which would put the retired framework or an LLM runtime on Air's request path. */
@@ -87,10 +92,14 @@ function verifyVercelConfiguration(config) {
   if (!Array.isArray(config.rewrites) || config.rewrites.length !== EXPECTED_REWRITES.length) {
     throw new Error("vercel.json must expose exactly the Air route rewrites");
   }
-  for (const [index, [source, destination]] of EXPECTED_REWRITES.entries()) {
+  for (const [index, expected] of EXPECTED_REWRITES.entries()) {
     const rewrite = config.rewrites[index];
-    if (rewrite?.source !== source || rewrite?.destination !== destination) {
-      throw new Error(`rewrite ${index + 1} must map ${source} to ${destination}`);
+    if (
+      rewrite?.source !== expected.source
+      || rewrite?.destination !== expected.destination
+      || JSON.stringify(rewrite?.has ?? []) !== JSON.stringify(expected.has ?? [])
+    ) {
+      throw new Error(`rewrite ${index + 1} must match the approved Air route contract`);
     }
   }
 }

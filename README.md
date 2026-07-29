@@ -88,7 +88,8 @@ flowchart LR
 
 | Route | Method | Purpose |
 | --- | --- | --- |
-| `/` | `GET` | Minimal public Air status. |
+| `/` | `GET` | Air landing for HTML navigations; dependency-free JSON status for non-HTML clients. |
+| `/api` | `GET` | Minimal public Air status. |
 | `/healthz` | `GET` | Static health response with no dependency details. |
 | `/webhooks/imessage` | `POST` | Signed iMessage receipt ingress. |
 | `/internal/drain-inbox` | `GET`, `POST` | `CRON_SECRET` bearer-protected minute recovery route. |
