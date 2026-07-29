@@ -32,7 +32,8 @@ describe("Air landing delivery", () => {
     expect(landing).toContain("favicon.href = '/wzrdtechlogo.png'");
     expect(landing).toContain("polish.src = '/air-polish.js'");
     expect(polish).toContain("data-air-hero-mark");
-    expect(polish).toContain("data-air-cursor-field");
+    expect(polish).toContain("data-air-page-bubble");
+    expect(polish).not.toContain("data-air-cursor-field");
     expect(polish).toContain('border-radius: 999px');
     expect(favicon.subarray(1, 4).toString("ascii")).toBe("PNG");
   });
