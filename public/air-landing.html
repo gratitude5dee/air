@@ -324,6 +324,9 @@ document.addEventListener('DOMContentLoaded', async function() {
     favicon.type = 'image/png';
     favicon.href = '/wzrdtechlogo.png';
     doc.head.append(favicon);
+    const polish = doc.createElement('script');
+    polish.src = '/air-polish.js';
+    doc.head.append(polish);
     document.documentElement.replaceWith(doc.documentElement);
 
     // Resolve page-frame markers: mint this document's own blob for each

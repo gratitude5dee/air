@@ -20,13 +20,20 @@ describe("Air landing delivery", () => {
   });
 
   it("ships the supplied landing with the WZRD favicon and accessible motion controls", async () => {
-    const landing = await readFile(new URL("../public/air-landing.html", import.meta.url), "utf8");
+    const [landing, polish] = await Promise.all([
+      readFile(new URL("../public/air-landing.html", import.meta.url), "utf8"),
+      readFile(new URL("../public/air-polish.js", import.meta.url), "utf8"),
+    ]);
     const favicon = await readFile(new URL("../public/wzrdtechlogo.png", import.meta.url));
 
     expect(landing).toContain("Send a text.<br>Get a film back.");
     expect(landing).toContain("prefers-reduced-motion: reduce");
     expect(landing).toContain("doc.title = 'Air by WZRD'");
     expect(landing).toContain("favicon.href = '/wzrdtechlogo.png'");
+    expect(landing).toContain("polish.src = '/air-polish.js'");
+    expect(polish).toContain("data-air-hero-mark");
+    expect(polish).toContain("data-air-cursor-field");
+    expect(polish).toContain('border-radius: 999px');
     expect(favicon.subarray(1, 4).toString("ascii")).toBe("PNG");
   });
 });
