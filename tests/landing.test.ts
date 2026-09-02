@@ -19,7 +19,7 @@ describe("Air landing delivery", () => {
     ]);
   });
 
-  it("ships the supplied landing with the WZRD favicon and accessible motion controls", async () => {
+  it("ships the supplied landing with the WZRD favicon, mobile-safe intro media, and launch video", async () => {
     const [landing, polish] = await Promise.all([
       readFile(new URL("../public/air-landing.html", import.meta.url), "utf8"),
       readFile(new URL("../public/air-polish.js", import.meta.url), "utf8"),
@@ -33,8 +33,15 @@ describe("Air landing delivery", () => {
     expect(landing).toContain("polish.src = '/air-polish.js'");
     expect(polish).toContain("data-air-hero-mark");
     expect(polish).toContain("data-air-page-bubble");
+    expect(polish).toContain('video.src = "/air-launch.mp4"');
+    expect(polish).toContain("video.controls = true");
+    expect(polish).toContain("video.preload = \"metadata\"");
+    expect(polish).toContain("configureMobileIntroVideo");
+    expect(polish).toContain("(max-width: 767px)");
     expect(polish).not.toContain("data-air-cursor-field");
     expect(polish).toContain('border-radius: 999px');
     expect(favicon.subarray(1, 4).toString("ascii")).toBe("PNG");
+    const launchVideo = await readFile(new URL("../public/air-launch.mp4", import.meta.url));
+    expect(launchVideo.subarray(4, 8).toString("ascii")).toBe("ftyp");
   });
 });

@@ -1,6 +1,7 @@
 (() => {
   const STYLE_ID = "air-polish-styles";
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const mobileViewport = window.matchMedia("(max-width: 767px)");
 
   function installStyles() {
     if (document.getElementById(STYLE_ID)) return;
@@ -48,6 +49,30 @@
         position: relative;
         z-index: 1;
       }
+      [data-air-launch-section] {
+        position: relative;
+        overflow: hidden;
+        background: #05070a;
+        padding: clamp(1.5rem, 4vw, 3.5rem) max(1.5rem, calc((100vw - 76rem) / 2));
+      }
+      [data-air-launch-shell] {
+        overflow: hidden;
+        border: 1px solid rgba(219, 237, 255, 0.22);
+        border-radius: 1.5rem;
+        background: #02060d;
+        box-shadow: 0 1.5rem 3.5rem rgba(0, 0, 0, 0.3);
+      }
+      [data-air-launch-video] {
+        display: block;
+        width: 100%;
+        aspect-ratio: 16 / 9;
+        background: #02060d;
+        object-fit: contain;
+      }
+      @media (max-width: 767px) {
+        [data-air-launch-section] { padding: 1rem 1rem 2.5rem; }
+        [data-air-launch-shell] { border-radius: 1rem; }
+      }
       @media (prefers-reduced-motion: reduce) {
         [data-air-page-bubble] { display: none !important; }
       }
@@ -63,6 +88,48 @@
     mark.setAttribute("aria-hidden", "true");
     mark.textContent = "air";
     heading.before(mark);
+  }
+
+  function installLaunchVideo() {
+    const hero = document.getElementById("top");
+    if (!hero || hero.parentElement?.querySelector("[data-air-launch-section]")) return;
+
+    const section = document.createElement("section");
+    section.dataset.airLaunchSection = "";
+    section.setAttribute("aria-label", "Air launch video");
+
+    const shell = document.createElement("div");
+    shell.dataset.airLaunchShell = "";
+    const video = document.createElement("video");
+    video.dataset.airLaunchVideo = "";
+    video.src = "/air-launch.mp4";
+    video.controls = true;
+    video.playsInline = true;
+    video.preload = "metadata";
+    video.setAttribute("aria-label", "Air launch video");
+    shell.append(video);
+    section.append(shell);
+    hero.after(section);
+  }
+
+  function configureMobileIntroVideo() {
+    document.querySelectorAll("[data-clip], #top video").forEach((video) => {
+      if (!(video instanceof HTMLVideoElement) || video.dataset.airLaunchVideo !== undefined) return;
+      video.dataset.airIntroVideo = "";
+
+      const stopPlayback = () => {
+        if (!mobileViewport.matches) return;
+        video.pause();
+        video.autoplay = false;
+        video.removeAttribute("autoplay");
+      };
+
+      stopPlayback();
+      if (video.dataset.airMobilePlaybackBound === undefined) {
+        video.dataset.airMobilePlaybackBound = "";
+        video.addEventListener("play", stopPlayback);
+      }
+    });
   }
 
   function installBackgroundMotion() {
@@ -87,10 +154,13 @@
   function install() {
     installStyles();
     installHeroMark();
+    installLaunchVideo();
+    configureMobileIntroVideo();
     installBackgroundMotion();
   }
 
   const observer = new MutationObserver(install);
   observer.observe(document.documentElement, { childList: true, subtree: true });
+  mobileViewport.addEventListener?.("change", configureMobileIntroVideo);
   install();
 })();

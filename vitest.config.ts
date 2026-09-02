@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     environment: "node",
     include: [
+      "tests/landing.test.ts",
       "tests/studio/**/*.test.ts",
       "tests/unit/crypto.test.ts",
       "tests/unit/redis-connection.test.ts",
