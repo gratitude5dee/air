@@ -11,6 +11,8 @@ export interface AirEnvironment {
   readonly imessageProjectSecret?: string | undefined;
   readonly imessageWebhookSecret?: string | undefined;
   readonly redisUrl?: string | undefined;
+  readonly upstashRedisRestUrl?: string | undefined;
+  readonly upstashRedisRestToken?: string | undefined;
   readonly zapAirServiceUrl?: string | undefined;
   readonly zapAirServiceToken?: string | undefined;
   readonly idHashSecret?: string | undefined;
@@ -48,7 +50,15 @@ export function loadAirEnvironment(
 ): AirEnvironment {
   const mode = options.mode ?? inferDeploymentMode(source);
   if (mode === "production") {
-    const missing = missingRequiredEnvironment(source);
+    // Workers deployments connect through Upstash REST instead of a TCP
+    // REDIS_URL; either credentials path satisfies the queue requirement.
+    const upstashConfigured = Boolean(
+      source.UPSTASH_REDIS_REST_URL?.trim() && source.UPSTASH_REDIS_REST_TOKEN?.trim(),
+    );
+    const required = upstashConfigured
+      ? PRODUCTION_REQUIRED_ENV.filter((name) => name !== "REDIS_URL")
+      : PRODUCTION_REQUIRED_ENV;
+    const missing = missingRequiredEnvironment(source, required);
     if (missing.length > 0) {
       throw new Error(`missing required production environment: ${missing.join(", ")}`);
     }
@@ -74,6 +84,8 @@ export function loadAirEnvironment(
     imessageProjectSecret: optional(source.IMESSAGE_PROJECT_SECRET),
     imessageWebhookSecret: optional(source.IMESSAGE_WEBHOOK_SECRET),
     redisUrl: optional(source.REDIS_URL),
+    upstashRedisRestUrl: optional(source.UPSTASH_REDIS_REST_URL),
+    upstashRedisRestToken: optional(source.UPSTASH_REDIS_REST_TOKEN),
     zapAirServiceUrl,
     zapAirServiceToken,
     idHashSecret: optional(source.AIR_ID_HASH_SECRET),

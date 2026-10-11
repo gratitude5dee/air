@@ -250,6 +250,149 @@ function settleWithin<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
   });
 }
 
+/** The subset of `@upstash/redis` used by the Workers adapter below. */
+export interface UpstashRedisCompatibleClient {
+  get(key: string): Promise<unknown>;
+  set(
+    key: string,
+    value: string,
+    options?: { nx?: boolean; xx?: boolean; ex?: number; px?: number },
+  ): Promise<unknown>;
+  del(...keys: string[]): Promise<number>;
+  incr(key: string): Promise<number>;
+  expire(key: string, seconds: number): Promise<number | boolean>;
+  pttl(key: string): Promise<number>;
+  zadd(key: string, entries: readonly { score: number; member: string }[]): Promise<number | null>;
+  zrangebyscore(
+    key: string,
+    min: number,
+    max: number,
+    options?: { offset?: number; count?: number },
+  ): Promise<string[]>;
+  zcard(key: string): Promise<number>;
+  zrem(key: string, ...members: string[]): Promise<number>;
+  zremrangebyscore(key: string, min: number, max: number): Promise<number>;
+  eval(
+    script: string,
+    keys: readonly string[],
+    args: readonly string[],
+  ): Promise<unknown>;
+}
+
+/**
+ * Upstash REST adapter for Cloudflare Workers, where node-redis' TCP socket
+ * cannot connect. `RedisLike` is unchanged — the same server-side Lua `eval`
+ * path runs over Upstash's HTTP API.
+ */
+export function createUpstashRedisAdapter(client: UpstashRedisCompatibleClient): RedisLike {
+  const adapter: RedisLike = {
+    get: async (key) => {
+      const value = await client.get(key);
+      return value === null || value === undefined ? null : String(value);
+    },
+    async set(key, value, options = {}) {
+      const upstashOptions: { nx?: boolean; xx?: boolean; ex?: number; px?: number } = {};
+      if (options.nx) upstashOptions.nx = true;
+      if (options.xx) upstashOptions.xx = true;
+      if (options.ex !== undefined) upstashOptions.ex = options.ex;
+      if (options.px !== undefined) upstashOptions.px = options.px;
+      const result = await client.set(
+        key,
+        value,
+        Object.keys(upstashOptions).length > 0 ? upstashOptions : undefined,
+      );
+      return result === "OK" ? "OK" : null;
+    },
+    del: (...keys) => client.del(...keys),
+    incr: (key) => client.incr(key),
+    async expire(key, seconds) {
+      const result = await client.expire(key, seconds);
+      return result === true || result === 1;
+    },
+    pttl: (key) => client.pttl(key),
+    async zAdd(key, entries) {
+      if (entries.length === 0) return 0;
+      const added = await client.zadd(
+        key,
+        entries.map((entry) => ({ score: entry.score, member: entry.value })),
+      );
+      return added ?? 0;
+    },
+    zRangeByScore: (key, min, max, options) =>
+      client.zrangebyscore(
+        key,
+        min,
+        max,
+        options?.limit === undefined
+          ? undefined
+          : { offset: options.offset ?? 0, count: options.limit },
+      ),
+    zCard: (key) => client.zcard(key),
+    zRem: (key, ...members) => client.zrem(key, ...members),
+    zRemRangeByScore: (key, min, max) => client.zremrangebyscore(key, min, max),
+    eval: (script, options) => client.eval(script, [...options.keys], [...options.arguments]),
+  };
+  return Object.freeze(adapter);
+}
+
+export interface UpstashRedisConnectionOptions {
+  readonly url: string;
+  readonly token: string;
+  /** Test-only factory so the REST adapter is independently verifiable. */
+  readonly clientFactory?:
+    | ((options: { url: string; token: string }) => UpstashRedisCompatibleClient)
+    | undefined;
+}
+
+/**
+ * Cloudflare Workers path: Upstash REST has no socket to connect or destroy,
+ * so `ConnectedRedis` lifecycle methods are no-ops. Every command is wrapped
+ * so a failed REST call still fires `onOperationalError` and invalidates the
+ * cached runtime the same way a dropped TCP connection does.
+ */
+export async function connectUpstashRedis(
+  options: UpstashRedisConnectionOptions,
+): Promise<ConnectedRedis> {
+  const client = options.clientFactory
+    ? options.clientFactory({ url: options.url, token: options.token })
+    : (new ((await import("@upstash/redis")).Redis)({
+        url: options.url,
+        token: options.token,
+      }) as unknown as UpstashRedisCompatibleClient);
+  const operationalErrorListeners = new Set<() => void>();
+  const notify = () => {
+    for (const listener of operationalErrorListeners) {
+      try {
+        listener();
+      } catch {
+        // Error reporting must never rethrow through a command failure.
+      }
+    }
+  };
+  const adapter = createUpstashRedisAdapter(client);
+  const guarded = {} as Record<keyof RedisLike, (...args: unknown[]) => Promise<unknown>>;
+  for (const name of Object.keys(adapter) as (keyof RedisLike)[]) {
+    const fn = adapter[name] as (...args: unknown[]) => Promise<unknown>;
+    guarded[name] = async (...args: unknown[]) => {
+      try {
+        return await fn(...args);
+      } catch (error) {
+        notify();
+        throw error;
+      }
+    };
+  }
+  return Object.freeze({
+    redis: guarded as RedisLike,
+    onOperationalError(listener: () => void): () => void {
+      operationalErrorListeners.add(listener);
+      return () => operationalErrorListeners.delete(listener);
+    },
+    destroy(): void {},
+    async close(): Promise<void> {},
+  });
+}
+
 /**
  * Encodes externally supplied identifiers before they become part of a Redis
  * key. It is deliberately reversible only for provider IDs (never sender

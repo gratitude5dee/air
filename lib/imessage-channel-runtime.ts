@@ -2,7 +2,7 @@ import { createQueueCipher, type QueueCipher } from "./crypto.js";
 import { DurableInbox } from "./durable-inbox.js";
 import { loadAirEnvironment, type AirEnvironment } from "./env.js";
 import { RateLimiter } from "./rate-limit.js";
-import { connectRedisFromUrl, type RedisLike } from "./redis.js";
+import { connectRedisFromUrl, connectUpstashRedis, type RedisLike } from "./redis.js";
 
 /**
  * Shared, lazy runtime for Air's signed webhook and recovery cron.  It owns
@@ -60,7 +60,12 @@ export async function getAirRuntime(): Promise<AirRuntime> {
     pending = (async () => {
       const environment = loadAirEnvironment();
       assertQueueEnvironment(environment);
-      const connection = await connectRedisFromUrl(environment.redisUrl as string);
+      const connection = environment.upstashRedisRestUrl && environment.upstashRedisRestToken
+        ? await connectUpstashRedis({
+            url: environment.upstashRedisRestUrl,
+            token: environment.upstashRedisRestToken,
+          })
+        : await connectRedisFromUrl(environment.redisUrl as string);
       let invalidated = false;
       const invalidate = () => {
         if (invalidated) return;
@@ -84,7 +89,7 @@ export function assertQueueEnvironment(environment: AirEnvironment): void {
     !environment.imessageProjectId ||
     !environment.imessageProjectSecret ||
     !environment.imessageWebhookSecret ||
-    !environment.redisUrl ||
+    !(environment.redisUrl || (environment.upstashRedisRestUrl && environment.upstashRedisRestToken)) ||
     !environment.zapAirServiceUrl ||
     !environment.zapAirServiceToken ||
     !environment.idHashSecret ||
