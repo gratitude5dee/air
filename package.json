@@ -8,8 +8,8 @@
     "npm": ">=10"
   },
   "scripts": {
-    "postinstall": "node scripts/patch-eve-logging.mjs",
-    "build": "node scripts/patch-eve-logging.mjs && eve build && npm run verify:build",
+    "postinstall": "node scripts/patch-eve-logging.mjs && node scripts/patch-eve-esm-banner.mjs",
+    "build": "node scripts/patch-eve-logging.mjs && node scripts/patch-eve-esm-banner.mjs && eve build && npm run verify:build",
     "dev": "eve dev --no-ui",
     "start": "eve start",
     "typecheck": "tsc --noEmit",
@@ -23,12 +23,14 @@
     "@photon-ai/chat-adapter-imessage": "3.0.1",
     "@spectrum-ts/core": "^10.0.0",
     "@spectrum-ts/imessage": "^10.0.0",
+    "@upstash/redis": "^1.39.0",
     "ai": "7.0.28",
     "chat": "4.34.0",
     "eve": "0.24.3",
     "heic-convert": "^2.1.0",
     "redis": "5.11.0",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "air-workers-world": "file:packages/air-workers-world"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

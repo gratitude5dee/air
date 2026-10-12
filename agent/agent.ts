@@ -9,4 +9,12 @@ export default defineAgent({
   model: "openai/gpt-4.1-mini",
   // Keep the build deterministic without resolving a remote model catalog.
   modelContextWindowTokens: 128_000,
+  experimental: {
+    workflow: {
+      // Air registers no workflow runs. The Workers deployment installs an
+      // inert world because the default local backend needs a writable
+      // filesystem the Workers runtime does not have.
+      world: "air-workers-world",
+    },
+  },
 });

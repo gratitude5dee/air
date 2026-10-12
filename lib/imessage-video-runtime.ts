@@ -1,7 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { imessage } from "@spectrum-ts/imessage";
 import type { AdapterPostableMessage } from "chat";
-import heicConvert from "heic-convert";
 import {
   type InboxContentType,
   type InboxProcessingLease,
@@ -944,6 +942,9 @@ async function readPhotonAttachment(
     // lookup below is authoritative and gives a safe retryable failure if not.
   }
   if (!adapter.app) throw new VideoWorkflowError("attachment_transport", true);
+  // @spectrum-ts/imessage pulls gRPC/net modules that cannot evaluate inside a
+  // Cloudflare Worker; load it only once an attachment is actually requested.
+  const { imessage } = await import("@spectrum-ts/imessage");
   const platform = imessage as unknown as (app: unknown) => SpectrumAttachmentReader;
   let attachment: Awaited<ReturnType<SpectrumAttachmentReader["getAttachment"]>>;
   try {
@@ -997,6 +998,9 @@ async function prepareImage(bytes: Buffer, attachment: NormalizedIMessageAttachm
   if (detected === "jpeg") return Object.freeze({ bytes, mimeType: "image/jpeg" });
   if (detected === "png") return Object.freeze({ bytes, mimeType: "image/png" });
   try {
+    // heic-convert's module graph requires node builtins at import time; keep
+    // it out of the eager path for the same reason as the Spectrum packages.
+    const { default: heicConvert } = await import("heic-convert");
     const jpeg = Buffer.from(await heicConvert({ buffer: bytes, format: "JPEG", quality: 0.9 }));
     if (jpeg.byteLength < 4 || jpeg.byteLength > MAX_INPUT_IMAGE_BYTES || detectImageKind(jpeg) !== "jpeg") {
       throw new VideoWorkflowError("invalid_image", false);

@@ -1,5 +1,9 @@
-import { ConsoleLogger } from "chat";
-import { createiMessageAdapter } from "@photon-ai/chat-adapter-imessage";
+import type { AirVideoIMessageAdapter } from "./imessage-video-runtime.js";
+
+type ChatAdapterModule = typeof import("@photon-ai/chat-adapter-imessage");
+type RealIMessageAdapter = ReturnType<ChatAdapterModule["createiMessageAdapter"]> & {
+  app: unknown | null;
+};
 
 /**
  * Air accepts signed Photon deliveries only through `agent/channels/ingress`.
@@ -41,7 +45,14 @@ function buildSafeAdapterValue(name: string): string {
 
 /** Fail closed before an ingress or recovery worker can accept a message. */
 export function assertIMessageRuntimeConfiguration(): void {
-  const missing = RUNTIME_ENVIRONMENT_NAMES.filter((name) => environmentValue(name) === undefined);
+  // Workers deployments use Upstash REST instead of a TCP REDIS_URL.
+  const redisConfigured =
+    environmentValue("REDIS_URL") !== undefined ||
+    (environmentValue("UPSTASH_REDIS_REST_URL") !== undefined &&
+      environmentValue("UPSTASH_REDIS_REST_TOKEN") !== undefined);
+  const missing = RUNTIME_ENVIRONMENT_NAMES.filter(
+    (name) => name !== "REDIS_URL" || !redisConfigured,
+  ).filter((name) => environmentValue(name) === undefined);
   if (missing.length > 0) {
     throw new Error(`Air iMessage video runtime configuration is incomplete (${missing.join(", ")}).`);
   }
@@ -56,12 +67,71 @@ export function assertIMessageRuntimeConfiguration(): void {
   }
 }
 
-/** Silence framework transport logging; Air emits no prompts or provider bodies. */
-export const AIR_CHAT_LOGGER = new ConsoleLogger("silent");
+const IMESSAGE_THREAD_PREFIX = "imessage:";
+const IMESSAGE_LINE_SEPARATOR = "~";
 
-export const imessageAdapter = createiMessageAdapter({
-  projectId: buildSafeAdapterValue("IMESSAGE_PROJECT_ID"),
-  projectSecret: buildSafeAdapterValue("IMESSAGE_PROJECT_SECRET"),
-  webhookSecret: buildSafeAdapterValue("IMESSAGE_WEBHOOK_SECRET"),
-  logger: AIR_CHAT_LOGGER,
-});
+let adapterPromise: Promise<RealIMessageAdapter> | undefined;
+
+/**
+ * The Photon adapter chain pulls gRPC/net/sqlite modules that cannot evaluate
+ * inside a Cloudflare Worker, so the real adapter is built on first use inside
+ * the media/delivery path. The webhook-verify path never touches it.
+ */
+function loadIMessageAdapter(): Promise<RealIMessageAdapter> {
+  adapterPromise ??= (async () => {
+    const [{ createiMessageAdapter }, { ConsoleLogger }] = await Promise.all([
+      import("@photon-ai/chat-adapter-imessage"),
+      import("chat"),
+    ]);
+    // Silence framework transport logging; Air emits no prompts or provider bodies.
+    return createiMessageAdapter({
+      projectId: buildSafeAdapterValue("IMESSAGE_PROJECT_ID"),
+      projectSecret: buildSafeAdapterValue("IMESSAGE_PROJECT_SECRET"),
+      webhookSecret: buildSafeAdapterValue("IMESSAGE_WEBHOOK_SECRET"),
+      logger: new ConsoleLogger("silent"),
+    }) as unknown as RealIMessageAdapter;
+  })();
+  return adapterPromise;
+}
+
+/**
+ * Lazy `AirVideoIMessageAdapter`: `encodeThreadId` mirrors the adapter's
+ * internal encoder (THREAD_PREFIX + LINE_SEP) so it stays synchronous; every
+ * network-facing method defers the package load until first call. `app` is
+ * null until the underlying adapter has initialized, matching the previous
+ * semantics that gated attachments on a prior `fetchMessage`.
+ */
+class LazyIMessageAdapter implements AirVideoIMessageAdapter {
+  private real: RealIMessageAdapter | undefined;
+
+  get app(): unknown | null {
+    return this.real?.app ?? null;
+  }
+
+  encodeThreadId(input: { readonly chatGuid: string; readonly phone?: string }): string {
+    return input.phone
+      ? `${IMESSAGE_THREAD_PREFIX}${input.chatGuid}${IMESSAGE_LINE_SEPARATOR}${input.phone}`
+      : `${IMESSAGE_THREAD_PREFIX}${input.chatGuid}`;
+  }
+
+  async fetchMessage(threadId: string, messageId: string): Promise<unknown> {
+    const adapter = await this.ensure();
+    return adapter.fetchMessage(threadId, messageId);
+  }
+
+  async postMessage(
+    threadId: string,
+    message: Parameters<RealIMessageAdapter["postMessage"]>[1],
+  ): Promise<unknown> {
+    const adapter = await this.ensure();
+    return adapter.postMessage(threadId, message);
+  }
+
+  private async ensure(): Promise<RealIMessageAdapter> {
+    const adapter = await loadIMessageAdapter();
+    this.real = adapter;
+    return adapter;
+  }
+}
+
+export const imessageAdapter: AirVideoIMessageAdapter = new LazyIMessageAdapter();
